@@ -39,7 +39,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+*.pyc
 # Jupyter
 .ipynb_checkpoints
 *.ipynb
