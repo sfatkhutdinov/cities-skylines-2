@@ -1,10 +1,24 @@
+# Core packages
 numpy>=1.24.0
 torch>=2.0.0
 torchvision>=0.15.0
 opencv-python>=4.7.0
-pynput>=1.7.6
-gymnasium>=0.29.0
-wandb>=0.15.0  # for logging and visualization
-mss>=9.0.1  # for fast screen capture
-tensorboard>=2.14.0
 pillow>=10.0.0 
+
+# Environment interaction
+pynput>=1.7.6
+mss>=9.0.1  # for fast screen capture
+pywin32>=306  # for Windows API access
+pyautogui>=0.9.54  # for GUI automation
+
+# Reinforcement learning
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0  # optional RL implementation
+
+# Visualization and logging
+wandb>=0.15.0  # for experiment tracking
+tensorboard>=2.14.0
+matplotlib>=3.7.0  # for plotting
+
+# Performance monitoring
+psutil>=5.9.0  # system resource monitoring 
