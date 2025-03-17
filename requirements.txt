@@ -1,0 +1,10 @@
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.7.0
+pynput>=1.7.6
+gymnasium>=0.29.0
+wandb>=0.15.0  # for logging and visualization
+mss>=9.0.1  # for fast screen capture
+tensorboard>=2.14.0
+pillow>=10.0.0 
