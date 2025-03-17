@@ -67,10 +67,7 @@ class OptimizedScreenCapture:
                 # Get handle to the game window 
                 game_hwnd = None
                 window_titles = [
-                    "Cities: Skylines II",
-                    "Cities Skylines II", 
-                    "Cities Skylines 2",
-                    "Cities: Skylines 2"
+                    "Cities: Skylines II"
                 ]
                 
                 def enum_windows_callback(hwnd, _):

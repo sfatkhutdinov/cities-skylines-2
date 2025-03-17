@@ -48,10 +48,7 @@ class InputSimulator:
         """Find the Cities: Skylines II window handle."""
         game_hwnd = None
         window_titles = [
-            "Cities: Skylines II",
-            "Cities Skylines II", 
-            "Cities Skylines 2",
-            "Cities: Skylines 2"
+            "Cities: Skylines II"
         ]
         
         def enum_windows_callback(hwnd, _):
@@ -471,4 +468,38 @@ class InputSimulator:
             except Exception as e:
                 print(f"Error releasing key {key}: {e}")
                 
-        print("Input simulator resources released") 
+        print("Input simulator resources released")
+
+    def press_mouse_button(self, button: str = 'left'):
+        """Press a mouse button without releasing it.
+        
+        Args:
+            button (str): 'left', 'right', or 'middle'
+        """
+        # Map button string to pynput Button
+        button_map = {
+            'left': Button.left,
+            'right': Button.right,
+            'middle': Button.middle
+        }
+        btn = button_map.get(button, Button.left)
+        
+        # Press button
+        self.mouse.press(btn)
+        
+    def release_mouse_button(self, button: str = 'left'):
+        """Release a previously pressed mouse button.
+        
+        Args:
+            button (str): 'left', 'right', or 'middle'
+        """
+        # Map button string to pynput Button
+        button_map = {
+            'left': Button.left,
+            'right': Button.right,
+            'middle': Button.middle
+        }
+        btn = button_map.get(button, Button.left)
+        
+        # Release button
+        self.mouse.release(btn) 
