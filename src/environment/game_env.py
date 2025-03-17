@@ -7,12 +7,12 @@ import torch
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
 import time
-from environment.visual_metrics import VisualMetricsEstimator
-from environment.reward_system import RewardSystem
-from environment.optimized_capture import OptimizedScreenCapture
-from config.hardware_config import HardwareConfig
-from utils.performance_safeguards import PerformanceSafeguards
-from environment.input_simulator import InputSimulator
+from .visual_metrics import VisualMetricsEstimator
+from .reward_system import RewardSystem
+from .optimized_capture import OptimizedScreenCapture
+from src.config.hardware_config import HardwareConfig
+from src.utils.performance_safeguards import PerformanceSafeguards
+from .input_simulator import InputSimulator
 import logging
 import win32api
 import random

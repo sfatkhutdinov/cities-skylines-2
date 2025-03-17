@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple
-from config.hardware_config import HardwareConfig
+from src.config.hardware_config import HardwareConfig
 
 class VisualMetricsEstimator:
     def __init__(self, config: HardwareConfig):

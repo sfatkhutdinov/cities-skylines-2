@@ -5,8 +5,8 @@ Hierarchical reward system for learning game objectives through visual observati
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Any
-from config.hardware_config import HardwareConfig
-from environment.visual_metrics import VisualMetricsEstimator
+from src.config.hardware_config import HardwareConfig
+from .visual_metrics import VisualMetricsEstimator
 import time
 
 class RewardSystem:
