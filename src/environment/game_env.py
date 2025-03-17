@@ -16,18 +16,20 @@ from .input_simulator import InputSimulator
 import logging
 import win32api
 import random
+import os
 
 logger = logging.getLogger(__name__)
 
 class CitiesEnvironment:
     """Environment for interacting with Cities: Skylines 2."""
     
-    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False):
+    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, menu_screenshot_path: Optional[str] = None):
         """Initialize the environment.
         
         Args:
             config: Optional hardware configuration
             mock_mode: If True, use a mock environment for testing/training without the actual game
+            menu_screenshot_path: Path to a reference screenshot of the menu screen
         """
         self.config = config or HardwareConfig()
         self.mock_mode = mock_mode
@@ -38,6 +40,44 @@ class CitiesEnvironment:
         # Connect input simulator to screen capture for coordinate translation
         self.input_simulator.screen_capture = self.screen_capture
         self.visual_estimator = VisualMetricsEstimator(self.config)
+        
+        # Initialize menu detection with reference image if provided
+        self.menu_reference_path = menu_screenshot_path
+        
+        # Check if the menu reference exists in the specified path or root directory
+        if menu_screenshot_path and os.path.exists(menu_screenshot_path):
+            self.has_menu_reference = True
+        elif menu_screenshot_path:
+            # If not found in the specified path, try looking in the root directory
+            root_path = os.path.join(os.getcwd(), os.path.basename(menu_screenshot_path))
+            if os.path.exists(root_path):
+                self.menu_reference_path = root_path
+                self.has_menu_reference = True
+                logger.info(f"Found menu reference image in root directory: {root_path}")
+            else:
+                self.has_menu_reference = False
+                logger.warning(f"Menu reference image not found at {menu_screenshot_path} or {root_path}")
+        else:
+            # Check if there's a default menu_reference.png in the root directory
+            default_path = os.path.join(os.getcwd(), "menu_reference.png")
+            if os.path.exists(default_path):
+                self.menu_reference_path = default_path
+                self.has_menu_reference = True
+                logger.info(f"Using default menu reference image found at {default_path}")
+            else:
+                self.has_menu_reference = False
+        
+        self.menu_detection_initialized = False
+        
+        if self.has_menu_reference:
+            try:
+                self.visual_estimator.initialize_menu_detection(self.menu_reference_path)
+                self.menu_detection_initialized = True
+                logger.info(f"Initialized menu detection using reference image: {self.menu_reference_path}")
+            except Exception as e:
+                logger.error(f"Failed to initialize menu detection: {e}")
+                self.has_menu_reference = False
+        
         self.reward_system = RewardSystem(self.config)
         self.safeguards = PerformanceSafeguards(self.config)
         
@@ -60,6 +100,10 @@ class CitiesEnvironment:
         self.fps_history = []
         self.last_optimization_check = time.time()
         self.optimization_interval = 60  # Check optimization every 60 seconds
+        
+        # Counter for how long the agent has been stuck in a menu
+        self.menu_stuck_counter = 0
+        self.max_menu_penalty = -2.0  # Maximum penalty for being stuck in menu
         
         # For mock mode, create a dummy frame
         if self.mock_mode:
@@ -229,12 +273,62 @@ class CitiesEnvironment:
         
         return base_actions
     
+    def capture_menu_reference(self, save_path: str = "menu_reference.png") -> bool:
+        """Capture the current frame as a menu reference image.
+        
+        This should be called when the menu is visible on screen.
+        
+        Args:
+            save_path: Path to save the reference image
+            
+        Returns:
+            bool: True if successfully saved, False otherwise
+        """
+        if self.mock_mode:
+            logger.warning("Cannot capture menu reference in mock mode")
+            return False
+            
+        # Focus the game window
+        if not self.input_simulator.ensure_game_window_focused():
+            logger.error("Could not focus game window to capture menu reference")
+            return False
+            
+        # Capture current frame
+        frame = self.screen_capture.capture_frame()
+        if frame is None:
+            logger.error("Failed to capture frame for menu reference")
+            return False
+            
+        # Save as reference
+        success = self.visual_estimator.save_current_frame_as_menu_reference(frame, save_path)
+        if success:
+            self.menu_reference_path = save_path
+            self.has_menu_reference = True
+            self.menu_detection_initialized = True
+            logger.info(f"Successfully captured menu reference image to {save_path}")
+        else:
+            logger.error("Failed to save menu reference image")
+            
+        return success
+    
     def reset(self) -> torch.Tensor:
-        """Reset the environment to initial state."""
+        """Reset the environment to initial state.
+        
+        Returns:
+            torch.Tensor: Initial observation
+        """
+        # Increment performance logging counter
+        self._update_performance_metrics()
+        
+        # Reset step counter
+        self.steps_taken = 0
+        
+        # Reset menu counter
+        self.menu_stuck_counter = 0
+        
         # In mock mode, just return the mock frame
         if self.mock_mode:
             self.current_frame = self.screen_capture.capture_frame()
-            self.steps_taken = 0
             return self.current_frame
             
         # For real game mode, try to focus the game window
@@ -245,6 +339,83 @@ class CitiesEnvironment:
         if not self.input_simulator.ensure_game_window_focused():
             raise RuntimeError("Could not focus Cities: Skylines II window. Make sure the game window is visible.")
             
+        # Capture initial frame
+        initial_frame = self.screen_capture.capture_frame()
+        
+        # Check if this is the first run and we don't have a menu reference yet
+        if not self.has_menu_reference and not self.menu_detection_initialized:
+            # On first run, assume we might be at the menu and capture a reference
+            logger.info("First run, capturing menu reference image")
+            
+            # Save the current frame as a reference (assuming we're starting at the menu)
+            self.capture_menu_reference("menu_reference.png")
+            
+            # Try to exit the menu immediately after capturing reference
+            self.input_simulator.key_press('escape')
+            time.sleep(0.7)
+            self.input_simulator.key_press('escape')  # Press twice to be safe
+            time.sleep(0.7)
+            
+            # Also try clicking the Resume Game button
+            width, height = self._get_screen_dimensions()
+            resume_x = int(width * 0.15)  # About 15% in from left
+            resume_y = int(height * 0.25)  # About 25% down from top
+            self.input_simulator.mouse_click(resume_x, resume_y)
+            time.sleep(0.7)
+            
+            # Update the current frame
+            initial_frame = self.screen_capture.capture_frame()
+        
+        # Keep trying to exit menu if detected
+        menu_attempts = 0
+        max_menu_exit_attempts = 5
+        
+        while self.visual_estimator.detect_main_menu(initial_frame) and menu_attempts < max_menu_exit_attempts:
+            menu_attempts += 1
+            logger.info(f"Main menu detected during reset (attempt {menu_attempts}/{max_menu_exit_attempts}) - trying to exit")
+            
+            # First try: Press Escape key once (only on first attempt)
+            if menu_attempts == 1:
+                logger.info("Trying single Escape key press to exit menu")
+                self.input_simulator.block_escape = False  # Temporarily allow Escape
+                self.input_simulator.key_press('escape')
+                self.input_simulator.block_escape = True   # Re-block Escape
+                time.sleep(0.7)
+                
+                # Check if we're still in menu
+                initial_frame = self.screen_capture.capture_frame()
+                if not self.visual_estimator.detect_main_menu(initial_frame):
+                    logger.info("Successfully exited menu with Escape key")
+                    break
+            
+            # Second try: Click Resume Game button at different positions
+            logger.info("Trying to click 'RESUME GAME' button")
+            width, height = self._get_screen_dimensions()
+            
+            # Try several potential positions for the resume game button
+            resume_positions = [
+                (int(width * 0.45), int(height * 0.387)),   # Exact position from screenshot
+                (int(width * 0.452), int(height * 0.39)),   # Slightly adjusted
+                (450, 387),                                 # Absolute coordinates from screenshot
+                (int(width * 0.288), int(height * 0.27)),   # Previous position from logs
+                (int(width * 0.5), int(height * 0.5))       # Center of screen
+            ]
+            
+            # Try the position corresponding to the current attempt or cycle through positions
+            position_index = min((menu_attempts - 1) % len(resume_positions), len(resume_positions) - 1)
+            resume_x, resume_y = resume_positions[position_index]
+            self.input_simulator.mouse_click(resume_x, resume_y)
+            time.sleep(0.7)
+            
+            # Update frame to check if we're still in the menu
+            initial_frame = self.screen_capture.capture_frame()
+        
+        if menu_attempts >= max_menu_exit_attempts:
+            logger.warning("Failed to exit menu after multiple attempts - continuing anyway")
+        
+        # Capture again after potential menu exit
+        self.current_frame = self.screen_capture.capture_frame()
+        
         # Reset game state (unpause if paused)
         self._ensure_game_running()
         
@@ -256,12 +427,8 @@ class CitiesEnvironment:
         if self.steps_taken == 0:
             self.test_mouse_freedom()
         
-        # Capture initial frame
-        self.current_frame = self.screen_capture.capture_frame()
-        self.steps_taken = 0
-        
         return self.current_frame
-        
+    
     def _ensure_game_running(self):
         """Make sure game is not paused. Press space if it is."""
         # Use space to unpause the game without using ESC
@@ -296,55 +463,173 @@ class CitiesEnvironment:
         logger.info(f"Game speed set to level {speed_level}")
         time.sleep(0.2)  # Give time for speed change to take effect
     
-    def step(self, action: int) -> Tuple[torch.Tensor, float, bool, Dict[str, Any]]:
-        """Take a step in the environment.
+    def step(self, action_index: int) -> Tuple[torch.Tensor, float, bool, dict]:
+        """Take an action in the environment.
         
         Args:
-            action (int): Action to take
+            action_index: Index of the action to take
             
         Returns:
-            Tuple[torch.Tensor, float, bool, Dict[str, Any]]: (next_state, reward, done, info)
+            observation: The next observation (frame)
+            reward: The reward for the action
+            done: Whether the episode is done
+            info: Additional information
         """
         # Check if we need to delay before taking another action
         elapsed = time.time() - self.last_action_time
         if elapsed < self.min_action_delay:
             time.sleep(self.min_action_delay - elapsed)
             
-        # Get action details
-        if action < 0 or action >= len(self.actions):
-            logger.warning(f"Invalid action index: {action}")
-            action = 0  # Default to first action
+        # In mock mode, just increment counter and return mock frame
+        if self.mock_mode:
+            self.steps_taken += 1
+            self.current_frame = self.screen_capture.capture_frame()
+            return self.current_frame, 0.0, False, {}
             
-        action_info = self.actions[action]
+        # Ensure Cities: Skylines II window is focused
+        if not self.input_simulator.ensure_game_window_focused():
+            logger.warning("Could not focus Cities: Skylines II window during step - trying to recover")
+            if not self.input_simulator.find_game_window():
+                raise RuntimeError("Cities: Skylines II window not found during step")
+                
+        # First check if we're in a menu before executing action
+        pre_action_frame = self.screen_capture.capture_frame()
+        if self.visual_estimator.detect_main_menu(pre_action_frame):
+            logger.info("Menu detected before action - attempting to exit menu first")
+            
+            # Try pressing escape once to exit the menu
+            logger.info("Trying single Escape key press to exit menu")
+            self.input_simulator.block_escape = False  # Temporarily allow Escape
+            self.input_simulator.key_press('escape')
+            self.input_simulator.block_escape = True   # Re-block Escape
+            time.sleep(0.7)
+            
+            # Check if we're still in a menu
+            if self.visual_estimator.detect_main_menu(self.screen_capture.capture_frame()):
+                logger.info("Still in menu after Escape key, trying to click 'RESUME GAME' button")
+                
+                # Now try clicking Resume Game button
+                width, height = self._get_screen_dimensions()
+                
+                # Try several potential positions for the resume game button, starting with exact coordinates from screenshot
+                resume_positions = [
+                    (int(width * 0.45), int(height * 0.387)),   # Exact position from screenshot
+                    (int(width * 0.452), int(height * 0.39)),   # Slightly adjusted
+                    (450, 387),                                 # Absolute coordinates from screenshot
+                    (int(width * 0.288), int(height * 0.27)),   # Previous position from logs
+                    (int(width * 0.5), int(height * 0.5))       # Center of screen
+                ]
+                
+                # Try each position
+                for resume_x, resume_y in resume_positions:
+                    self.input_simulator.mouse_click(resume_x, resume_y)
+                    time.sleep(0.7)
+                    
+                    # Check if we're out of the menu
+                    if not self.visual_estimator.detect_main_menu(self.screen_capture.capture_frame()):
+                        break
         
-        # Execute action
+        # Get action details
+        if action_index < 0 or action_index >= len(self.actions):
+            logger.warning(f"Invalid action index: {action_index}")
+            action_index = 0  # Default to first action
+        
+        action_info = self.actions[action_index]
+        
+        # Now execute the selected action
         self._execute_action(action_info)
         self.last_action_time = time.time()
+        
+        # Increment step counter
         self.steps_taken += 1
         
-        # Observe new state
-        next_frame = self.screen_capture.capture_frame()
-        self.current_frame = next_frame
+        # Wait for a short period to let the game update
+        # This delay is calibrated based on the game's response time
+        time.sleep(0.2)
         
-        # Calculate reward
-        if hasattr(self, "reward_system") and hasattr(self.reward_system, "compute_reward"):
-            # Use the new reward system
-            reward = self.reward_system.compute_reward(next_frame, action, action_info)
-        else:
-            # Legacy reward calculation
-            reward, _ = self.reward_system.compute_population_reward(next_frame)
+        # Capture new frame after action
+        self.current_frame = self.screen_capture.capture_frame()
+        
+        # Check if we ended up in a menu after the action (in case the action triggered a menu)
+        if self.visual_estimator.detect_main_menu(self.current_frame):
+            logger.info("Menu detected after action - trying to exit menu")
             
-        # Check if episode is done
+            # Try pressing escape once to exit the menu
+            logger.info("Trying single Escape key press to exit menu")
+            self.input_simulator.block_escape = False  # Temporarily allow Escape
+            self.input_simulator.key_press('escape')
+            self.input_simulator.block_escape = True   # Re-block Escape
+            time.sleep(0.7)
+            
+            # Update the current frame to see if we're still in the menu
+            self.current_frame = self.screen_capture.capture_frame()
+            
+            # If still in menu, try clicking buttons
+            if self.visual_estimator.detect_main_menu(self.current_frame):
+                logger.info("Still in menu after Escape key, trying to click 'RESUME GAME' button")
+                menu_exit_attempts = 0
+                max_exit_attempts = 3
+                
+                while self.visual_estimator.detect_main_menu(self.current_frame) and menu_exit_attempts < max_exit_attempts:
+                    menu_exit_attempts += 1
+                    logger.info(f"Attempting to click menu buttons (attempt {menu_exit_attempts}/{max_exit_attempts})")
+                    
+                    # Try clicking Resume Game button at different positions
+                    width, height = self._get_screen_dimensions()
+                    
+                    # Try several potential positions for the resume game button
+                    resume_positions = [
+                        (int(width * 0.45), int(height * 0.387)),   # Exact position from screenshot
+                        (int(width * 0.452), int(height * 0.39)),   # Slightly adjusted
+                        (450, 387),                                 # Absolute coordinates from screenshot
+                        (int(width * 0.288), int(height * 0.27)),   # Previous position from logs
+                        (int(width * 0.5), int(height * 0.5))       # Center of screen
+                    ]
+                    
+                    # Try the position corresponding to the current attempt
+                    position_index = min(menu_exit_attempts - 1, len(resume_positions) - 1)
+                    resume_x, resume_y = resume_positions[position_index]
+                    self.input_simulator.mouse_click(resume_x, resume_y)
+                    time.sleep(0.7)
+                    
+                    # Update the current frame to see if we're still in the menu
+                    self.current_frame = self.screen_capture.capture_frame()
+        
+        # Calculate reward using visual metrics
+        reward = self.visual_estimator.calculate_reward(self.current_frame)
+        
+        # Apply menu penalty if a menu is detected
+        menu_detected = self.visual_estimator.detect_main_menu(self.current_frame)
+        if menu_detected:
+            # Increment the counter for consecutive menu steps
+            self.menu_stuck_counter += 1
+            
+            # Calculate escalating penalty based on how long the agent has been stuck
+            menu_penalty = self.reward_system.calculate_menu_penalty(menu_detected, self.menu_stuck_counter)
+            
+            # Apply penalty but don't let it exceed the maximum defined penalty
+            menu_penalty = max(menu_penalty, self.max_menu_penalty)
+            
+            reward += menu_penalty
+            logger.info(f"Applied menu penalty: {menu_penalty} (consecutive menu steps: {self.menu_stuck_counter}, total reward: {reward})")
+        else:
+            # Reset the menu counter when not in menu
+            self.menu_stuck_counter = 0
+        
+        # Check if episode should terminate (using step limit for now)
         done = self.steps_taken >= self.max_steps
         
-        # Compile info
+        # Prepare info dict
         info = {
-            "steps": self.steps_taken,
-            "action_type": action_info["type"],
-            "action": action_info["action"]
+            'steps': self.steps_taken,
+            'action_type': action_info["type"],
+            'action': action_info["action"],
+            'menu_detected': self.visual_estimator.detect_main_menu(self.current_frame),
+            'menu_penalty': menu_penalty if menu_detected else 0.0,
+            'menu_stuck_counter': self.menu_stuck_counter
         }
         
-        return next_frame, reward, done, info
+        return self.current_frame, reward, done, info
     
     def _execute_action(self, action_info: Dict[str, Any]):
         """Execute the specified action in the game."""
@@ -878,7 +1163,7 @@ class CitiesEnvironment:
         elif action == "open_pause_menu":
             # Open pause menu with Escape (default keybinding)
             self.input_simulator.key_press('escape')
-            time.sleep(0.5)  # Give menu time to appear
+            time.sleep(0.5)
             logger.info("Opened pause menu")
     
     def _handle_info_view_action(self, action: str):
@@ -1204,4 +1489,16 @@ class CitiesEnvironment:
             # Draw a power line to connect
             power_start_x, power_start_y = center_x + 50, center_y
             power_end_x, power_end_y = zone_start_x, zone_start_y
-            self._drag_zone(power_start_x, power_start_y, power_end_x, power_end_y) 
+            self._drag_zone(power_start_x, power_start_y, power_end_x, power_end_y)
+    
+    def _get_screen_dimensions(self) -> Tuple[int, int]:
+        """Get the dimensions of the game window or screen."""
+        if hasattr(self.screen_capture, 'client_position'):
+            client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
+            width = client_right - client_left
+            height = client_bottom - client_top
+        else:
+            width = win32api.GetSystemMetrics(0)
+            height = win32api.GetSystemMetrics(1)
+            
+        return width, height 

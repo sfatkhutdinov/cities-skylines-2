@@ -24,26 +24,32 @@ class InputSimulator:
         
         # Initialize virtual key code mapping for all standard keys
         self.key_map = {
-            # Function keys
-            'f1': Key.f1, 'f2': Key.f2, 'f3': Key.f3, 'f4': Key.f4,
-            'f5': Key.f5, 'f6': Key.f6, 'f7': Key.f7, 'f8': Key.f8,
-            'f9': Key.f9, 'f10': Key.f10, 'f11': Key.f11, 'f12': Key.f12,
-            
-            # Special keys
+            'a': 'a', 'b': 'b', 'c': 'c', 'd': 'd', 'e': 'e', 'f': 'f', 'g': 'g', 'h': 'h',
+            'i': 'i', 'j': 'j', 'k': 'k', 'l': 'l', 'm': 'm', 'n': 'n', 'o': 'o', 'p': 'p',
+            'q': 'q', 'r': 'r', 's': 's', 't': 't', 'u': 'u', 'v': 'v', 'w': 'w', 'x': 'x',
+            'y': 'y', 'z': 'z', '0': '0', '1': '1', '2': '2', '3': '3', '4': '4', '5': '5',
+            '6': '6', '7': '7', '8': '8', '9': '9', 'space': Key.space, 'enter': Key.enter,
             'escape': Key.esc, 'tab': Key.tab, 'capslock': Key.caps_lock,
             'shift': Key.shift, 'ctrl': Key.ctrl, 'alt': Key.alt,
-            'space': Key.space, 'enter': Key.enter, 'backspace': Key.backspace,
-            
-            # Navigation keys
-            'insert': Key.insert, 'delete': Key.delete, 'home': Key.home, 'end': Key.end,
-            'pageup': Key.page_up, 'pagedown': Key.page_down,
-            'left': Key.left, 'up': Key.up, 'right': Key.right, 'down': Key.down,
-        }
+            'up': Key.up, 'down': Key.down, 'left': Key.left, 'right': Key.right,
+            'delete': Key.delete, 'home': Key.home, 'end': Key.end, 'pageup': Key.page_up,
+            'pagedown': Key.page_down, 'f1': Key.f1, 'f2': Key.f2, 'f3': Key.f3, 'f4': Key.f4,
+            'f5': Key.f5, 'f6': Key.f6, 'f7': Key.f7, 'f8': Key.f8, 'f9': Key.f9, 'f10': Key.f10,
+            'f11': Key.f11, 'f12': Key.f12,
+        }1c
         
         # Add letter keys
         for c in 'abcdefghijklmnopqrstuvwxyz0123456789':
             self.key_map[c] = c
             
+        # Store game window information
+        self.game_hwnd = None
+        self.game_rect = None
+        self.client_rect = None
+        
+        # Block escape key by default to prevent accidental menu toggling
+        self.block_escape = True
+        
     def find_game_window(self) -> bool:
         """Find the Cities: Skylines II window handle."""
         game_hwnd = None
@@ -372,17 +378,34 @@ class InputSimulator:
         time.sleep(0.1)
         
     def key_press(self, key: str, duration: float = 0.1):
-        """Press and hold a keyboard key.
+        """Press a key with a short duration.
         
         Args:
-            key (str): Key name from key_map
-            duration (float): Duration to hold the key in seconds
+            key (str): Key to press
+            duration (float): How long to hold the key
         """
-        key_code = self.key_map.get(key.lower())
-        if key_code is not None:
-            self.keyboard.press(key_code)
+        # Prevent ESC key from being pressed if it's being blocked
+        if hasattr(self, 'block_escape') and self.block_escape and key.lower() in ['escape', 'esc']:
+            print("WARNING: Blocked ESC key press")
+            return False
+        
+        try:
+            # Get the key from the map
+            if key in self.key_map:
+                k = self.key_map[key]
+            else:
+                # If not in map, try direct key
+                k = key
+                
+            # Press and release with specified duration
+            self.keyboard.press(k)
             time.sleep(duration)
-            self.keyboard.release(key_code)
+            self.keyboard.release(k)
+            time.sleep(0.05)  # Small delay after release
+            return True
+        except Exception as e:
+            print(f"Error pressing key {key}: {str(e)}")
+            return False
             
     def key_combination(self, keys: List[str], duration: float = 0.1):
         """Press a combination of keys simultaneously.
@@ -420,35 +443,35 @@ class InputSimulator:
         for key_code in reversed(pressed_keys):
             self.keyboard.release(key_code)
             
-    def press_key(self, key: str, duration: float = 0.1):
-        """Press a key with a short duration.
+    def press_key(self, key: str):
+        """Press a key without releasing it.
         
         Args:
-            key (str): Key to press
-            duration (float): How long to hold the key
+            key (str): Key to press down and hold
         """
-        # Prevent ESC key from being pressed
-        if key.lower() in ['escape', 'esc']:
-            print("WARNING: Blocked ESC key press")
-            return False
-            
+        # Map string key to pynput Key if needed
+        mapped_key = self.key_map.get(key, key)
+        
         try:
-            # Get the key from the map
-            if key in self.key_map:
-                k = self.key_map[key]
-            else:
-                # If not in map, try direct key
-                k = key
-                
-            # Press and release with specified duration
-            self.keyboard.press(k)
-            time.sleep(duration)
-            self.keyboard.release(k)
-            time.sleep(0.05)  # Small delay after release
-            return True
+            # Press the key
+            self.keyboard.press(mapped_key)
         except Exception as e:
-            print(f"Error pressing key {key}: {str(e)}")
-            return False
+            print(f"Error pressing key {key}: {e}")
+    
+    def release_key(self, key: str):
+        """Release a previously pressed key.
+        
+        Args:
+            key (str): Key to release
+        """
+        # Map string key to pynput Key if needed
+        mapped_key = self.key_map.get(key, key)
+        
+        try:
+            # Release the key
+            self.keyboard.release(mapped_key)
+        except Exception as e:
+            print(f"Error releasing key {key}: {e}")
             
     def close(self):
         """Clean up resources and release all keys/buttons."""

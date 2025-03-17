@@ -282,3 +282,27 @@ class RewardSystem:
             return normalized_reward
             
         return reward 
+
+    def calculate_menu_penalty(self, in_menu: bool, consecutive_menu_steps: int = 0) -> float:
+        """Calculate penalty for being in a menu state.
+        
+        Args:
+            in_menu: Whether the agent is currently in a menu
+            consecutive_menu_steps: Number of consecutive steps agent has been in menu
+            
+        Returns:
+            float: Negative reward value as penalty for being in a menu
+        """
+        if not in_menu:
+            return 0.0
+            
+        # Base penalty for being in a menu
+        base_penalty = -0.5
+        
+        # Increase penalty the longer agent stays in menu
+        if consecutive_menu_steps > 0:
+            # Exponential penalty growth: starts small and gets increasingly severe
+            growth_factor = min(consecutive_menu_steps / 5.0, 3.0)  # Cap at 3x penalty
+            return base_penalty * (1.0 + growth_factor)
+        
+        return base_penalty 

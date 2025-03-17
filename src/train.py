@@ -52,6 +52,8 @@ def parse_args():
     parser.add_argument("--action_delay", type=float, default=1.0, help="Minimum delay between actions (seconds)")
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     parser.add_argument("--resume_best", action="store_true", help="Resume training from best checkpoint")
+    parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")
+    parser.add_argument("--capture_menu", action="store_true", help="Capture a menu screenshot at startup (assumes you're starting from the menu)")
     return parser.parse_args()
 
 def collect_trajectory(
@@ -206,10 +208,23 @@ def train():
     logger.info(f"Config initialized with device: {config.device}, mock mode: {args.mock}")
     
     # Initialize environment with config
-    env = CitiesEnvironment(config=config, mock_mode=args.mock)
+    env = CitiesEnvironment(
+        config=config, 
+        mock_mode=args.mock, 
+        menu_screenshot_path=args.menu_screenshot
+    )
     # Set minimum delay between actions
     env.min_action_delay = args.action_delay
     logger.info(f"Environment initialized with mock mode: {args.mock}, action delay: {args.action_delay}s")
+    
+    # If user requested to capture menu screenshot at startup
+    if args.capture_menu and not args.mock:
+        logger.info("Capturing menu screenshot at startup (assuming game is showing menu)")
+        menu_path = "menu_reference.png"
+        if env.capture_menu_reference(menu_path):
+            logger.info(f"Successfully captured menu screenshot to {menu_path}")
+        else:
+            logger.warning("Failed to capture menu screenshot")
     
     logger.info("Initializing agent...")
     agent = PPOAgent(config)
