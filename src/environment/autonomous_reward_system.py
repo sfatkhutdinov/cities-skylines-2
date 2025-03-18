@@ -222,7 +222,11 @@ class StateDensityEstimator:
             return min(1.0, distances[0] / 10.0)
         
         # Use average distance to k nearest neighbors as novelty measure
-        k = min(10, self.filled)
+        k = min(10, self.filled)  # Ensure k is not larger than number of states
+        if k <= 1:  # If we have 2 or fewer states
+            return min(1.0, np.mean(distances) / 10.0)
+            
+        # Get k nearest neighbors
         nearest_distances = np.partition(distances, k)[:k]
         novelty_score = np.mean(nearest_distances)
         
@@ -317,6 +321,18 @@ class TemporalAssociationMemory:
         Returns:
             float: Visual change score (-1 to 1, positive = improvement)
         """
+        # Convert tensors to numpy arrays if needed
+        if torch.is_tensor(frame1):
+            frame1 = frame1.cpu().numpy()
+        if torch.is_tensor(frame2):
+            frame2 = frame2.cpu().numpy()
+            
+        # Ensure correct channel ordering (from PyTorch's CHW to OpenCV's HWC)
+        if frame1.shape[0] == 3:  # If channels are first
+            frame1 = np.transpose(frame1, (1, 2, 0))
+        if frame2.shape[0] == 3:  # If channels are first
+            frame2 = np.transpose(frame2, (1, 2, 0))
+            
         # Convert to grayscale
         current_gray = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
         previous_gray = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
@@ -326,7 +342,7 @@ class TemporalAssociationMemory:
         score, diff = structural_similarity(previous_gray, current_gray, full=True, data_range=1.0)
         
         # Convert diff to numpy array (0-1 range)
-        diff_image = (1.0 - diff) 
+        diff_image = (1.0 - diff)
         
         # Compute visual change magnitude
         change_magnitude = np.mean(np.abs(diff_image))

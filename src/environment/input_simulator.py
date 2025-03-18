@@ -23,6 +23,11 @@ class InputSimulator:
         self.screen_height = win32api.GetSystemMetrics(1)
         print(f"Screen resolution: {self.screen_width}x{self.screen_height}")
         
+        # Initialize speed control parameters
+        self.mouse_speed = 0.5  # Default medium speed (0.0 to 1.0)
+        self.key_press_duration = 0.1  # Default key press duration
+        self.verification_delay = 0.1  # Default verification delay
+        
         # Initialize virtual key code mapping for all standard keys
         self.key_map = {
             'a': 'a', 'b': 'b', 'c': 'c', 'd': 'd', 'e': 'e', 'f': 'f', 'g': 'g', 'h': 'h',
@@ -275,9 +280,9 @@ class InputSimulator:
         if use_win32 and not relative:
             try:
                 win32api.SetCursorPos((x, y))
-                # Verify position after setting
+                # Verify position after setting - use speed-based verification delay
                 for attempt in range(3):  # Try up to 3 times
-                    time.sleep(0.05)
+                    time.sleep(self.verification_delay)
                     new_x, new_y = win32api.GetCursorPos()
                     if abs(new_x - x) <= 3 and abs(new_y - y) <= 3:
                         # Position is close enough
@@ -302,8 +307,9 @@ class InputSimulator:
             # Configure pyautogui to not enforce physical screen boundaries
             pyautogui.FAILSAFE = False
             
-            # Move mouse with pyautogui for fallback
-            pyautogui.moveTo(target_x, target_y, duration=0.1)
+            # Move mouse with pyautogui for fallback - use speed-based duration
+            duration = max(0.05, 0.2 * (1.0 - self.mouse_speed))  # Faster speed = shorter duration
+            pyautogui.moveTo(target_x, target_y, duration=duration)
             
             # Verify final position
             final_x, final_y = win32api.GetCursorPos()
@@ -352,50 +358,52 @@ class InputSimulator:
             self.mouse.click(btn, 1)
             time.sleep(0.1)
             
-    def mouse_drag(self, start: Tuple[int, int], end: Tuple[int, int],
-                  button: str = 'left', duration: float = 0.2):
-        """Perform mouse drag operation.
+    def mouse_drag(self, start_x: int, start_y: int, end_x: int, end_y: int, duration: float = None):
+        """Drag mouse from start position to end position.
         
         Args:
-            start (Tuple[int, int]): Starting coordinates (x, y)
-            end (Tuple[int, int]): Ending coordinates (x, y)
-            button (str): 'left', 'right', or 'middle'
-            duration (float): Duration of drag operation in seconds
+            start_x (int): Starting X coordinate
+            start_y (int): Starting Y coordinate
+            end_x (int): Ending X coordinate
+            end_y (int): Ending Y coordinate
+            duration (float): Duration of the drag in seconds. If None, calculated based on distance and speed.
         """
-        x1, y1 = start
-        x2, y2 = end
+        # Print drag operation details
+        print(f"Dragging mouse: ({start_x},{start_y}) -> ({end_x},{end_y})")
         
-        # Map button string to pynput Button
-        button_map = {
-            'left': Button.left,
-            'right': Button.right,
-            'middle': Button.middle
-        }
-        btn = button_map.get(button, Button.left)
+        # Move to start position
+        self.mouse_move(start_x, start_y)
+        time.sleep(self.verification_delay)
         
-        # Move to start position using improved mouse_move
-        self.mouse_move(x1, y1)
-        time.sleep(0.1)
+        # Press left button
+        self.mouse.press(Button.left)
+        time.sleep(self.verification_delay)
         
-        # Print drag operation details for debugging
-        print(f"Dragging: ({x1},{y1}) -> ({x2},{y2}) with {button} button")
+        # Calculate drag duration based on distance if none specified
+        if duration is None:
+            # Calculate Euclidean distance
+            distance = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
+            
+            # Scale duration with distance, adjusted by speed
+            # Longer distance = longer duration, higher speed = shorter duration
+            base_duration = min(2.0, max(0.5, distance / 500))
+            duration = base_duration * (1.0 - 0.7 * self.mouse_speed)  # Reduce duration by up to 70% at max speed
+            
+            print(f"Calculated drag duration: {duration:.2f}s (distance: {distance:.1f}px, speed: {self.mouse_speed:.1f})")
         
-        # Press button
-        self.mouse.press(btn)
-        time.sleep(0.1)
+        # Smooth movement with more steps for longer drags
+        steps = max(10, int(duration * 60))  # At least 10 steps, more for longer durations
         
-        # Smooth movement
-        steps = max(5, int(duration * 60))  # At least 5 steps, up to 60 updates per second
         for i in range(1, steps + 1):
             t = i / steps
-            x = int(x1 + (x2 - x1) * t)
-            y = int(y1 + (y2 - y1) * t)
+            x = int(start_x + (end_x - start_x) * t)
+            y = int(start_y + (end_y - start_y) * t)
             self.mouse_move(x, y)
             time.sleep(duration / steps)
             
-        # Release button
-        self.mouse.release(btn)
-        time.sleep(0.1)
+        # Release left button
+        self.mouse.release(Button.left)
+        time.sleep(self.verification_delay)
         
     def mouse_scroll(self, clicks: int):
         """Scroll the mouse wheel.
@@ -473,36 +481,36 @@ class InputSimulator:
         self.mouse.release(Button.right)
         time.sleep(0.1)
         
-    def key_press(self, key: str, duration: float = 0.1):
-        """Press a key with a short duration.
+    def key_press(self, key: str, duration: float = None):
+        """Press a key for a specified duration.
         
         Args:
             key (str): Key to press
-            duration (float): How long to hold the key
+            duration (float): Duration to hold the key in seconds. If None, uses speed-based duration.
         """
-        # Completely prevent ESC key from being pressed unless explicitly allowed
-        if key.lower() in ['escape', 'esc']:
-            if hasattr(self, 'block_escape') and self.block_escape:
-                print("WARNING: Blocked ESC key press - using safe menu handling instead")
-                return self.safe_menu_handling()
-        
         try:
-            # Get the key from the map
+            # Convert key to virtual key code
             if key in self.key_map:
-                k = self.key_map[key]
-            else:
-                # If not in map, try direct key
-                k = key
-                
-            # Press and release with specified duration
-            self.keyboard.press(k)
+                key = self.key_map[key]
+            
+            # Use speed-based duration if none specified
+            if duration is None:
+                duration = self.key_press_duration
+            
+            # Press key
+            self.keyboard.press(key)
+            
+            # Wait for specified duration
             time.sleep(duration)
-            self.keyboard.release(k)
-            time.sleep(0.05)  # Small delay after release
-            return True
+            
+            # Release key
+            self.keyboard.release(key)
+            
+            # Add small delay after key press - use speed-based verification delay
+            time.sleep(self.verification_delay)
+            
         except Exception as e:
-            print(f"Error pressing key {key}: {str(e)}")
-            return False
+            print(f"Error in key_press: {e}")
             
     def safe_menu_handling(self):
         """Safely handle menu toggling without using Escape key.
@@ -731,4 +739,24 @@ class InputSimulator:
         btn = button_map.get(button, Button.left)
         
         # Release button
-        self.mouse.release(btn) 
+        self.mouse.release(btn)
+        
+    def set_movement_speed(self, speed: float):
+        """Set the movement speed for mouse and keyboard actions.
+        
+        Args:
+            speed (float): Speed value between 0.0 (slowest) and 1.0 (fastest)
+        """
+        if not 0.0 <= speed <= 1.0:
+            raise ValueError("Speed must be between 0.0 and 1.0")
+            
+        # Adjust key press duration based on speed
+        self.key_press_duration = max(0.05, 0.2 * (1.0 - speed))  # Faster speed = shorter duration
+        
+        # Set mouse speed directly
+        self.mouse_speed = speed
+        
+        # Adjust verification delays based on speed
+        self.verification_delay = max(0.05, 0.2 * (1.0 - speed))  # Faster speed = shorter verification delay
+        
+        print(f"Movement speed set to {speed}, key press duration: {self.key_press_duration}s, verification delay: {self.verification_delay}s") 

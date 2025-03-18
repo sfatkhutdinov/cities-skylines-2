@@ -123,100 +123,53 @@ class CitiesEnvironment:
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
         base_actions = {
-            # Camera actions - Default key bindings
-            0: {"type": "camera", "action": "move_up"},          # W
-            1: {"type": "camera", "action": "move_down"},        # S
-            2: {"type": "camera", "action": "move_left"},        # A
-            3: {"type": "camera", "action": "move_right"},       # D
-            4: {"type": "camera", "action": "zoom_in"},          # R
-            5: {"type": "camera", "action": "zoom_out"},         # F
-            6: {"type": "camera", "action": "rotate_left"},      # Q
-            7: {"type": "camera", "action": "rotate_right"},     # E
-            8: {"type": "camera", "action": "tilt_up"},          # T
-            9: {"type": "camera", "action": "tilt_down"},        # G
-            10: {"type": "camera", "action": "pan_left"},        # A (longer press)
-            11: {"type": "camera", "action": "pan_right"},       # D (longer press)
+            # Speed control actions (0.0 to 1.0)
+            0: {"type": "speed", "speed": 0.0},  # Slowest
+            1: {"type": "speed", "speed": 0.25}, # Slow
+            2: {"type": "speed", "speed": 0.5},  # Medium
+            3: {"type": "speed", "speed": 0.75}, # Fast
+            4: {"type": "speed", "speed": 1.0},  # Fastest
             
-            # Enhanced camera control - Combo movements
-            12: {"type": "camera", "action": "move_up_left"},    # W+A
-            13: {"type": "camera", "action": "move_up_right"},   # W+D
-            14: {"type": "camera", "action": "move_down_left"},  # S+A
-            15: {"type": "camera", "action": "move_down_right"}, # S+D
-            16: {"type": "camera", "action": "orbit_left"},      # Q+A
-            17: {"type": "camera", "action": "orbit_right"},     # E+D
-            18: {"type": "camera", "action": "move_up_fast"},    # W (longer press)
-            19: {"type": "camera", "action": "move_down_fast"},  # S (longer press)
+            # Basic camera movements (no semantic meaning, just key presses)
+            5: {"type": "key", "key": "w", "duration": 0.1},
+            6: {"type": "key", "key": "s", "duration": 0.1},
+            7: {"type": "key", "key": "a", "duration": 0.1},
+            8: {"type": "key", "key": "d", "duration": 0.1},
+            9: {"type": "key", "key": "r", "duration": 0.1},
+            10: {"type": "key", "key": "f", "duration": 0.1},
+            11: {"type": "key", "key": "q", "duration": 0.1},
+            12: {"type": "key", "key": "e", "duration": 0.1},
+            13: {"type": "key", "key": "t", "duration": 0.1},
+            14: {"type": "key", "key": "g", "duration": 0.1},
             
-            # UI exploration actions
-            20: {"type": "ui", "action": "click_random"},
-            21: {"type": "ui", "action": "right_click_random"},
-            22: {"type": "ui", "action": "drag_random"},
-            23: {"type": "ui", "action": "click_top_menu"},
-            24: {"type": "ui", "action": "hover_random"},
-            25: {"type": "ui", "action": "double_click_random"},
-            26: {"type": "ui", "action": "scroll_up"},
-            27: {"type": "ui", "action": "scroll_down"},
+            # Basic UI interactions (no semantic meaning, just mouse actions)
+            15: {"type": "mouse", "action": "click", "button": "left"},
+            16: {"type": "mouse", "action": "click", "button": "right"},
+            17: {"type": "mouse", "action": "double_click", "button": "left"},
+            18: {"type": "mouse", "action": "drag", "button": "left"},
+            19: {"type": "mouse", "action": "scroll", "direction": 1},
+            20: {"type": "mouse", "action": "scroll", "direction": -1},
             
-            # Building actions
-            28: {"type": "build", "action": "residential_zone"},
-            29: {"type": "build", "action": "commercial_zone"},
-            30: {"type": "build", "action": "industrial_zone"},
-            31: {"type": "build", "action": "road"},
-            32: {"type": "build", "action": "highway"},
-            33: {"type": "build", "action": "avenue"},
-            34: {"type": "build", "action": "curve_road"},
-            35: {"type": "build", "action": "power_line"},
-            36: {"type": "build", "action": "water_pipe"},
-            37: {"type": "build", "action": "park"},
-            38: {"type": "build", "action": "plaza"},
+            # Basic game controls (no semantic meaning, just key presses)
+            21: {"type": "key", "key": "space", "duration": 0.1},
+            22: {"type": "key", "key": "1", "duration": 0.1},
+            23: {"type": "key", "key": "2", "duration": 0.1},
+            24: {"type": "key", "key": "3", "duration": 0.1},
+            25: {"type": "key", "key": "b", "duration": 0.1},
+            26: {"type": "key", "key": "escape", "duration": 0.1},
             
-            # Service actions
-            39: {"type": "service", "action": "police"},
-            40: {"type": "service", "action": "fire"},
-            41: {"type": "service", "action": "healthcare"},
-            42: {"type": "service", "action": "elementary_school"},
-            43: {"type": "service", "action": "high_school"},
-            44: {"type": "service", "action": "university"},
-            45: {"type": "service", "action": "bus_stop"},
-            46: {"type": "service", "action": "train_station"},
-            
-            # Tool actions - Default key bindings
-            47: {"type": "tool", "action": "bulldoze"},          # B
-            48: {"type": "tool", "action": "raise_terrain"},     # Page Up
-            49: {"type": "tool", "action": "lower_terrain"},     # Page Down
-            50: {"type": "tool", "action": "level_terrain"},     # Page Up + drag
-            51: {"type": "tool", "action": "focus_selection"},   # U
-            52: {"type": "tool", "action": "hide_ui"},           # ` (backtick)
-            53: {"type": "tool", "action": "quicksave"},         # F5
-            54: {"type": "tool", "action": "quickload"},         # F9
-            
-            # Time control - Default key bindings
-            55: {"type": "time", "action": "pause"},             # Space
-            56: {"type": "time", "action": "play_normal"},       # 1
-            57: {"type": "time", "action": "play_fast"},         # 2
-            58: {"type": "time", "action": "play_fastest"},      # 3
-            59: {"type": "time", "action": "wait_short"},        # (just wait)
-            60: {"type": "time", "action": "wait_medium"},       # (just wait longer)
-            61: {"type": "time", "action": "open_pause_menu"},   # Escape
-            
-            # Info views - Default key bindings
-            62: {"type": "info_view", "action": "progression"},           # P
-            63: {"type": "info_view", "action": "city_economy"},          # Z
-            64: {"type": "info_view", "action": "city_information"},      # C
-            65: {"type": "info_view", "action": "city_statistics"},       # V
-            66: {"type": "info_view", "action": "transportation_overview"}, # X
-            67: {"type": "info_view", "action": "map_tiles"},             # M
-            68: {"type": "info_view", "action": "photo_mode"},            # . (period)
-            69: {"type": "info_view", "action": "take_photo"},            # Enter
-            
-            # Multi-step actions
-            70: {"type": "sequence", "action": "open_menu_click"},
-            71: {"type": "sequence", "action": "build_and_connect"},
+            # Basic info keys (no semantic meaning, just key presses)
+            27: {"type": "key", "key": "p", "duration": 0.1},
+            28: {"type": "key", "key": "z", "duration": 0.1},
+            29: {"type": "key", "key": "c", "duration": 0.1},
+            30: {"type": "key", "key": "v", "duration": 0.1},
+            31: {"type": "key", "key": "x", "duration": 0.1},
+            32: {"type": "key", "key": "m", "duration": 0.1},
         }
         
         # Create grid of points across screen (10x10 grid = 100 additional actions)
         grid_size = 10
-        action_offset = 72  # Start after the base actions
+        action_offset = 33  # Start after the base actions
         
         for i in range(grid_size):
             for j in range(grid_size):
@@ -233,21 +186,21 @@ class CitiesEnvironment:
                 y = int(screen_height * (j + 0.5) / grid_size)
                 action_idx = action_offset + i * grid_size + j
                 base_actions[action_idx] = {
-                    "type": "ui_position", 
-                    "action": "click",
+                    "type": "mouse", 
+                    "action": "move",
                     "position": (x, y)
                 }
                 
-                # Add right-click grid points
+                # Add click actions for each grid point
                 action_idx = action_offset + 100 + i * grid_size + j
                 base_actions[action_idx] = {
-                    "type": "ui_position", 
-                    "action": "right_click",
-                    "position": (x, y)
+                    "type": "mouse", 
+                    "action": "click",
+                    "position": (x, y),
+                    "button": "left"
                 }
         
-        # Add grid drag actions (for more precise zoning)
-        # We'll create 50 drag actions between random grid points
+        # Add drag actions between random grid points with variable durations
         drag_count = 0
         max_drags = 50
         drag_offset = action_offset + 200
@@ -256,7 +209,6 @@ class CitiesEnvironment:
             i1, j1 = random.randint(0, grid_size-1), random.randint(0, grid_size-1)
             i2, j2 = random.randint(0, grid_size-1), random.randint(0, grid_size-1)
             
-            # Ensure start and end points are different
             if i1 == i2 and j1 == j2:
                 continue
                 
@@ -265,12 +217,18 @@ class CitiesEnvironment:
             x2 = int(screen_width * (i2 + 0.5) / grid_size)
             y2 = int(screen_height * (j2 + 0.5) / grid_size)
             
+            # Calculate duration based on distance
+            distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            duration = min(2.0, max(0.5, distance / 500))  # Scale duration with distance
+            
             action_idx = drag_offset + drag_count
             base_actions[action_idx] = {
-                "type": "ui_position", 
+                "type": "mouse", 
                 "action": "drag",
                 "start": (x1, y1),
-                "end": (x2, y2)
+                "end": (x2, y2),
+                "button": "left",
+                "duration": duration
             }
             drag_count += 1
             
@@ -718,6 +676,14 @@ class CitiesEnvironment:
     def _execute_action(self, action_info: Dict[str, Any]):
         """Execute the specified action in the game."""
         action_type = action_info["type"]
+        
+        # Handle speed control actions
+        if action_type == "speed":
+            speed = action_info["speed"]
+            self.input_simulator.set_movement_speed(speed)
+            logger.info(f"Set movement speed to {speed}")
+            return
+            
         action = action_info["action"]
         
         if action_type == "camera":
@@ -735,7 +701,8 @@ class CitiesEnvironment:
                 # Handle drag between two positions
                 start = action_info["start"]
                 end = action_info["end"]
-                self.input_simulator.mouse_drag(start, end)
+                duration = action_info.get("duration", None)  # Use provided duration or default (None = auto-calculate)
+                self.input_simulator.mouse_drag(start[0], start[1], end[0], end[1], duration)
             else:
                 # Handle single position actions (click, right-click, etc.)
                 position = action_info.get("position", (0, 0))
@@ -1357,12 +1324,14 @@ class CitiesEnvironment:
             self.input_simulator.mouse_move(start_x, start_y)
             time.sleep(0.3)
             
-            # Press and hold mouse button
-            self.input_simulator.mouse_click(start_x, start_y, button='left', double=False)
-            time.sleep(0.3)
+            # Calculate distance for duration
+            distance = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
             
-            # Drag to ending point
-            self.input_simulator.mouse_drag((start_x, start_y), (end_x, end_y), button='left', duration=0.5)
+            # Scale duration with distance
+            duration = min(2.0, max(0.5, distance / 500))
+            
+            # Drag to ending point with calculated duration (None = auto-calculate based on distance and speed)
+            self.input_simulator.mouse_drag(start_x, start_y, end_x, end_y, None)
             time.sleep(0.3)
             
             # Click to confirm (some actions require this)
