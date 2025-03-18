@@ -240,7 +240,7 @@ class StateDensityEstimator:
             
         # Get k nearest neighbors - ensure k is at least 3 to avoid np.partition errors
         k = max(3, k)
-        if k > len(distances):
+        if k >= len(distances):
             return min(1.0, np.mean(distances) / 10.0)
             
         nearest_distances = np.partition(distances, k)[:k]
