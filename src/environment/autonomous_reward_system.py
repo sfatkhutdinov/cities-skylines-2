@@ -44,12 +44,11 @@ class WorldModelCNN(nn.Module):
         # Feature representation (for novelty detection)
         # Calculate the output size from encoder dynamically
         with torch.no_grad():
-            # Get resolution from config
-            width, height = getattr(config, 'resolution', (1920, 1080))
-            # Scale down to match the expected input resolution for the model
-            model_width, model_height = 320, 240  # Typical processing resolution
+            # Get resolution from config or fall back to defaults
+            width, height = 320, 180  # Default for optimized_network.py 
+            
             # Create a dummy input to compute output shape - MUST use the same dtype as the encoder
-            dummy_input = torch.zeros(1, 3, model_height, model_width, 
+            dummy_input = torch.zeros(1, 3, height, width, 
                                      device=self.device, dtype=self.dtype)
             encoder_output = self.encoder(dummy_input)
             flattened_size = encoder_output.numel() // encoder_output.size(0)
@@ -93,7 +92,12 @@ class WorldModelCNN(nn.Module):
         Returns:
             torch.Tensor: Feature representation
         """
-        x = frame.to(self.device, dtype=self.dtype)
+        # Extract single frame if stacked
+        if frame.shape[0] > 3 and frame.shape[0] % 3 == 0:
+            x = frame[-3:].to(self.device, dtype=self.dtype)
+        else:
+            x = frame.to(self.device, dtype=self.dtype)
+            
         if len(x.shape) == 3:
             x = x.unsqueeze(0)  # Add batch dimension
         
@@ -116,14 +120,20 @@ class WorldModelCNN(nn.Module):
             return torch.zeros(3, 240, 320, device=self.device, dtype=self.dtype)
             
         # Use the most recent frame
-        frame = frames[-1].to(self.device, dtype=self.dtype)
+        frame = frames[-1]
+        
+        # Extract single frame if stacked
+        if frame.shape[0] > 3 and frame.shape[0] % 3 == 0:
+            frame = frame[-3:].to(self.device, dtype=self.dtype)
+        else:
+            frame = frame.to(self.device, dtype=self.dtype)
         
         # Store original dimensions for later resizing
         original_shape = frame.shape
         
         if len(frame.shape) == 3:
             frame = frame.unsqueeze(0)  # Add batch dimension
-        
+            
         # Encode frame
         encoded = self.encoder(frame)
         
@@ -140,7 +150,12 @@ class WorldModelCNN(nn.Module):
         
         # Apply action influence
         for b in range(batch_size):
-            action_channel[b, 0] = action_spatial[b, 0].view(height, width)
+            # Make sure the shape is exactly right
+            action_influence = action_spatial[b, 0]
+            # Safely reshape to match exactly
+            total_elements = height * width
+            action_influence = action_influence.flatten()[:total_elements].reshape(height, width)
+            action_channel[b, 0] = action_influence
         
         # Concatenate features with action channel
         combined_features = torch.cat([encoded, action_channel], dim=1)
@@ -171,8 +186,16 @@ class WorldModelCNN(nn.Module):
             action (int): Action taken
             current_frame (torch.Tensor): Current frame [C, H, W]
         """
-        prev = previous_frame.to(self.device, dtype=self.dtype)
-        curr = current_frame.to(self.device, dtype=self.dtype)
+        # Extract single frames if stacked
+        if previous_frame.shape[0] > 3 and previous_frame.shape[0] % 3 == 0:
+            prev = previous_frame[-3:].to(self.device, dtype=self.dtype)
+        else:
+            prev = previous_frame.to(self.device, dtype=self.dtype)
+            
+        if current_frame.shape[0] > 3 and current_frame.shape[0] % 3 == 0:
+            curr = current_frame[-3:].to(self.device, dtype=self.dtype)
+        else:
+            curr = current_frame.to(self.device, dtype=self.dtype)
         
         if len(prev.shape) == 3:
             prev = prev.unsqueeze(0)  # Add batch dimension
@@ -195,7 +218,12 @@ class WorldModelCNN(nn.Module):
         
         # Apply action influence
         for b in range(batch_size):
-            action_channel[b, 0] = action_spatial[b, 0].view(height, width)
+            # Make sure the shape is exactly right
+            action_influence = action_spatial[b, 0]
+            # Safely reshape to match exactly
+            total_elements = height * width
+            action_influence = action_influence.flatten()[:total_elements].reshape(height, width)
+            action_channel[b, 0] = action_influence
         
         # Concatenate features with action channel
         combined_features = torch.cat([encoded, action_channel], dim=1)
@@ -340,6 +368,23 @@ class TemporalAssociationMemory:
             'yellow': {'positive': 0, 'negative': 0},
             'white': {'positive': 0, 'negative': 0}
         }
+        
+    def _extract_single_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        """Extract a single RGB frame from potentially stacked frames.
+        
+        Args:
+            frame (torch.Tensor): Input frame, may be stacked
+            
+        Returns:
+            torch.Tensor: Single RGB frame with 3 channels
+        """
+        # Check if this is a stacked frame (multiple of 3 channels)
+        if frame.shape[0] > 3 and frame.shape[0] % 3 == 0:
+            # Take the most recent frame (last 3 channels)
+            return frame[-3:]
+        
+        # Already a single frame
+        return frame
         
     def update(self, frame: torch.Tensor, action: int, next_frame: torch.Tensor):
         """Update temporal memory with new observation.
@@ -938,6 +983,10 @@ class AutonomousRewardSystem:
         Returns:
             float: Visual change score (positive = improvement)
         """
+        # Extract single frames if stacked
+        current_frame = self._extract_single_frame(current_frame)
+        previous_frame = self._extract_single_frame(previous_frame)
+        
         # Convert to numpy for OpenCV
         current_np = current_frame.detach().cpu().numpy()
         previous_np = previous_frame.detach().cpu().numpy()
