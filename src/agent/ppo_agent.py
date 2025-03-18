@@ -92,6 +92,13 @@ class PPOAgent:
         if state.device != self.device:
             state = state.to(self.device)
             
+        # Ensure state has batch dimension
+        if state.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+            state = state.unsqueeze(0)
+            
+        # Log state shape for debugging
+        logger.debug(f"Action selection - state shape: {state.shape}")
+            
         # Get action probabilities and value
         with torch.no_grad():
             action_probs, value = self.network(state)
@@ -557,13 +564,17 @@ class PPOAgent:
             done: Whether the episode is done
             next_state: Next state
         """
-        # Store in memory
+        # Convert tensor inputs to proper format
+        if isinstance(action, torch.Tensor):
+            action = action.unsqueeze(0) if action.dim() == 0 else action
+            
         if isinstance(action_prob, torch.Tensor):
             action_prob = action_prob.item()
             
         if isinstance(value, torch.Tensor):
-            value = value.item() 
+            value = value.item()
             
+        # Store in memory buffers
         self.states.append(state)
         self.actions.append(action)
         self.action_probs.append(action_prob)

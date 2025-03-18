@@ -95,6 +95,7 @@ def collect_trajectory(
     Returns:
         Tuple of (states, actions, log_probs, rewards, values, dones, next_states, total_reward)
     """
+    # Initialize storage
     states = []
     next_states = []
     actions = []
@@ -104,78 +105,40 @@ def collect_trajectory(
     dones = []
     total_reward = 0.0
     
-    # Get initial state
+    # Get initial state and create frame history
     state = env.reset()
+    frame_history = [state.clone() for _ in range(4)]  # Always use 4 frames for stacking
     
-    # For frame stacking - create history of last 4 frames
-    frame_stack_size = 4  # Match model expectation of 12 channels (4 frames * 3 channels)
-    frame_history = [state.clone() for _ in range(frame_stack_size)]
+    # Create stacked initial state
+    stacked_state = torch.cat(frame_history, dim=0)
     
-    # Define mini-batch size for parallel processing
-    mini_batch_size = min(8, max_steps)  # Process up to 8 steps at once
-    
-    for step in range(0, max_steps, mini_batch_size):
-        # Limit batch size to remaining steps
-        current_batch_size = min(mini_batch_size, max_steps - step)
+    # Loop through steps
+    for step in range(max_steps):
+        # Select action using current policy
+        action, log_prob, value = agent.select_action(stacked_state.unsqueeze(0))
         
-        # Initialize batch storage
-        batch_states = []
-        batch_actions = []
-        batch_log_probs = []
-        batch_values = []
-        batch_next_states = []
-        batch_rewards = []
-        batch_dones = []
+        # Execute action in environment
+        next_state, reward, done, info = env.step(action.item())
+        total_reward += reward
         
-        # Collect experience for the mini-batch
-        for i in range(current_batch_size):
-            # Create stacked frame by concatenating last 4 frames along channel dimension
-            stacked_frame = torch.cat(frame_history, dim=0)
-            batch_states.append(stacked_frame)
-            
-            # If this is the last step in the batch, we'll use the results
-            # Otherwise we're just pre-filling the batch
-            if i == current_batch_size - 1:
-                # Process the entire batch at once using the batch action selection
-                batch_tensor = torch.stack(batch_states)
-                with torch.inference_mode():
-                    batch_actions_tensor, batch_log_probs_tensor, batch_values_tensor = agent.select_action_batch(batch_tensor)
-                
-                # Now execute each action in the environment and collect results
-                for j in range(current_batch_size):
-                    # Get the action for this position in the batch
-                    action = batch_actions_tensor[j].item()
-                    log_prob = batch_log_probs_tensor[j]
-                    value = batch_values_tensor[j]
-                    
-                    # Execute in environment
-                    next_state, reward, done, info = env.step(action)
-                    total_reward += reward
-                    
-                    # Update frame history
-                    frame_history.pop(0)
-                    frame_history.append(next_state.clone())
-                    
-                    # Create stacked next state
-                    stacked_next_state = torch.cat(frame_history, dim=0)
-                    
-                    # Store transition
-                    states.append(batch_states[j])
-                    actions.append(action)
-                    log_probs.append(log_prob)
-                    values.append(value)
-                    rewards.append(reward)
-                    dones.append(done)
-                    next_states.append(stacked_next_state)
-                    
-                    # Prepare for next iteration
-                    state = next_state
-                    
-                    if done:
-                        # If episode is done, don't continue
-                        break
-            
-        # If episode ended in the middle of the batch, break out of main loop
+        # Update frame history for next state
+        frame_history.pop(0)
+        frame_history.append(next_state.clone())
+        stacked_next_state = torch.cat(frame_history, dim=0)
+        
+        # Store transition
+        states.append(stacked_state)
+        actions.append(action)
+        log_probs.append(log_prob)
+        values.append(value)
+        rewards.append(reward)
+        dones.append(done)
+        next_states.append(stacked_next_state)
+        
+        # Update current state
+        stacked_state = stacked_next_state
+        
+        # End episode if done
         if done:
             break
     
@@ -280,60 +243,42 @@ def main():
     best_reward = float('-inf')
     last_time_checkpoint = time.time()
     
-    # Auto-resume logic: Automatically load checkpoints unless explicitly disabled
-    should_auto_resume = not args.no_auto_resume and not args.resume and not args.resume_best
-    
-    if args.resume or args.resume_best or should_auto_resume:
-        # Priority order for loading:
-        # 1. If --resume_best is specified, try loading best_model.pt
-        # 2. If --resume is specified, try loading the latest checkpoint
-        # 3. If auto-resume is enabled (default), try best_model.pt first, then latest checkpoint
-        
-        if (args.resume_best or should_auto_resume) and (checkpoint_dir / "best_model.pt").exists():
-            # Resume from best model
+    # Auto-resume logic for recovery after crashes
+    if not args.no_auto_resume and os.path.exists(args.checkpoint_dir):
+        latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+        if latest_checkpoint:
+            episode_num, checkpoint_path = latest_checkpoint
             try:
-                logger.info("Loading best model checkpoint...")
-                agent.load(checkpoint_dir / "best_model.pt")
-                logger.info("Successfully loaded best model")
+                logger.info(f"Found checkpoint at {checkpoint_path}, attempting to resume...")
+                agent.load(checkpoint_path)
+                start_episode = episode_num
+                logger.info(f"Successfully resumed from checkpoint at episode {episode_num}")
             except Exception as e:
-                logger.error(f"Failed to load best model: {str(e)}")
-                
-        # If best model loading was not requested or failed, try latest checkpoint
-        if not (args.resume or args.resume_best or should_auto_resume):
-            # Find and load the latest checkpoint
-            latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
-            if latest_checkpoint:
-                episode_num, checkpoint_path = latest_checkpoint
-                try:
-                    logger.info(f"Loading checkpoint from {checkpoint_path}...")
-                    agent.load(checkpoint_path)
-                    start_episode = episode_num
-                    logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
-                except Exception as e:
-                    logger.error(f"Failed to load checkpoint: {str(e)}")
-        
-        if not (args.resume or args.resume_best or should_auto_resume):
-            logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
-        elif should_auto_resume:
-            logger.info("Auto-resume successfully loaded checkpoint.")
+                logger.error(f"Failed to load checkpoint: {str(e)}")
+                logger.info("Starting fresh training due to checkpoint load failure")
     
-    # Initialize wandb if available
+    logger.info(f"Starting training with model dimensions: {agent.network.expected_width}x{agent.network.expected_height}")
+    logger.info(f"Frame stack size: {hardware_config.frame_stack}")
+    
+    # Initialize wandb logging if available
     use_wandb = False
     try:
-        wandb.init(project="cs2-agent", config={
-            "num_episodes": args.num_episodes,
-            "max_steps": args.max_steps,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "resolution": args.resolution,
-            "device": args.device,
-            "mock_mode": args.mock,
-            "use_curiosity": True  # Flag that we're using curiosity-driven exploration
-        })
+        import wandb
         use_wandb = True
-        logger.info("Initialized wandb for experiment tracking")
-    except Exception as e:
-        logger.warning(f"Failed to initialize wandb: {str(e)}")
+        logger.info("Initializing wandb for experiment tracking")
+        wandb.init(
+            project="cs2-agent",
+            config={
+                "learning_rate": args.learning_rate,
+                "batch_size": args.batch_size,
+                "device": args.device,
+                "resolution": args.resolution,
+                "max_steps": args.max_steps,
+                "frame_stack": hardware_config.frame_stack
+            }
+        )
+    except ImportError:
+        logger.warning("wandb not available, skipping experiment tracking")
     
     # Training loop
     best_reward = float('-inf')

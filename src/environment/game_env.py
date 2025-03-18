@@ -297,24 +297,20 @@ class CitiesEnvironment:
         Returns:
             torch.Tensor: Initial observation
         """
-        # Increment performance logging counter
-        self._update_performance_metrics()
-        
-        # Reset step counter
+        # Reset internal state variables
         self.steps_taken = 0
         self.episode_step = 0
         self.cumulative_reward = 0.0
         self.done = False
-        
-        # Reset menu counter and suppression
         self.menu_stuck_counter = 0
         self.suppress_menu_actions = False
         self.menu_action_suppression_steps = 0
         
-        # In mock mode, just return the mock frame
+        # Handle mock mode
         if self.mock_mode:
-            logger.info("Using mock environment for testing/training")
-            self.current_frame = torch.rand((3, 224, 224), device=self.config.get_device())
+            logger.info("Using mock environment")
+            # Create mock observation with correct channel/dimension order [C, H, W]
+            self.current_frame = torch.rand(3, 180, 320, device=self.config.get_device())
             return self.current_frame
             
         # For real game mode, try to focus the game window
@@ -462,6 +458,33 @@ class CitiesEnvironment:
             
         logger.info(f"Game speed set to level {speed_level}")
         time.sleep(0.2)  # Give time for speed change to take effect
+    
+    def get_observation(self) -> torch.Tensor:
+        """Get the current observation (frame) from the environment.
+        
+        Returns:
+            torch.Tensor: Current observation frame
+        """
+        # In mock mode, return the mock frame
+        if self.mock_mode:
+            return self.mock_frame
+            
+        # Capture the current frame from the game
+        frame = self.screen_capture.capture_frame()
+        
+        # If capture failed, try to focus the window and try again
+        if frame is None:
+            logger.warning("Frame capture failed, trying to focus window")
+            self.input_simulator.ensure_game_window_focused()
+            time.sleep(0.1)
+            frame = self.screen_capture.capture_frame()
+            
+            if frame is None:
+                logger.error("Frame capture failed again, returning zeros")
+                # Return a black frame with appropriate dimensions
+                return torch.zeros((3, 180, 320), device=self.config.get_device())
+        
+        return frame
     
     def step(self, action_index: int) -> Tuple[torch.Tensor, float, bool, dict]:
         """Take an action in the environment.
@@ -738,8 +761,8 @@ class CitiesEnvironment:
         # Prepare info dict
         info = {
             'steps': self.steps_taken,
-            'action_type': action_info["type"],
-            'action': action_info["action"],
+            'action_type': action_info.get("type", "unknown"),
+            'action': action_info.get("action", "unknown"),
             'menu_detected': self.visual_estimator.detect_main_menu(self.current_frame),
             'menu_penalty': menu_penalty if menu_detected else 0.0,
             'menu_stuck_counter': self.menu_stuck_counter,
@@ -748,9 +771,13 @@ class CitiesEnvironment:
         
         return self.current_frame, reward, done, info
     
-    def _execute_action(self, action_info: Dict[str, Any]):
-        """Execute the specified action in the game."""
-        action_type = action_info["type"]
+    def _execute_action(self, action_info: Dict):
+        """Execute a selected action based on its type.
+        
+        Args:
+            action_info (Dict): Action information dictionary
+        """
+        action_type = action_info.get("type", "")
         
         # Handle speed control actions
         if action_type == "speed":
@@ -758,8 +785,37 @@ class CitiesEnvironment:
             self.input_simulator.set_movement_speed(speed)
             logger.info(f"Set movement speed to {speed}")
             return
+        
+        # Handle key press actions    
+        if action_type == "key":
+            key = action_info.get("key", "")
+            duration = action_info.get("duration", 0.1)
+            if key:
+                self.input_simulator.key_press(key, duration)
+                logger.debug(f"Pressed key: {key} for {duration}s")
+            return
             
-        action = action_info["action"]
+        # Handle mouse actions
+        if action_type == "mouse":
+            action = action_info.get("action", "")
+            button = action_info.get("button", "left")
+            if action == "click":
+                self.input_simulator.mouse_click(button=button)
+                logger.debug(f"Mouse {button} click")
+            elif action == "double_click":
+                self.input_simulator.mouse_click(button=button, double=True)
+                logger.debug(f"Mouse {button} double click")
+            elif action == "scroll":
+                direction = action_info.get("direction", 0)
+                self.input_simulator.mouse_scroll(direction)
+                logger.debug(f"Mouse scroll: {direction}")
+            return
+            
+        # For other action types, extract the action
+        action = action_info.get("action", "")
+        if not action:
+            logger.warning(f"No action specified for action type: {action_type}")
+            return
         
         if action_type == "camera":
             self._handle_camera_action(action)
@@ -782,12 +838,6 @@ class CitiesEnvironment:
                 # Handle single position actions (click, right-click, etc.)
                 position = action_info.get("position", (0, 0))
                 self._handle_ui_position_action(action, position)
-        elif action_type == "time":
-            self._handle_time_action(action)
-        elif action_type == "sequence":
-            self._handle_sequence_action(action)
-        elif action_type == "info_view":
-            self._handle_info_view_action(action)
     
     def _handle_camera_action(self, action: str):
         """Execute camera movement actions using default game key bindings."""

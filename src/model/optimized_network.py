@@ -36,39 +36,34 @@ class OptimizedNetwork(nn.Module):
         
         self.config = config
         
-        # Store expected dimensions as class attributes - Fixed order to width, height
-        width, height = getattr(config, 'resolution', (1920, 1080))
+        # Get frame_stack from config, default to 4 if not specified
+        frame_stack = getattr(config, 'frame_stack', 4)
         
-        # Override with our optimized processing resolution
-        self.expected_width = 480  # Increased from 320
-        self.expected_height = 270  # Increased from 240
+        # Set expected resolution dimensions
+        # Start with lower resolution for training
+        self.expected_width = 320
+        self.expected_height = 180
         
-        # Input dimensions will be 3-channel (RGB) image with config resolution
-        in_channels = 3
-        # Check if frame_stack exists and is greater than 1
-        # Set a default of 1 if not specified
-        frame_stack = getattr(config, 'frame_stack', 1)
-        if frame_stack > 1:
-            in_channels *= frame_stack
+        # Log the configuration
+        logger.info(f"Creating network with input resolution {self.expected_width}x{self.expected_height}, "
+                    f"frame_stack={frame_stack}")
+        
+        # Input dimensions will be 3-channel (RGB) image, stacked for temporal information
+        in_channels = 3 * frame_stack
             
-        # Define network sizes - now with more capacity for UI recognition
+        # Define network architecture - slightly modified for lighter model
         self.conv_layers = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, padding=2),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            # Add an attention mechanism to focus on UI elements
-            nn.Conv2d(64, 64, kernel_size=1, stride=1),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
         )
         
-        # Define the size of the flattened features
-        # Use the stored expected dimensions
-        
-        # Calculate the output size of the conv layers
+        # Calculate the output size of conv layers for our exact dimensions
         conv_output_size = self._calculate_conv_output_size(in_channels, self.expected_height, self.expected_width)
+        logger.info(f"Convolution output size: {conv_output_size}")
         
         # Define fully connected layers
         self.fc_layers = nn.Sequential(
@@ -78,21 +73,20 @@ class OptimizedNetwork(nn.Module):
             nn.ReLU()
         )
         
-        # Define UI features extraction to identify interface elements
+        # Define UI features extraction
         self.ui_features = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU()
         )
         
-        # Separate policy and value heads for better specialization
-        # Policy head is now MUCH larger to handle the expanded action space (51+ actions)
+        # Action space size
+        action_space_size = 51  # Adjust based on your action space
+        
+        # Policy and value heads
         self.policy_head = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            # Increase output size to handle additional UI position actions
-            nn.Linear(64, 51)
+            nn.Linear(128, action_space_size)
         )
         
         self.value_head = nn.Linear(256, 1)
@@ -100,32 +94,34 @@ class OptimizedNetwork(nn.Module):
         # Move the model to the appropriate device
         self.to(config.get_device())
         
-        # Apply PyTorch 2.0 compile optimization if available
         try:
             # Check for proper PyTorch 2.0+ and CUDA
             torch_version = tuple(map(int, torch.__version__.split('.')[:2]))
             supports_compile = torch_version >= (2, 0) and hasattr(torch, 'compile')
             if supports_compile and torch.cuda.is_available():
-                logger.info("Applying PyTorch 2.0 model compilation for hardware optimization")
-                # Wrap compilation in try-except block
+                logger.info("Applying PyTorch 2.0 model compilation")
                 try:
-                    # Selective compile for key modules
+                    # Only compile the policy head to avoid errors
                     self.policy_head = torch.compile(self.policy_head)
-                    self.value_head = torch.compile(self.value_head)
-                    logger.info("Model compilation successful - this should improve performance")
+                    logger.info("Model compilation successful")
                 except Exception as e:
-                    logger.warning(f"Module compilation failed, continuing with uncompiled version: {e}")
+                    logger.warning(f"Module compilation failed: {e}")
             else:
-                logger.info("PyTorch 2.0 compilation not available (requires PyTorch 2.0+ and CUDA)")
+                logger.info("PyTorch 2.0 compilation not available")
         except Exception as e:
-            logger.warning(f"Could not check for PyTorch compilation support: {e}")
+            logger.warning(f"Error checking PyTorch compilation support: {e}")
         
     def _calculate_conv_output_size(self, in_channels, height, width):
         """Calculate the size of the flattened features after convolution."""
-        # Use a dummy tensor to calculate the output size
+        # Create a dummy input and pass it through the conv layers
         dummy_input = torch.zeros(1, in_channels, height, width)
-        dummy_output = self.conv_layers(dummy_input)
-        return int(np.prod(dummy_output.shape))
+        with torch.no_grad():
+            dummy_output = self.conv_layers(dummy_input)
+            
+        # Get the flattened size from the output shape
+        flattened_size = dummy_output.numel() // dummy_output.size(0)
+        
+        return flattened_size
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through the network.
