@@ -652,171 +652,170 @@ class InputSimulator:
                 
             return False
             
-    def safe_menu_handling(self):
-        """Safely handle menu toggling without using Escape key.
-        Uses multiple strategies to exit menus including clicks and key combinations.
+    def safe_menu_handling(self) -> bool:
+        """Handle being stuck in a menu using a safe sequence of escape and clicks.
         
         Returns:
-            bool: Success status
+            bool: True if the menu was likely handled successfully
         """
+        logger.info("Attempting safe menu handling routine")
+        
+        # Safety mechanism: try to close any menu by pressing ESC and clicking center
+        success = False
+        
+        # Sequence 1: Press ESC a few times with delays
+        logger.info("Trying escape key sequence")
+        for _ in range(3):
+            self.key_press("escape", duration=0.1)
+            time.sleep(0.5)
+        
         # Get screen dimensions
-        screen_width, screen_height = self.get_screen_dimensions()
+        width, height = self._get_screen_dimensions()
+        center_x, center_y = width // 2, height // 2
         
-        # Reference coordinates for resume button at 1920x1080 resolution
-        # These are relative positions within the window (percentages of screen dimensions)
-        primary_resume_button_rel = (0.375, 0.475)  # ~720/1920, ~513/1080
+        # Sequence 2: Click center of screen
+        logger.info(f"Clicking center of screen ({center_x}, {center_y})")
+        self.mouse_click(center_x, center_y)
+        time.sleep(0.5)
         
-        # Calculate actual pixel position based on current screen resolution
-        primary_resume_button = (
-            int(primary_resume_button_rel[0] * screen_width),
-            int(primary_resume_button_rel[1] * screen_height)
-        )
-        print(f"Primary resume button calculated at {primary_resume_button} for {screen_width}x{screen_height}")
+        # Sequence 3: Try clicking at known menu button locations
+        self._click_common_menu_buttons()
         
-        # Create a comprehensive grid of positions around the main button
-        # using relative offsets to scale properly on all resolutions
-        grid_positions = []
-        relative_offsets = [(-0.02, -0.02), (0, -0.02), (0.02, -0.02),
-                           (-0.02, 0), (0, 0), (0.02, 0),
-                           (-0.02, 0.02), (0, 0.02), (0.02, 0.02)]
-        
-        for x_offset_rel, y_offset_rel in relative_offsets:
-            x_offset = int(x_offset_rel * screen_width)
-            y_offset = int(y_offset_rel * screen_height)
-            grid_positions.append((
-                primary_resume_button[0] + x_offset,
-                primary_resume_button[1] + y_offset
-            ))
-        
-        # No need for additional scaling since we calculated based on current resolution
-        scaled_positions = grid_positions
-        
-        # Add additional fallback positions with wider coverage
-        additional_positions = [
-            # Center positions
-            (screen_width // 2, screen_height // 2),
-            # Various relative positions for common button placements
-            (int(screen_width * 0.375), int(screen_height * 0.475)),  # ~720x513 in 1920x1080
-            (int(screen_width * 0.37), int(screen_height * 0.47)),
-            (int(screen_width * 0.38), int(screen_height * 0.48)),
-            # Bottom positions (for OK buttons)
-            (int(screen_width * 0.5), int(screen_height * 0.8)),
-            # Try standard button positions
-            (int(screen_width * 0.25), int(screen_height * 0.8)),
-            (int(screen_width * 0.75), int(screen_height * 0.8)),
-            # Add more positions covering the whole dialog area
-            (int(screen_width * 0.5), int(screen_height * 0.4)),  # Top-center
-            (int(screen_width * 0.5), int(screen_height * 0.6)),  # Mid-center
-            (int(screen_width * 0.25), int(screen_height * 0.6)),  # Mid-left
-            (int(screen_width * 0.75), int(screen_height * 0.6)),  # Mid-right
-        ]
-        
-        # Add more targeted button positions for Cities Skylines 2 specific menus
-        cs2_specific_buttons = [
-            # Resume game button at different positions based on menu type
-            (int(screen_width * 0.375), int(screen_height * 0.475)),  # Main menu resume
-            (int(screen_width * 0.5), int(screen_height * 0.4)),      # Pause menu resume
-            (int(screen_width * 0.5), int(screen_height * 0.35)),     # Options dialog OK button
-            (int(screen_width * 0.75), int(screen_height * 0.9)),     # Bottom right (common for OK/Cancel)
-            (int(screen_width * 0.8), int(screen_height * 0.1)),      # Top-right X button (settings)
-            (int(screen_width * 0.95), int(screen_height * 0.05)),    # Close button corner
-        ]
-        
-        # Prioritize primary position and nearby grid, then add fallbacks
-        click_positions = [primary_resume_button] + scaled_positions[:10] + cs2_specific_buttons + additional_positions
-        
-        print("Attempting to exit menu using multiple strategies")
-        
-        # First attempt: Try specific key combinations known to close menus
-        key_combinations = [
-            ('enter', 0.2),      # Enter key - confirm dialogs
-            ('space', 0.2),      # Space - can dismiss some dialogs
-            ('escape', 0.2),     # Escape - now allowed in controlled manner
-            ('tab', 0.2),        # Tab - may move focus to OK button in some dialogs
-            ('tab+enter', 0.3),  # Tab to focus + Enter to confirm
-        ]
-        
-        print("Strategy 1: Trying key combinations")
-        for keys, wait_time in key_combinations:
-            if '+' in keys:
-                # Handle combination like tab+enter
-                combo_keys = keys.split('+')
-                for key in combo_keys[:-1]:
-                    self.key_press(key, 0.1)
-                    time.sleep(0.1)
-                # Press the last key after others
-                self.key_press(combo_keys[-1], 0.1)
-            else:
-                # Single key press
-                # We're explicitly allowing escape here in a controlled context
-                temp_block_state = self.block_escape
-                if keys == 'escape':
-                    self.block_escape = False
-                    
-                self.key_press(keys, 0.1)
-                
-                # Restore original escape blocking state
-                if keys == 'escape':
-                    self.block_escape = temp_block_state
-                    
-            time.sleep(wait_time)
-            
-        # Strategy 2: Click Resume button (with different patterns)
-        print("Strategy 2: Clicking at common resume button locations")
-        for attempt in range(2):
-            # First pass tries fewer positions with longer waits
-            # Second pass tries more positions with shorter waits
-            positions_to_try = click_positions[:5] if attempt == 0 else click_positions
-            wait_time = 0.8 if attempt == 0 else 0.2
-            
-            for i, (x, y) in enumerate(positions_to_try):
-                # Ensure coordinates are within screen bounds
-                x = max(0, min(x, screen_width - 1))
-                y = max(0, min(y, screen_height - 1))
-                
-                print(f"Clicking at position {i+1}/{len(positions_to_try)}: ({x}, {y})")
-                
-                # Move to position and try both click and double-click
-                self.mouse_move(x, y, use_win32=True)
-                time.sleep(0.1)
-                
-                # Try left click
-                self.mouse_click(x, y)
-                time.sleep(wait_time)
-                
-                # Try double click on same spot
-                if i < 3:  # Only for the most likely positions
-                    self.mouse_click(x, y, double=True)
-                    time.sleep(wait_time)
-        
-        # Strategy 3: Try clicking and dragging (for sliders or special UI elements)
-        print("Strategy 3: Attempting click and drag operations")
-        center_x, center_y = screen_width // 2, screen_height // 2
-        drag_patterns = [
-            ((center_x, center_y), (center_x + 100, center_y)),     # Drag right
-            ((center_x, center_y), (center_x, center_y - 100)),     # Drag up
-            ((center_x, center_y + 100), (center_x, center_y - 100)) # Drag up long
-        ]
-        
-        for start, end in drag_patterns:
-            self.mouse_drag(start, end, duration=0.3)
+        # Sequence 4: Try pressing common menu navigation keys
+        logger.info("Trying menu navigation keys")
+        for key in ["tab", "enter", "space"]:
+            self.key_press(key, duration=0.1)
             time.sleep(0.3)
+        
+        # Sequence 5: More aggressive approach - click in grid pattern
+        if not success:
+            logger.info("Trying grid pattern clicks")
+            self._click_grid_pattern()
             
-        # Strategy 4: Final attempt with safer key combinations
-        print("Strategy 4: Final keyboard attempts")
-        # Try safer key combinations as last resort
-        self.key_press('escape', 0.1)  # Controlled use of escape key
-        time.sleep(0.1)
-        self.key_press('enter', 0.1)  # Enter key often confirms dialog options
-        time.sleep(0.2)
-        self.key_press('n', 0.1)  # Press 'n' for "No" if confirmation dialog appears
-        time.sleep(0.2)
-        
-        # Reset mouse to center of screen to allow full movement after menu handling
-        print("Resetting mouse to center position")
-        self.mouse_move(center_x, center_y, use_win32=True)
-        
         return True
+        
+    def _click_common_menu_buttons(self) -> None:
+        """Click at positions where common menu buttons are typically located."""
+        # Get screen dimensions
+        width, height = self._get_screen_dimensions()
+        
+        # Define common button positions (based on typical menu layouts)
+        # Each position is a tuple of (x_ratio, y_ratio, description)
+        button_positions = [
+            # Resume button (center top)
+            (0.5, 0.25, "center top - resume game"),
+            # Center options
+            (0.5, 0.5, "center - main button"),
+            # Lower buttons
+            (0.5, 0.75, "center bottom - confirm/ok"),
+            # Left menu buttons
+            (0.2, 0.3, "left menu - top item"),
+            (0.2, 0.4, "left menu - second item"),
+            (0.2, 0.5, "left menu - third item"),
+            # Close buttons (top right)
+            (0.95, 0.05, "top right - close button"),
+            # Back button (bottom left)
+            (0.1, 0.9, "bottom left - back button")
+        ]
+        
+        # Click each position with a delay
+        for x_ratio, y_ratio, desc in button_positions:
+            x = int(width * x_ratio)
+            y = int(height * y_ratio)
+            logger.info(f"Clicking {desc} at ({x}, {y})")
+            self.mouse_click(x, y)
+            time.sleep(0.5)
+            
+    def _click_grid_pattern(self) -> None:
+        """Click in a grid pattern to try to hit any interactive elements."""
+        # Get screen dimensions
+        width, height = self._get_screen_dimensions()
+        
+        # Define grid size
+        grid_cols, grid_rows = 4, 3
+        
+        # Calculate spacing
+        x_spacing = width // (grid_cols + 1)
+        y_spacing = height // (grid_rows + 1)
+        
+        # Click at each grid intersection
+        for row in range(1, grid_rows + 1):
+            for col in range(1, grid_cols + 1):
+                x = col * x_spacing
+                y = row * y_spacing
+                logger.info(f"Grid click at ({x}, {y})")
+                self.mouse_click(x, y)
+                time.sleep(0.3)
+                
+    def _get_screen_dimensions(self) -> Tuple[int, int]:
+        """Get the dimensions of the game screen.
+        
+        Returns:
+            Tuple[int, int]: Width and height of the screen
+        """
+        # Use client position if available
+        if hasattr(self, 'screen_capture') and self.screen_capture:
+            if hasattr(self.screen_capture, 'client_position') and self.screen_capture.client_position:
+                client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
+                return (client_right - client_left, client_bottom - client_top)
+        
+        # Fallback to system metrics
+        return (self.screen_width, self.screen_height)
+        
+    def handle_menu_recovery(self, retries: int = 3) -> bool:
+        """Comprehensive menu recovery with multiple strategies.
+        
+        Args:
+            retries (int): Number of recovery attempts to make
+            
+        Returns:
+            bool: True if recovery was likely successful
+        """
+        logger.info(f"Attempting menu recovery with {retries} retries")
+        
+        # Make sure game window is focused first
+        if not self.ensure_game_window_focused():
+            logger.warning("Failed to focus game window for menu recovery")
+            return False
+            
+        # Try different recovery strategies in sequence
+        for attempt in range(retries):
+            logger.info(f"Menu recovery attempt {attempt+1}/{retries}")
+            
+            # Strategy 1: Standard ESC sequence
+            self.key_press("escape", duration=0.1)
+            time.sleep(0.5)
+            self.key_press("escape", duration=0.1)
+            time.sleep(0.5)
+            
+            # Strategy 2: Click known resume button location
+            width, height = self._get_screen_dimensions()
+            # Resume button is typically at (720, 513) in 1920x1080
+            x_ratio, y_ratio = 720/1920, 513/1080
+            x = int(width * x_ratio)
+            y = int(height * y_ratio)
+            
+            logger.info(f"Clicking resume button at ({x}, {y})")
+            self.mouse_click(x, y)
+            time.sleep(1.0)
+            
+            # Strategy 3: Try common keys that dismiss dialog boxes
+            for key in ["enter", "space", "y", "escape"]:
+                self.key_press(key, duration=0.1)
+                time.sleep(0.5)
+                
+            # Strategy 4: Click in center of screen
+            self.mouse_click(width // 2, height // 2)
+            time.sleep(0.5)
+            
+            # Strategy 5: Full safe menu handling
+            if attempt == retries - 1:  # On last attempt
+                self.safe_menu_handling()
+                
+            # Add a longer delay between retry attempts
+            time.sleep(1.0)
+            
+        return True  # Assume we've done our best
 
     def get_screen_dimensions(self):
         """Get the dimensions of the game window or screen.
@@ -1340,3 +1339,27 @@ class InputSimulator:
         """
         self.movement_speed = max(0.1, min(2.0, speed))
         logger.info(f"Set movement speed to {self.movement_speed}")
+
+    def get_mouse_position(self) -> Tuple[int, int]:
+        """Get the current mouse position.
+        
+        Returns:
+            Tuple[int, int]: Current mouse position (x, y)
+        """
+        try:
+            # Use win32api to get mouse position
+            x, y = win32api.GetCursorPos()
+            
+            # If we have client position information, translate to client coordinates
+            if hasattr(self, 'screen_capture') and self.screen_capture:
+                if hasattr(self.screen_capture, 'client_position') and self.screen_capture.client_position:
+                    client_left, client_top, _, _ = self.screen_capture.client_position
+                    x = x - client_left
+                    y = y - client_top
+            
+            return (x, y)
+        except Exception as e:
+            logger.error(f"Error getting mouse position: {e}")
+            # Return center of screen as fallback
+            screen_width, screen_height = self.screen_width, self.screen_height
+            return (screen_width // 2, screen_height // 2)

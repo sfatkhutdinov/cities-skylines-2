@@ -243,185 +243,261 @@ class VisualMetricsEstimator:
         return is_menu
         
     def detect_main_menu(self, frame: torch.Tensor) -> bool:
-        """Detect if current frame shows the main menu.
+        """Detect if the game is showing a menu.
         
         Args:
-            frame (torch.Tensor): Current frame observation
-            
-        Returns:
-            bool: True if main menu is detected, False otherwise
-        """
-        # First try direct template matching for most reliable detection
-        if hasattr(self, 'has_direct_templates') and self.has_direct_templates:
-            # Try direct template matching first as it's most reliable
-            is_menu = self.direct_template_match(frame)
-            if is_menu:
-                logger.debug("Menu detected via direct template matching")
-                return True
-            
-        # Then try standard detection if reference image is available
-        if self.menu_reference is not None:
-            try:
-                # Use existing feature matching method
-                # Check if frame is None or empty
-                if frame is None:
-                    return False
-                    
-                # Convert to numpy for OpenCV processing
-                if isinstance(frame, torch.Tensor):
-                    frame_np = frame.detach().cpu().numpy()
-                    if len(frame_np.shape) == 3:  # CHW format
-                        frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
-                else:
-                    frame_np = frame
-                    
-                # Check if frame is empty
-                if frame_np is None or frame_np.size == 0 or np.all(frame_np == 0):
-                    return False
-                
-                # Try color-based detection first as it's faster and potentially more reliable
-                if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
-                    is_menu = self.detect_menu_by_colors(frame_np)
-                    if is_menu:
-                        logger.debug("Menu detected via color analysis")
-                        return True
-                    
-                # Convert to grayscale for feature matching
-                if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
-                    frame_gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
-                else:
-                    # If already grayscale, ensure it's the correct type
-                    if len(frame_np.shape) == 2:
-                        frame_gray = frame_np
-                    else:
-                        # Unexpected format, return false
-                        return False
-                        
-                # Ensure frame is 8-bit unsigned integer (CV_8U)
-                if frame_gray.dtype != np.uint8:
-                    frame_gray = frame_gray.astype(np.uint8)
-                    
-                # If we have a reference image, use feature matching
-                if self.menu_reference is not None and hasattr(self, 'menu_kp') and hasattr(self, 'menu_desc'):
-                    try:
-                        # Extract features from current frame
-                        kp, desc = self.menu_matcher.detectAndCompute(frame_gray, None)
-                        
-                        # Not enough features for matching
-                        if desc is None or len(kp) < 5:  # Lower minimum keypoints
-                            # If not enough features, still try template matching
-                            if np.array_equal(frame_gray.shape, self.menu_reference.shape):
-                                # Direct template matching if shapes match
-                                similarity = cv2.matchTemplate(
-                                    frame_gray, self.menu_reference, cv2.TM_CCOEFF_NORMED
-                                ).max()
-                                if similarity > 0.5:  # Threshold for similarity
-                                    return True
-                            return False
-                            
-                        # Match features
-                        matches = self.menu_flann.knnMatch(self.menu_desc, desc, k=2)
-                        
-                        # Apply ratio test
-                        good_matches = []
-                        for m, n in matches:
-                            if m.distance < 0.8 * n.distance:  # More lenient ratio
-                                good_matches.append(m)
-                                
-                        # If enough matches, consider it a menu
-                        match_threshold = 1  # Ultra sensitive - any match triggers detection
-                        is_menu = len(good_matches) >= match_threshold
-                        if is_menu:
-                            logger.debug(f"Menu detected with {len(good_matches)} feature matches")
-                        return is_menu
-                    except cv2.error:
-                        # If OpenCV processing fails, try fallback
-                        return self.detect_menu_fallback(frame)
-            except Exception as e:
-                logger.warning(f"Standard menu detection failed: {e}, falling back to pattern-based detection")
-                return self.detect_menu_fallback(frame)
-        else:
-            # Use fallback method
-            return self.detect_menu_fallback(frame)
-    
-    def direct_template_match(self, frame: torch.Tensor) -> bool:
-        """Use direct template matching for menu detection - most reliable method.
-        
-        Args:
-            frame (torch.Tensor): Input frame
+            frame (torch.Tensor): Current frame
             
         Returns:
             bool: True if menu detected, False otherwise
         """
+        # Validate input
+        if frame is None:
+            return False
+            
+        # Convert frame to numpy for OpenCV processing
+        if isinstance(frame, torch.Tensor):
+            # Move to CPU and convert to numpy array
+            frame_np = frame.detach().cpu().numpy()
+            
+            # Convert from PyTorch's CHW format to HWC format for OpenCV
+            if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:
+                frame_np = frame_np.transpose(1, 2, 0)  # CHW to HWC
+                
+            # Ensure proper scale (0-255 for OpenCV)
+            if frame_np.max() <= 1.0:
+                frame_np = (frame_np * 255).astype(np.uint8)
+        else:
+            frame_np = frame
+            
+        # Ensure frame is valid
+        if frame_np is None or len(frame_np.shape) < 2:
+            logger.warning("Invalid frame for menu detection")
+            return False
+            
+        # Try primary method (template matching if available)
+        if self.menu_reference is not None and self.menu_detection_initialized:
+            try:
+                # Use template matching for most reliable detection
+                return self._detect_menu_template_matching(frame_np)
+            except Exception as e:
+                logger.warning(f"Error in template matching menu detection: {e}")
+                # Fall through to secondary methods
+        
+        # Secondary methods (combined approach)
         try:
-            # Convert frame to numpy array for OpenCV
-            if isinstance(frame, torch.Tensor):
-                frame_np = frame.detach().cpu().numpy()
-                if len(frame_np.shape) == 3:  # CHW format
-                    frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
-            else:
-                frame_np = frame
-                
-            # Ensure proper format
-            if frame_np is None or frame_np.size == 0:
-                return False
-                
-            # Convert to grayscale
-            if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
-                frame_gray = cv2.cvtColor(frame_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-            else:
-                frame_gray = frame_np.astype(np.uint8)
+            # Use multiple detection methods and combine results for robustness
+            methods_results = []
             
-            # Try matching against "RESUME GAME" button template
-            if self.resume_button_template is not None:
-                # Apply template matching
-                result = cv2.matchTemplate(frame_gray, self.resume_button_template, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(result)
-                
-                # If good match found, consider it a menu
-                if max_val > 0.5:  # Threshold for matching
-                    logger.debug(f"Resume button detected (confidence: {max_val:.2f})")
-                    return True
+            # Method 1: Color distribution heuristics
+            color_result = self._detect_menu_by_color(frame_np)
+            methods_results.append(color_result)
             
-            # Check if we have any other templates to try
-            if hasattr(self, 'menu_templates') and self.menu_templates:
-                for template in self.menu_templates:
-                    result = cv2.matchTemplate(frame_gray, template, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, _ = cv2.minMaxLoc(result)
-                    if max_val > 0.5:
-                        logger.debug(f"Menu element detected (confidence: {max_val:.2f})")
-                        return True
+            # Method 2: Edge detection for UI elements
+            edge_result = self._detect_menu_by_edges(frame_np)
+            methods_results.append(edge_result)
             
-            # Also look for the specific menu layout characteristics
-            # 1. Check for white text in center-left area (menu buttons)
-            height, width = frame_gray.shape
-            menu_region = frame_gray[int(height*0.3):int(height*0.7), int(width*0.2):int(width*0.5)]
-            
-            if menu_region.size > 0:
-                # Threshold to find white text
-                _, menu_text = cv2.threshold(menu_region, 200, 255, cv2.THRESH_BINARY)
-                white_pixel_ratio = np.sum(menu_text > 0) / menu_region.size
+            # Method 3: Feature-based detection (if enabled)
+            if hasattr(self, 'resume_button_template') and self.resume_button_template is not None:
+                button_result = self._detect_resume_button(frame_np)
+                methods_results.append(button_result)
                 
-                # If enough white pixels in menu region, likely a menu
-                if white_pixel_ratio > 0.05:
-                    logger.debug(f"Menu text area detected (white ratio: {white_pixel_ratio:.2f})")
-                    return True
-                    
-            # Last check: Look for Cities Skylines logo (white hexagon) in center top
-            logo_region = frame_gray[int(height*0.1):int(height*0.3), int(width*0.4):int(width*0.6)]
-            if logo_region.size > 0:
-                # Threshold to isolate bright logo
-                _, logo_binary = cv2.threshold(logo_region, 200, 255, cv2.THRESH_BINARY)
-                logo_pixel_ratio = np.sum(logo_binary > 0) / logo_region.size
+            # Decision based on multiple methods - more weight to reliable methods
+            if color_result and edge_result:  # Both primary methods agree
+                return True
+            if button_result:  # Direct button detection is highly reliable
+                return True
+            if sum(methods_results) >= 2:  # At least 2 methods agree
+                return True
                 
-                if logo_pixel_ratio > 0.1:
-                    logger.debug("Potential CS2 logo detected in center top")
-                    return True
-                    
             return False
         except Exception as e:
-            logger.error(f"Error in direct template matching: {e}")
+            logger.error(f"Error in combined menu detection: {e}")
+            
+            # Last resort fallback: simple color histogram analysis
+            try:
+                return self._detect_menu_fallback(frame_np)
+            except Exception:
+                # Ultimate fallback - conservative (don't falsely detect menus)
+                return False
+                
+    def _detect_menu_template_matching(self, frame_np: np.ndarray) -> bool:
+        """Detect menu using template matching with reference screenshot.
+        
+        Args:
+            frame_np (np.ndarray): Current frame as numpy array
+            
+        Returns:
+            bool: True if menu detected, False otherwise
+        """
+        # Convert to grayscale for template matching
+        if len(frame_np.shape) == 3:
+            gray_frame = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_frame = frame_np
+            
+        try:
+            # SIFT feature matching
+            kp_frame, desc_frame = self.menu_matcher.detectAndCompute(gray_frame, None)
+            
+            # If no keypoints found, unlikely to be a menu
+            if kp_frame is None or desc_frame is None or len(kp_frame) < 10:
+                return False
+                
+            # Match against reference menu image
+            matches = self.menu_flann.knnMatch(self.menu_desc, desc_frame, k=2)
+            
+            # Apply ratio test for good matches
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append(m)
+                    
+            # Calculate match ratio
+            match_ratio = len(good_matches) / max(1, len(self.menu_kp))
+            
+            # Decision threshold - tuned for menus (need at least 15% matching keypoints)
+            return match_ratio > 0.15
+        except Exception as e:
+            logger.warning(f"Error in SIFT template matching: {e}")
+            
+            # Fallback to simpler template matching if SIFT fails
+            try:
+                # Use simple template matching (less accurate but more robust)
+                result = cv2.matchTemplate(gray_frame, self.menu_reference, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                return max_val > 0.6  # Threshold for menu detection
+            except Exception:
+                return False
+                
+    def _detect_menu_by_color(self, frame_np: np.ndarray) -> bool:
+        """Detect menu based on color distribution heuristics.
+        
+        Args:
+            frame_np (np.ndarray): Current frame as numpy array
+            
+        Returns:
+            bool: True if menu detected, False otherwise
+        """
+        # Convert to HSV color space for better color segmentation
+        hsv = cv2.cvtColor(frame_np, cv2.COLOR_BGR2HSV)
+        
+        # Look for dark overlay (common in game menus)
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 80])
+        dark_mask = cv2.inRange(hsv, lower_black, upper_black)
+        dark_ratio = np.count_nonzero(dark_mask) / dark_mask.size
+        
+        # Look for UI blue (common in Cities Skylines menus)
+        lower_blue = np.array([100, 50, 50])
+        upper_blue = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        blue_ratio = np.count_nonzero(blue_mask) / blue_mask.size
+        
+        # Look for white text (common in menus)
+        lower_white = np.array([0, 0, 200])
+        upper_white = np.array([180, 30, 255])
+        white_mask = cv2.inRange(hsv, lower_white, upper_white)
+        white_ratio = np.count_nonzero(white_mask) / white_mask.size
+        
+        # Decision heuristics
+        # 1. Dark overlay covering significant portion of screen
+        if dark_ratio > 0.4:
+            return True
+            
+        # 2. Combination of blue UI elements and white text
+        if blue_ratio > 0.05 and white_ratio > 0.03:
+            return True
+            
+        # 3. High contrast between dark and light areas
+        if dark_ratio > 0.2 and white_ratio > 0.05:
+            return True
+            
+        return False
+        
+    def _detect_menu_by_edges(self, frame_np: np.ndarray) -> bool:
+        """Detect menu based on edge patterns typical of UI elements.
+        
+        Args:
+            frame_np (np.ndarray): Current frame as numpy array
+            
+        Returns:
+            bool: True if menu detected, False otherwise
+        """
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Detect edges
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Look for horizontal and vertical lines (common in UI)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
+        
+        # Check if sufficient lines were detected
+        if lines is None:
             return False
+            
+        # Count horizontal and vertical lines
+        horizontal_lines = 0
+        vertical_lines = 0
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            
+            # Calculate angle to determine horizontal or vertical
+            if abs(x2 - x1) < 1:  # Avoid division by zero
+                angle = 90.0
+            else:
+                angle = abs(np.arctan((y2 - y1) / (x2 - x1)) * 180 / np.pi)
+                
+            # Classify lines
+            if angle < 10:  # Nearly horizontal
+                horizontal_lines += 1
+            elif angle > 80:  # Nearly vertical
+                vertical_lines += 1
+                
+        # UI typically has both horizontal and vertical elements
+        if horizontal_lines >= 5 and vertical_lines >= 5:
+            return True
+            
+        # Check if edges are concentrated in UI-typical regions
+        edge_ratio = np.count_nonzero(edges) / edges.size
+        
+        # Menu UI typically has distinct edges
+        if edge_ratio > 0.1:
+            return True
+            
+        return False
+        
+    def _detect_resume_button(self, frame_np: np.ndarray) -> bool:
+        """Detect resume button in the menu.
+        
+        Args:
+            frame_np (np.ndarray): Current frame
+            
+        Returns:
+            bool: True if resume button detected, False otherwise
+        """
+        if self.resume_button_template is None:
+            return False
+            
+        # Convert to grayscale
+        if len(frame_np.shape) == 3:
+            gray_frame = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_frame = frame_np
+            
+        # Apply template matching
+        result = cv2.matchTemplate(gray_frame, self.resume_button_template, cv2.TM_CCOEFF_NORMED)
+        
+        # Get maximum match value
+        _, max_val, _, _ = cv2.minMaxLoc(result)
+        
+        # Threshold for detection
+        return max_val > 0.6
     
     def save_current_frame_as_menu_reference(self, frame: torch.Tensor, save_path: str) -> bool:
         """Save current frame as a menu reference.

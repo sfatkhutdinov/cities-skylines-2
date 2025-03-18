@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 from model.optimized_network import OptimizedNetwork
 
 class PPOAgent:
@@ -62,6 +62,10 @@ class PPOAgent:
         with torch.no_grad():
             action_probs, value = self.network(state)
             
+            # Fix: Ensure action_probs is properly reshaped if it has batch dimension
+            if len(action_probs.shape) > 1 and action_probs.shape[0] == 1:
+                action_probs = action_probs.squeeze(0)
+            
             # Apply penalties to menu-opening actions
             if self.menu_action_indices and hasattr(self, 'menu_action_penalties'):
                 # Create a penalty mask (default 1.0 for all actions)
@@ -71,22 +75,23 @@ class PPOAgent:
                 for action_idx, penalty in self.menu_action_penalties.items():
                     if 0 <= action_idx < len(penalty_mask):
                         # Reduce probability of this action by the penalty factor
-                        penalty_mask[action_idx] = max(0.1, 1.0 - penalty)  # Don't completely eliminate
+                        penalty_mask[action_idx] = max(0.05, 1.0 - penalty)  # Ensure minimal probability
                 
                 # Apply the mask to reduce probabilities of problematic actions
                 action_probs = action_probs * penalty_mask
                 
                 # Renormalize probabilities
-                action_probs = action_probs / action_probs.sum()
+                if action_probs.sum() > 0:
+                    action_probs = action_probs / action_probs.sum()
+                else:
+                    # Safety fallback if all actions are severely penalized
+                    action_probs = torch.ones_like(action_probs) / action_probs.size(0)
             
         # Sample action from probability distribution
         action = torch.multinomial(action_probs, 1)
         
-        # Handle tensor shape for proper indexing
-        if action_probs.dim() == 1:
-            log_prob = torch.log(action_probs[action[0]]).unsqueeze(0)
-        else:
-            log_prob = torch.log(action_probs[0, action[0]]).unsqueeze(0)
+        # Handle tensor shape for proper indexing and get log probability
+        log_prob = torch.log(action_probs[action.item()].clamp(min=1e-10))
         
         # Store experience
         self.states.append(state)
@@ -283,13 +288,46 @@ class PPOAgent:
         
         # If this is a high-penalty action, also penalize similar actions
         if new_penalty > 0.7:
-            # Penalize adjacent action indices (likely similar actions)
-            for adj_idx in [action_idx-1, action_idx+1]:
-                if adj_idx >= 0 and adj_idx not in self.menu_action_indices:
-                    # Apply a reduced penalty to adjacent actions
-                    self.menu_action_indices.append(adj_idx)
-                    self.menu_action_penalties[adj_idx] = min(0.3, new_penalty * 0.4)
-                    logger.info(f"Added related action {adj_idx} with reduced penalty {self.menu_action_penalties[adj_idx]}")
+            # Improved: Penalize similar action types (not just adjacent indices)
+            # For key actions, penalize other key actions in same category
+            # For mouse actions, penalize similar mouse actions
+            similar_indices = self._find_similar_actions(action_idx)
+            
+            for sim_idx in similar_indices:
+                if sim_idx >= 0 and sim_idx not in self.menu_action_indices:
+                    # Apply a reduced penalty to similar actions
+                    self.menu_action_indices.append(sim_idx)
+                    self.menu_action_penalties[sim_idx] = min(0.3, new_penalty * 0.4)
+                    logger.info(f"Added related action {sim_idx} with reduced penalty {self.menu_action_penalties[sim_idx]}")
+    
+    def _find_similar_actions(self, action_idx: int) -> List[int]:
+        """Find actions similar to the given action index.
+        
+        Args:
+            action_idx (int): Index of the action
+            
+        Returns:
+            List[int]: List of similar action indices
+        """
+        similar_indices = []
+        
+        # Add adjacent action indices (likely similar actions)
+        similar_indices.extend([action_idx-1, action_idx+1])
+        
+        # Find actions of the same type (key, mouse, etc.)
+        # This is a heuristic based on common action layouts
+        if 0 <= action_idx <= 14:
+            # Key press actions - find other key press actions
+            similar_indices.extend([i for i in range(0, 14) if abs(i - action_idx) <= 4])
+        elif 15 <= action_idx <= 20:
+            # Mouse actions - find other mouse actions
+            similar_indices.extend([i for i in range(15, 20) if i != action_idx])
+        elif 21 <= action_idx <= 32:
+            # Game control keys - find related controls
+            similar_indices.extend([i for i in range(21, 32) if abs(i - action_idx) <= 3])
+        
+        # Filter out invalid indices and duplicates
+        return list(set([idx for idx in similar_indices if idx >= 0]))
 
     def decay_menu_penalties(self):
         """Gradually reduce penalties for menu actions over time."""

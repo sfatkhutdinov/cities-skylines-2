@@ -54,6 +54,7 @@ class OptimizedScreenCapture:
         self.capture_thread = None
         self.frame_queue = queue.Queue(maxsize=3)  # Buffer a few frames
         self.stop_capture_thread = threading.Event()
+        self.capture_thread_lock = threading.Lock()  # Add thread lock for safety
         self.use_threading = True  # Can be disabled for debugging
         
         # Frame quality control
@@ -74,16 +75,28 @@ class OptimizedScreenCapture:
         # Start capture thread if threading is enabled
         if self.use_threading:
             self._start_capture_thread()
+            
+    def __del__(self):
+        """Ensure thread cleanup on deletion."""
+        self.stop_capture_thread.set()
+        if hasattr(self, 'capture_thread') and self.capture_thread:
+            if self.capture_thread.is_alive():
+                logger.info("Cleaning up capture thread on deletion")
+                try:
+                    self.capture_thread.join(timeout=1.0)
+                except Exception:
+                    pass  # Best effort to join thread
     
     def _start_capture_thread(self):
         """Start a background thread for continuous frame capture."""
-        if self.capture_thread is not None and self.capture_thread.is_alive():
-            return
-            
-        logger.info("Starting background capture thread")
-        self.stop_capture_thread.clear()
-        self.capture_thread = threading.Thread(target=self._capture_thread_worker, daemon=True)
-        self.capture_thread.start()
+        with self.capture_thread_lock:
+            if self.capture_thread is not None and self.capture_thread.is_alive():
+                return
+                
+            logger.info("Starting background capture thread")
+            self.stop_capture_thread.clear()
+            self.capture_thread = threading.Thread(target=self._capture_thread_worker, daemon=True)
+            self.capture_thread.start()
     
     def _capture_thread_worker(self):
         """Worker function for continuous frame capture in background thread."""
@@ -94,13 +107,25 @@ class OptimizedScreenCapture:
                 # Capture frame
                 frame = self._capture_frame_direct()
                 
-                # If frame is valid, put it in the queue
-                if frame is not None and not self.frame_queue.full():
-                    # Don't block if queue is full, just skip this frame
-                    try:
-                        self.frame_queue.put(frame, block=False)
-                    except queue.Full:
-                        pass
+                # Validate frame quality
+                if frame is not None:
+                    # Check if frame is blank or invalid
+                    is_valid = self._validate_frame(frame)
+                    
+                    if is_valid and not self.frame_queue.full():
+                        # Don't block if queue is full, just skip this frame
+                        try:
+                            self.frame_queue.put(frame, block=False)
+                        except queue.Full:
+                            pass
+                    elif not is_valid:
+                        logger.warning("Captured invalid frame, using fallback")
+                        # Use previous valid frame if available
+                        if self.previous_valid_frame is not None and not self.frame_queue.full():
+                            try:
+                                self.frame_queue.put(self.previous_valid_frame, block=False)
+                            except queue.Full:
+                                pass
                         
                 # Small sleep to avoid excessive CPU usage
                 time.sleep(0.01)
@@ -110,6 +135,39 @@ class OptimizedScreenCapture:
                 
         logger.info("Capture thread stopped")
     
+    def _validate_frame(self, frame: torch.Tensor) -> bool:
+        """Validate frame quality to detect blank or invalid frames.
+        
+        Args:
+            frame (torch.Tensor): Frame to validate
+            
+        Returns:
+            bool: True if frame is valid, False otherwise
+        """
+        if frame is None:
+            return False
+            
+        try:
+            # Check for blank or low-variation frames
+            std_dev = torch.std(frame).item()
+            if std_dev < self.blank_frame_threshold:
+                return False
+                
+            # Check for abnormal brightness (all white or all black frames)
+            mean_val = torch.mean(frame).item()
+            if mean_val < 0.02 or mean_val > 0.98:
+                return False
+                
+            # Check for valid shape (ensure it's within expected range)
+            if len(frame.shape) != 3 or frame.shape[0] != 3:
+                return False
+            
+            # Frame is valid
+            return True
+        except Exception as e:
+            logger.warning(f"Error validating frame: {e}")
+            return False
+            
     def capture_frame(self) -> torch.Tensor:
         """Capture and process a single frame.
         
@@ -128,64 +186,93 @@ class OptimizedScreenCapture:
             return self.mock_frame
             
         # If using threaded capture, get frame from queue
-        if self.use_threading and self.capture_thread and self.capture_thread.is_alive():
+        if self.use_threading and hasattr(self, 'capture_thread') and self.capture_thread and self.capture_thread.is_alive():
             try:
                 # Try to get frame from queue with timeout
-                frame = self.frame_queue.get(timeout=0.1)
+                frame = self.frame_queue.get(timeout=0.2)  # Increased timeout for better reliability
                 
-                # Add to history
-                self._update_frame_history(frame)
-                
-                # Store as previous valid frame
-                self.previous_valid_frame = frame
-                self.consecutive_failures = 0
-                
-                return frame
+                # Validate frame
+                if self._validate_frame(frame):
+                    # Add to history
+                    self._update_frame_history(frame)
+                    
+                    # Store as previous valid frame
+                    self.previous_valid_frame = frame.clone()  # Use clone to prevent modification
+                    self.consecutive_failures = 0
+                    
+                    return frame
+                else:
+                    logger.warning("Retrieved invalid frame from queue")
+                    self.consecutive_failures += 1
             except queue.Empty:
                 logger.warning("Frame queue empty, capturing directly")
+                self.consecutive_failures += 1
                 # Queue empty, capture directly
-                pass
             except Exception as e:
                 logger.warning(f"Error getting frame from queue: {e}")
+                self.consecutive_failures += 1
                 
         # Direct capture as fallback
         try:
             frame = self._capture_frame_direct()
             
-            # If frame is None or invalid, use previous valid frame if available
-            if frame is None or not self._is_valid_frame(frame):
-                self.consecutive_failures += 1
-                
-                if self.previous_valid_frame is not None:
-                    logger.warning(f"Using previous valid frame ({self.consecutive_failures}/{self.max_consecutive_failures})")
-                    frame = self.previous_valid_frame
-                else:
-                    # If no previous valid frame, return blank frame
-                    logger.warning("No valid frame available, returning blank frame")
-                    frame = torch.zeros((3, self.process_resolution[1], self.process_resolution[0]), 
-                                      dtype=self.dtype, device=self.device)
-                                      
-                # If too many consecutive failures, switch to mock mode temporarily
-                if self.consecutive_failures >= self.max_consecutive_failures:
-                    logger.warning(f"Too many consecutive capture failures ({self.consecutive_failures}), using mock frame")
-                    return self.mock_frame
-            else:
-                # Valid frame, reset failure counter and store
+            # Validate frame 
+            if self._validate_frame(frame):
+                # Store as previous valid frame
+                self.previous_valid_frame = frame.clone()
                 self.consecutive_failures = 0
-                self.previous_valid_frame = frame
-            
-            # Add to history
-            self._update_frame_history(frame)
-            
-            return frame
-        except Exception as e:
-            logger.error(f"Error in capture_frame: {e}")
-            
-            # In case of error, return previous valid frame or mock frame
-            if self.previous_valid_frame is not None:
-                return self.previous_valid_frame
+                
+                # Add to history
+                self._update_frame_history(frame)
+                
+                return frame
             else:
-                return self.mock_frame
+                logger.warning("Direct capture returned invalid frame")
+                self.consecutive_failures += 1
+        except Exception as e:
+            logger.warning(f"Error in direct capture: {e}")
+            self.consecutive_failures += 1
+            
+        # If we have too many consecutive failures, restart the capture thread
+        if self.consecutive_failures > self.max_consecutive_failures:
+            logger.warning(f"Too many consecutive failures ({self.consecutive_failures}), restarting capture thread")
+            self._restart_capture_thread()
+            self.consecutive_failures = 0
+        
+        # Return previous valid frame as fallback if available
+        if self.previous_valid_frame is not None:
+            return self.previous_valid_frame
+            
+        # Last resort fallback: return a blank frame
+        logger.warning("No valid frame available, returning blank frame")
+        return torch.zeros((3, self.process_resolution[1], self.process_resolution[0]), 
+                         dtype=self.dtype, device=self.device)
+                         
+    def _restart_capture_thread(self):
+        """Restart the capture thread after failures."""
+        with self.capture_thread_lock:
+            logger.info("Restarting capture thread")
+            
+            # Stop existing thread
+            self.stop_capture_thread.set()
+            if self.capture_thread and self.capture_thread.is_alive():
+                try:
+                    self.capture_thread.join(timeout=1.0)
+                except Exception:
+                    pass  # Best effort
+                    
+            # Clear queue
+            while not self.frame_queue.empty():
+                try:
+                    self.frame_queue.get_nowait()
+                except Exception:
+                    pass
+                    
+            # Start new thread
+            self.stop_capture_thread.clear()
+            self.capture_thread = threading.Thread(target=self._capture_thread_worker, daemon=True)
+            self.capture_thread.start()
+            logger.info("Capture thread restarted")
     
     def _capture_frame_direct(self) -> Optional[torch.Tensor]:
         """Internal method to capture frame directly without threading.
