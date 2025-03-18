@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--mock", action="store_true", help="Use mock environment for training without the actual game")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--resolution", type=str, default="320x240", help="Resolution for screen capture (WxH)")
-    parser.add_argument("--action_delay", type=float, default=1.0, help="Minimum delay between actions (seconds)")
+    parser.add_argument("--action_delay", type=float, default=0.5, help="Minimum delay between actions (seconds)")
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     parser.add_argument("--resume_best", action="store_true", help="Resume training from best checkpoint")
     parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")

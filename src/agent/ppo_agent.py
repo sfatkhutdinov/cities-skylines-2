@@ -123,6 +123,10 @@ class PPOAgent:
         if not self.use_curiosity:
             return 0.0
             
+        # Safety check - if inputs are None, return 0
+        if state is None or next_state is None:
+            return 0.0
+            
         # Ensure tensors are on the correct device
         if isinstance(state, np.ndarray):
             state = torch.FloatTensor(state).to(self.device)
@@ -131,11 +135,22 @@ class PPOAgent:
         if isinstance(action, int):
             action = torch.tensor([action], device=self.device)
             
-        # Compute curiosity reward
-        with torch.no_grad():
-            intrinsic_reward = self.icm.compute_curiosity_reward(state, next_state, action)
+        # Handle batch dimension for state tensors
+        if state.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+            state = state.unsqueeze(0)
+        if next_state.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+            next_state = next_state.unsqueeze(0)
             
-        return intrinsic_reward.item() * self.curiosity_weight
+        # Compute curiosity reward with error handling
+        try:
+            with torch.no_grad():
+                intrinsic_reward = self.icm.compute_curiosity_reward(state, next_state, action)
+                
+            return intrinsic_reward.item() * self.curiosity_weight
+        except Exception as e:
+            # Log error and return 0 reward on failure
+            print(f"Error computing curiosity reward: {str(e)}")
+            return 0.0
         
     def update(self) -> Dict[str, float]:
         """Update the agent using collected experience.

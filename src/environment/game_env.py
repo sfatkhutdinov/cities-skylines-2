@@ -1476,9 +1476,9 @@ class CitiesEnvironment:
         try:
             # Move to each test point with verification
             for i, (x, y) in enumerate(test_points):
-                # Ensure coordinates are within bounds
-                x = max(0, min(x, width - 1))
-                y = max(0, min(y, height - 1))
+                # Log if coordinates are outside normal bounds but don't restrict them
+                if x < 0 or x >= width or y < 0 or y >= height:
+                    print(f"Notice: Test point ({x}, {y}) is outside normal screen bounds")
                 
                 print(f"Moving to point {i+1}/{len(test_points)}: ({x}, {y})")
                 
@@ -1632,9 +1632,9 @@ class CitiesEnvironment:
             submenu_x = top_menu_x + random.randint(-50, 50)
             submenu_y = top_menu_y + random.randint(30, 100)
             
-            # Ensure coordinates are within bounds
-            submenu_x = max(0, min(width - 1, submenu_x))
-            submenu_y = max(0, min(height - 1, submenu_y))
+            # Log if coordinates are outside normal bounds but don't restrict them
+            if submenu_x < 0 or submenu_x >= width or submenu_y < 0 or submenu_y >= height:
+                logger.info(f"Notice: Submenu position ({submenu_x}, {submenu_y}) is outside normal screen bounds")
             
             logger.info(f"Sequence: Click submenu at ({submenu_x}, {submenu_y})")
             self.input_simulator.mouse_click(submenu_x, submenu_y)

@@ -77,6 +77,10 @@ class VisualMetricsEstimator:
         Returns:
             bool: True if menu detected
         """
+        # Check if frame is None or empty
+        if frame is None:
+            return False
+            
         # Convert to numpy for OpenCV processing
         if isinstance(frame, torch.Tensor):
             frame_np = frame.detach().cpu().numpy()
@@ -85,33 +89,50 @@ class VisualMetricsEstimator:
         else:
             frame_np = frame
             
+        # Check if frame is empty
+        if frame_np is None or frame_np.size == 0 or np.all(frame_np == 0):
+            return False
+            
         # Convert to grayscale for feature matching
         if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
             frame_gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
         else:
-            frame_gray = frame_np
-        
-        # If we have a reference image, use feature matching
-        if self.menu_reference is not None and hasattr(self, 'menu_kp') and hasattr(self, 'menu_desc'):
-            # Extract features from current frame
-            kp, desc = self.menu_matcher.detectAndCompute(frame_gray, None)
-            
-            # Not enough features for matching
-            if desc is None or len(kp) < 10:
+            # If already grayscale, ensure it's the correct type
+            if len(frame_np.shape) == 2:
+                frame_gray = frame_np
+            else:
+                # Unexpected format, return false
                 return False
                 
-            # Match features
-            matches = self.menu_flann.knnMatch(self.menu_desc, desc, k=2)
+        # Ensure frame is 8-bit unsigned integer (CV_8U)
+        if frame_gray.dtype != np.uint8:
+            frame_gray = frame_gray.astype(np.uint8)
             
-            # Apply ratio test
-            good_matches = []
-            for m, n in matches:
-                if m.distance < 0.7 * n.distance:
-                    good_matches.append(m)
-            
-            # If enough matches, consider it a menu
-            match_threshold = 10  # Minimum number of matches to consider it a menu
-            return len(good_matches) >= match_threshold
+        # If we have a reference image, use feature matching
+        if self.menu_reference is not None and hasattr(self, 'menu_kp') and hasattr(self, 'menu_desc'):
+            try:
+                # Extract features from current frame
+                kp, desc = self.menu_matcher.detectAndCompute(frame_gray, None)
+                
+                # Not enough features for matching
+                if desc is None or len(kp) < 10:
+                    return False
+                    
+                # Match features
+                matches = self.menu_flann.knnMatch(self.menu_desc, desc, k=2)
+                
+                # Apply ratio test
+                good_matches = []
+                for m, n in matches:
+                    if m.distance < 0.7 * n.distance:
+                        good_matches.append(m)
+                        
+                # If enough matches, consider it a menu
+                match_threshold = 10  # Minimum number of matches to consider it a menu
+                return len(good_matches) >= match_threshold
+            except cv2.error:
+                # If OpenCV processing fails, assume no menu
+                return False
         
         # Fallback: Use generic menu detection based on UI patterns
         # This is a simple heuristic based on common menu characteristics

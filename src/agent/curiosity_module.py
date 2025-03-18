@@ -28,7 +28,7 @@ class FeatureEncoder(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.LeakyReLU(),
             nn.Flatten()
-        )
+        ).to(self.device)
         
         # Calculate the output size from CNN
         with torch.no_grad():
@@ -37,7 +37,7 @@ class FeatureEncoder(nn.Module):
             self.feature_size = dummy_output.shape[1]
             
         # Feature embedding layer
-        self.fc = nn.Linear(self.feature_size, 256)
+        self.fc = nn.Linear(self.feature_size, 256).to(self.device)
         
     def forward(self, x):
         # Ensure input is on the correct device
@@ -55,21 +55,22 @@ class FeatureEncoder(nn.Module):
 class ForwardModel(nn.Module):
     """Predicts next state features given current state features and action."""
     
-    def __init__(self, feature_size=256, action_dim=51):
+    def __init__(self, feature_size=256, action_dim=51, device='cuda'):
         super(ForwardModel, self).__init__()
+        self.device = device
         
         # Action embedding
         self.action_embedding = nn.Sequential(
             nn.Linear(action_dim, 128),
             nn.LeakyReLU()
-        )
+        ).to(self.device)
         
         # Forward dynamics model
         self.forward_model = nn.Sequential(
             nn.Linear(feature_size + 128, 256),
             nn.LeakyReLU(),
             nn.Linear(256, feature_size)
-        )
+        ).to(self.device)
         
     def forward(self, features, action_one_hot):
         # Embed action
@@ -85,15 +86,16 @@ class ForwardModel(nn.Module):
 class InverseDynamicsModel(nn.Module):
     """Predicts action given current and next state features."""
     
-    def __init__(self, feature_size=256, action_dim=51):
+    def __init__(self, feature_size=256, action_dim=51, device='cuda'):
         super(InverseDynamicsModel, self).__init__()
+        self.device = device
         
         # Inverse dynamics model
         self.inverse_model = nn.Sequential(
             nn.Linear(feature_size * 2, 256),
             nn.LeakyReLU(),
             nn.Linear(256, action_dim)
-        )
+        ).to(self.device)
         
     def forward(self, features, next_features):
         # Concatenate current and next state features
@@ -131,13 +133,15 @@ class IntrinsicCuriosityModule(nn.Module):
         # Forward model
         self.forward_model = ForwardModel(
             feature_size=256,
-            action_dim=action_dim
+            action_dim=action_dim,
+            device=self.device
         )
         
         # Inverse model
         self.inverse_model = InverseDynamicsModel(
             feature_size=256,
-            action_dim=action_dim
+            action_dim=action_dim,
+            device=self.device
         )
         
         # Moving average for reward normalization
@@ -215,30 +219,45 @@ class IntrinsicCuriosityModule(nn.Module):
             torch.Tensor: Intrinsic reward
         """
         with torch.no_grad():
-            # Convert action to one-hot
-            if isinstance(action, int):
-                action = torch.tensor([action], device=self.device)
-            action_one_hot = torch.zeros(1, self.action_dim, device=self.device)
-            action_one_hot.scatter_(1, action.unsqueeze(1), 1)
-            
-            # Encode states into features
-            state_features = self.feature_encoder(state)
-            next_state_features = self.feature_encoder(next_state)
-            
-            # Forward model: predict next state features
-            predicted_next_features = self.forward_model(state_features, action_one_hot)
-            
-            # Calculate prediction error
-            forward_error = F.mse_loss(predicted_next_features, next_state_features, reduction='none')
-            forward_error = forward_error.mean(dim=1)
-            
-            # Scale the reward
-            intrinsic_reward = self.eta * forward_error
-            
-            # Normalize if we have enough samples
-            if len(self.recent_errors) > 100:
-                mean = np.mean(self.recent_errors)
-                std = np.std(self.recent_errors) + 1e-8
-                intrinsic_reward = self.eta * (forward_error - mean) / std
-            
-            return intrinsic_reward 
+            try:
+                # Convert action to one-hot
+                if isinstance(action, int):
+                    action = torch.tensor([action], device=self.device)
+                elif isinstance(action, np.ndarray):
+                    action = torch.tensor(action, device=self.device)
+                    
+                # Ensure action is the right shape
+                if action.dim() > 1:
+                    action = action.squeeze()
+                if action.dim() == 0:
+                    action = action.unsqueeze(0)
+                    
+                # Create one-hot encoding
+                action_one_hot = torch.zeros(1, self.action_dim, device=self.device)
+                action_one_hot.scatter_(1, action.unsqueeze(1), 1)
+                
+                # Encode states into features
+                state_features = self.feature_encoder(state)
+                next_state_features = self.feature_encoder(next_state)
+                
+                # Forward model: predict next state features
+                predicted_next_features = self.forward_model(state_features, action_one_hot)
+                
+                # Calculate prediction error
+                forward_error = F.mse_loss(predicted_next_features, next_state_features, reduction='none')
+                forward_error = forward_error.mean(dim=1)
+                
+                # Scale the reward
+                intrinsic_reward = self.eta * forward_error
+                
+                # Normalize if we have enough samples
+                if len(self.recent_errors) > 100:
+                    mean = np.mean(self.recent_errors)
+                    std = np.std(self.recent_errors) + 1e-8
+                    intrinsic_reward = self.eta * (forward_error - mean) / std
+                
+                return intrinsic_reward
+            except Exception as e:
+                # On error, return zero reward
+                print(f"ICM compute_curiosity_reward error: {str(e)}")
+                return torch.tensor([0.0], device=self.device) 

@@ -258,15 +258,16 @@ class InputSimulator:
         if not relative:
             print(f"Moving mouse: {current_x},{current_y} -> {x},{y}")
         
-        # Verify the coordinates are within screen bounds
+        # Get screen bounds but don't restrict movement
+        # This allows cursor to move anywhere within the game window
         try:
             screen_width = win32api.GetSystemMetrics(0)
             screen_height = win32api.GetSystemMetrics(1)
             
-            # Adjust to be within screen bounds
-            if not relative:
-                x = max(0, min(x, screen_width - 1))
-                y = max(0, min(y, screen_height - 1))
+            # No coordinate clamping to allow full window access
+            # Just log if coordinates are outside normal bounds
+            if not relative and (x < 0 or x >= screen_width or y < 0 or y >= screen_height):
+                print(f"Notice: Mouse moving outside normal screen bounds to ({x},{y})")
         except Exception as e:
             print(f"Warning: Error getting screen metrics: {e}")
         
@@ -298,6 +299,9 @@ class InputSimulator:
             else:
                 target_x, target_y = x, y
                 
+            # Configure pyautogui to not enforce physical screen boundaries
+            pyautogui.FAILSAFE = False
+            
             # Move mouse with pyautogui for fallback
             pyautogui.moveTo(target_x, target_y, duration=0.1)
             
@@ -562,9 +566,9 @@ class InputSimulator:
             wait_time = 1.0 if attempt == 0 else 0.3
             
             for i, (x, y) in enumerate(positions_to_try):
-                # Ensure coordinates are within screen bounds
-                x = max(0, min(x, screen_width - 1))
-                y = max(0, min(y, screen_height - 1))
+                # We'll log if coordinates are outside normal bounds but won't restrict them
+                if x < 0 or x >= screen_width or y < 0 or y >= screen_height:
+                    print(f"Notice: Menu click position ({x}, {y}) is outside normal screen bounds")
                 
                 print(f"Clicking at position {i+1}/{len(positions_to_try)}: ({x}, {y})")
                 

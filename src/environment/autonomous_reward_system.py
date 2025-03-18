@@ -13,6 +13,7 @@ import time
 from collections import deque
 from src.config.hardware_config import HardwareConfig
 import cv2
+from skimage.metrics import structural_similarity as ssim
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class WorldModelCNN(nn.Module):
         # Feature representation (for novelty detection)
         self.feature_layer = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 9 * 9, 512),  # Adjust dimensions as needed
+            nn.Linear(59904, 512),  # Updated from 64 * 9 * 9 to match actual flattened dimension
             nn.ReLU()
         ).to(self.device, dtype=self.dtype)
         
@@ -91,8 +92,17 @@ class WorldModelCNN(nn.Module):
         Returns:
             torch.Tensor: Predicted next frame
         """
+        # Check if we have frames
+        if not frames:
+            # Return a zero tensor with default size if no frames available
+            return torch.zeros(3, 240, 320, device=self.device, dtype=self.dtype)
+            
         # Use the most recent frame
         frame = frames[-1].to(self.device, dtype=self.dtype)
+        
+        # Store original dimensions for later resizing
+        original_shape = frame.shape
+        
         if len(frame.shape) == 3:
             frame = frame.unsqueeze(0)  # Add batch dimension
         
@@ -105,7 +115,20 @@ class WorldModelCNN(nn.Module):
         # Predict next frame
         predicted = self.frame_predictor(encoded)
         
-        return predicted.squeeze(0)  # Remove batch dimension
+        # Ensure output has the same dimensions as input
+        if predicted.shape[-2:] != frame.shape[-2:]:
+            predicted = F.interpolate(
+                predicted, 
+                size=frame.shape[-2:],  # Match height and width of input
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+        # Restore original dimensions (remove batch if necessary)
+        if len(original_shape) == 3:
+            predicted = predicted.squeeze(0)
+            
+        return predicted
     
     def update(self, previous_frame: torch.Tensor, action: int, current_frame: torch.Tensor):
         """Update the world model based on observed transition.
@@ -275,26 +298,42 @@ class TemporalAssociationMemory:
             float: Visual change score (-1 to 1, positive = improvement)
         """
         # Convert to grayscale
-        if len(frame1.shape) == 3:
-            gray1 = cv2.cvtColor(frame1.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(frame2.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
-        else:
-            gray1 = frame1
-            gray2 = frame2
+        current_gray = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+        previous_gray = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
         
         # Compute structural similarity
-        score, diff = cv2.compareSSIM(gray1, gray2, full=True)
+        from skimage.metrics import structural_similarity
+        score, diff = structural_similarity(previous_gray, current_gray, full=True, data_range=1.0)
         
-        # Compute visual change (positive values indicate improvement)
-        # This is a proxy for "good" vs "bad" outcomes that must be learned
-        # In a real implementation, we would have more sophisticated metrics
+        # Convert diff to numpy array (0-1 range)
+        diff_image = (1.0 - diff) 
         
-        # For now, we'll assume any change is potentially good
-        # The agent will learn which changes are actually good over time
-        change_magnitude = np.mean(np.abs(diff))
+        # Compute visual change magnitude
+        change_magnitude = np.mean(np.abs(diff_image))
         
-        # Return signed change value
-        return change_magnitude
+        # Get predicted outcome based on visual patterns
+        if len(self.frame_history) > 100:  # Only start using the analyzer after some experience
+            # Get the predicted outcome for this visual change
+            predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_image)
+            
+            # Blend prediction with base magnitude (initially rely more on magnitude)
+            blend_factor = min(len(self.frame_history) / 10000.0, 0.8)  # Up to 80% from prediction
+            change_score = (1 - blend_factor) * change_magnitude * 5.0 + blend_factor * predicted_outcome
+        else:
+            change_score = change_magnitude * 5.0
+        
+        # Store the visual change for later analysis
+        if len(self.visual_change_history) >= 5:  # Wait for some outcomes to be available
+            # Use the average outcome over next few steps as the "true" outcome
+            past_outcomes = np.mean([o for o in list(self.visual_change_history)[-5:]])
+            # Update the analyzer with this pattern->outcome pair
+            self.visual_change_analyzer.update_association(diff_image, past_outcomes)
+        
+        # Store the current change score to correlate with future outcomes
+        self.visual_change_history.append(change_score)
+        
+        # Return signed change value in range [-1, 1]
+        return np.clip(change_score, -1.0, 1.0)
     
     def _update_color_associations(self, frame: np.ndarray, change_score: float):
         """Update associations between colors and outcomes.
@@ -574,6 +613,7 @@ class AutonomousRewardSystem:
         """
         self.config = config
         self.device = config.get_device()
+        self.dtype = torch.float32  # Add the missing dtype attribute
         
         # World model for prediction and feature extraction
         self.world_model = WorldModelCNN(config)
@@ -646,6 +686,27 @@ class AutonomousRewardSystem:
         self.total_steps += 1
         self._update_training_phase()
         
+        # Ensure the frame is correctly shaped and on the right device
+        if current_frame is None:
+            # In case of a missing frame, use a zero frame
+            height, width = getattr(self.config, 'resolution', (240, 320))
+            current_frame = torch.zeros(3, height, width, device=self.device, dtype=self.dtype)
+        else:
+            # Move to correct device
+            current_frame = current_frame.to(self.device, dtype=self.dtype)
+            
+            # Ensure dimensions match expected resolution
+            expected_height, expected_width = getattr(self.config, 'resolution', (240, 320))
+            if current_frame.shape[-2:] != (expected_height, expected_width):
+                # Reshape frame to match expected dimensions
+                current_frame = F.interpolate(
+                    current_frame.unsqueeze(0) if current_frame.dim() == 3 else current_frame,
+                    size=(expected_height, expected_width),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                current_frame = current_frame.squeeze(0) if current_frame.dim() == 4 else current_frame
+        
         # Store frame in history
         self.frame_history.append(current_frame)
         
@@ -697,27 +758,45 @@ class AutonomousRewardSystem:
         
         return reward
     
-    def _compute_prediction_error(self, predicted_frame: torch.Tensor, actual_frame: torch.Tensor) -> float:
+    def _compute_prediction_error(self, predicted: torch.Tensor, actual: torch.Tensor) -> float:
         """Compute prediction error between predicted and actual frames.
         
         Args:
-            predicted_frame (torch.Tensor): Predicted frame
-            actual_frame (torch.Tensor): Actual frame
+            predicted (torch.Tensor): Predicted frame
+            actual (torch.Tensor): Actual frame
             
         Returns:
-            float: Prediction error
+            float: Prediction error (MSE)
         """
-        # Convert to same device and format
-        predicted = predicted_frame.to(self.device)
-        actual = actual_frame.to(self.device)
-        
-        # Compute MSE
+        # Move tensors to the same device if needed
+        if predicted.device != actual.device:
+            predicted = predicted.to(actual.device)
+            
+        # Ensure both tensors have same batch dimension
         if len(predicted.shape) != len(actual.shape):
             if len(predicted.shape) < len(actual.shape):
                 predicted = predicted.unsqueeze(0)
             else:
                 actual = actual.unsqueeze(0)
+        
+        # Check for dimension mismatch and resize if needed
+        if predicted.shape != actual.shape:
+            # Get target shape (use actual frame dimensions)
+            _, c, h, w = actual.shape if len(actual.shape) == 4 else (1, *actual.shape)
+            
+            # Resize predicted to match actual dimensions
+            predicted = F.interpolate(
+                predicted.view(-1, *predicted.shape[-3:]) if len(predicted.shape) > 3 else predicted.unsqueeze(0),
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # Restore original batch dimension if needed
+            if len(actual.shape) == 3:
+                predicted = predicted.squeeze(0)
                 
+        # Compute mean squared error
         mse = F.mse_loss(predicted, actual).item()
         return mse
     
@@ -763,7 +842,8 @@ class AutonomousRewardSystem:
         previous_gray = cv2.cvtColor(previous_np, cv2.COLOR_RGB2GRAY)
         
         # Compute structural similarity
-        score, diff = cv2.compareSSIM(previous_gray, current_gray, full=True)
+        from skimage.metrics import structural_similarity
+        score, diff = structural_similarity(previous_gray, current_gray, full=True, data_range=1.0)
         
         # Convert diff to numpy array (0-1 range)
         diff_image = (1.0 - diff) 

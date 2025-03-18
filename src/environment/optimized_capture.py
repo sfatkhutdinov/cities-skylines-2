@@ -19,10 +19,13 @@ class OptimizedScreenCapture:
         self.device = config.get_device()
         self.dtype = config.get_dtype()
         
+        # Get resolution from config if available
+        height, width = getattr(config, 'resolution', (240, 320))
+        
         # Pre-allocate tensors for frame processing
-        # Use a smaller resolution for processing (320x240) regardless of game window size
+        # Use the configured resolution for processing
         self.capture_resolution = (1920, 1080)  # Full HD game window
-        self.process_resolution = (320, 240)    # Downsampled for neural network
+        self.process_resolution = (width, height)  # Use configuration resolution
         
         # Initialize buffers on appropriate device
         self.frame_buffer = torch.zeros((1, 3, self.process_resolution[1], self.process_resolution[0]), 
