@@ -591,22 +591,27 @@ class CitiesEnvironment:
         return self.state, reward, done, info
     
     def check_menu_state(self) -> bool:
-        """Check if game is currently in a menu state.
+        """Check if the game is currently in a menu state.
         
         Returns:
-            bool: True if in menu, False otherwise
+            bool: True if a menu is detected, False otherwise
         """
+        # In mock mode, randomly simulate menu states (for testing)
+        if self.mock_mode:
+            # Very low probability to be in a menu (5%)
+            return random.random() < 0.05
+            
         # Use menu handler if available
-        if hasattr(self, 'menu_handler') and self.menu_handler:
-            current_frame = self.screen_capture.get_latest_frame()
-            if current_frame is not None:
-                in_menu, menu_type, confidence = self.menu_handler.detect_menu(current_frame)
-                if in_menu:
-                    logger.debug(f"Menu detected: {menu_type} (confidence: {confidence:.2f})")
-                return in_menu
-                
-        # Fallback to visual metrics menu detection
-        return self.visual_estimator.detect_main_menu(self.screen_capture.get_latest_frame())
+        if hasattr(self, 'menu_handler') and self.menu_handler is not None:
+            return self.menu_handler.detect_menu()
+            
+        # Fallback to visual estimator
+        current_frame = self.screen_capture.get_latest_frame()
+        if current_frame is None:
+            logger.warning("Failed to capture frame for menu detection")
+            return False
+            
+        return self.visual_estimator.detect_main_menu(current_frame)
     
     def _handle_menu_recovery(self, retries: int = 2) -> bool:
         """Try to recover from being stuck in a menu.

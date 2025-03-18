@@ -478,9 +478,23 @@ def train():
         menu_screenshot_path=None  # Use default menu detection
     )
     
+    # Get state and action dimensions from the environment
+    if env.mock_mode:
+        # For mock mode, get dimensions from mock frame (default 3x180x320)
+        state_shape = (3, 180, 320)
+    else:
+        # Try to get actual frame dimensions from a reset or current frame
+        initial_frame = env.reset()
+        state_shape = initial_frame.shape
+    
+    # Get action dimensions from the environment
+    action_dim = env.num_actions
+    
+    logger.info(f"State shape: {state_shape}, Action dim: {action_dim}")
+    
     agent = PPOAgent(
-        state_dim=env.observation_space.shape,
-        action_dim=env.action_space.n,
+        state_dim=state_shape,
+        action_dim=action_dim,
         device=config.get_device(),
         learning_rate=args.learning_rate,
         gamma=args.gamma,

@@ -23,73 +23,80 @@ class ConvBlock(nn.Module):
 class OptimizedNetwork(nn.Module):
     """Optimized neural network for the PPO agent."""
     
-    def __init__(self, config):
+    def __init__(self, input_shape, num_actions, device=None):
         """Initialize the network.
         
         Args:
-            config: Hardware configuration
+            input_shape: Shape of the input state (channels, height, width) or flattened size
+            num_actions: Number of actions in the action space
+            device: Computation device
         """
         super(OptimizedNetwork, self).__init__()
         
-        self.config = config
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
         
-        # Input dimensions will be 3-channel (RGB) image with config resolution
-        in_channels = 3
-        # Check if frame_stack exists and is greater than 1
-        # Set a default of 1 if not specified
-        frame_stack = getattr(config, 'frame_stack', 1)
-        if frame_stack > 1:
-            in_channels *= frame_stack
+        # Handle different types of input shapes
+        if isinstance(input_shape, tuple) and len(input_shape) >= 3:
+            # It's an image with shape (channels, height, width)
+            in_channels, height, width = input_shape
+            self.is_visual_input = True
+        elif isinstance(input_shape, tuple) and len(input_shape) == 1:
+            # It's a flattened vector with shape (n,)
+            in_channels, height, width = 1, 1, input_shape[0]
+            self.is_visual_input = False
+        elif isinstance(input_shape, int):
+            # It's a flattened vector with size n
+            in_channels, height, width = 1, 1, input_shape
+            self.is_visual_input = False
+        else:
+            raise ValueError(f"Unsupported input shape: {input_shape}")
             
-        # Define network sizes - now with more capacity for UI recognition
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            # Add an attention mechanism to focus on UI elements
-            nn.Conv2d(64, 64, kernel_size=1, stride=1),
-            nn.ReLU(),
-        )
-        
-        # Calculate the size of the flattened features
-        # Default to 320x240 if not specified
-        height, width = getattr(config, 'resolution', (240, 320))
-        
-        # Calculate the output size of the conv layers
-        conv_output_size = self._calculate_conv_output_size(in_channels, height, width)
-        
-        # Define fully connected layers
-        self.fc_layers = nn.Sequential(
-            nn.Linear(conv_output_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU()
-        )
-        
-        # Define UI features extraction to identify interface elements
-        self.ui_features = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU()
-        )
-        
-        # Separate policy and value heads for better specialization
-        # Policy head is now MUCH larger to handle the expanded action space (51+ actions)
+        # Define network architecture based on input type
+        if self.is_visual_input:
+            # Convolutional network for visual inputs
+            self.conv_layers = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU()
+            )
+            
+            # Calculate the size of the flattened features after convolution
+            conv_output_size = self._calculate_conv_output_size(in_channels, height, width)
+            
+            # Shared feature layers
+            self.shared_layers = nn.Sequential(
+                nn.Linear(conv_output_size, 512),
+                nn.ReLU()
+            )
+        else:
+            # Fully connected network for vector inputs
+            self.shared_layers = nn.Sequential(
+                nn.Linear(width, 256),
+                nn.ReLU(),
+                nn.Linear(256, 512),
+                nn.ReLU()
+            )
+            
+        # Policy head
         self.policy_head = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            # Increase output size to handle additional UI position actions
-            nn.Linear(64, 51)
+            nn.Linear(256, num_actions)
         )
         
-        self.value_head = nn.Linear(256, 1)
+        # Value head
+        self.value_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
         
-        # Move the model to the appropriate device
-        self.to(config.get_device())
+        # Initialize weights
+        self.apply(self._init_weights)
         
     def _calculate_conv_output_size(self, in_channels, height, width):
         """Calculate the size of the flattened features after convolution."""
@@ -108,23 +115,27 @@ class OptimizedNetwork(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: (action_probs, value)
         """
         # Ensure input is on the correct device
-        x = x.to(self.config.get_device())
+        x = x.to(self.device)
         
         # Get batch size and reshape if necessary
-        if len(x.shape) == 3:
+        if len(x.shape) == 3 and self.is_visual_input:  # For images: [C, H, W]
+            x = x.unsqueeze(0)  # Add batch dimension
+        elif len(x.shape) == 1 and not self.is_visual_input:  # For vectors: [D]
             x = x.unsqueeze(0)  # Add batch dimension
             
-        # Pass through convolutional layers
-        x = self.conv_layers(x)
-        
-        # Flatten
-        x = x.view(x.size(0), -1)
-        
-        # Pass through fully connected layers
-        features = self.fc_layers(x)
-        
-        # Extract UI features for better interface recognition
-        ui_features = self.ui_features(features)
+        # Process based on input type
+        if self.is_visual_input:
+            # Pass through convolutional layers
+            x = self.conv_layers(x)
+            
+            # Flatten
+            x = x.view(x.size(0), -1)
+        else:
+            # For vector inputs, no convolutional processing needed
+            pass
+            
+        # Pass through shared layers
+        features = self.shared_layers(x)
         
         # Get policy (action probabilities) and value
         action_logits = self.policy_head(features)
@@ -136,62 +147,82 @@ class OptimizedNetwork(nn.Module):
         return action_probs, value.squeeze(-1)
         
     def get_action_probs(self, x: torch.Tensor) -> torch.Tensor:
-        """Get action probabilities only.
+        """Get action probabilities for a state.
         
         Args:
-            x (torch.Tensor): Input tensor
+            x (torch.Tensor): Input state tensor
             
         Returns:
             torch.Tensor: Action probabilities
         """
-        # Ensure input is in the correct format and device
-        device = next(self.parameters()).device
-        if x.device != device:
-            x = x.to(device)
-            
-        # Ensure input has batch dimension
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            
-        # Get expected dimensions from config
-        height, width = getattr(self.config, 'resolution', (240, 320))
+        # Ensure input is on the correct device
+        x = x.to(self.device)
         
-        # Handle incorrect input shape
-        if x.shape[2] != height or x.shape[3] != width:
-            x = F.interpolate(x, size=(height, width), mode='bilinear', align_corners=False)
+        # Process based on input type
+        if self.is_visual_input:
+            # Check if we need to add batch dimension
+            if len(x.shape) == 3:  # [C, H, W]
+                x = x.unsqueeze(0)  # Add batch dimension
+                
+            # Process through convolutional layers
+            features = self.conv_layers(x)
+            features = features.reshape(x.size(0), -1)
+        else:
+            # For vector inputs
+            if len(x.shape) == 1:  # [D]
+                x = x.unsqueeze(0)  # Add batch dimension
+            features = x
             
-        features = self.conv_layers(x)
-        features = features.reshape(x.size(0), -1)
-        fc_features = self.fc_layers(features)
+        # Process through shared layers and policy head
+        fc_features = self.shared_layers(features)
         logits = self.policy_head(fc_features)
-        return torch.softmax(logits, dim=1)
         
+        # Apply softmax to get probabilities
+        return torch.softmax(logits, dim=1)
+    
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
-        """Get value prediction only.
+        """Get value for a state.
         
         Args:
-            x (torch.Tensor): Input tensor
+            x (torch.Tensor): Input state tensor
             
         Returns:
             torch.Tensor: Value prediction
         """
-        # Ensure input is in the correct format and device
-        device = next(self.parameters()).device
-        if x.device != device:
-            x = x.to(device)
-            
-        # Ensure input has batch dimension
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-            
-        # Get expected dimensions from config
-        height, width = getattr(self.config, 'resolution', (240, 320))
+        # Ensure input is on the correct device
+        x = x.to(self.device)
         
-        # Handle incorrect input shape
-        if x.shape[2] != height or x.shape[3] != width:
-            x = F.interpolate(x, size=(height, width), mode='bilinear', align_corners=False)
+        # Process based on input type
+        if self.is_visual_input:
+            # Check if we need to add batch dimension
+            if len(x.shape) == 3:  # [C, H, W]
+                x = x.unsqueeze(0)  # Add batch dimension
+                
+            # Process through convolutional layers
+            features = self.conv_layers(x)
+            features = features.reshape(x.size(0), -1)
+        else:
+            # For vector inputs
+            if len(x.shape) == 1:  # [D]
+                x = x.unsqueeze(0)  # Add batch dimension
+            features = x
             
-        features = self.conv_layers(x)
-        features = features.reshape(x.size(0), -1)
-        fc_features = self.fc_layers(features)
-        return self.value_head(fc_features) 
+        # Process through shared layers and value head
+        fc_features = self.shared_layers(features)
+        value = self.value_head(fc_features)
+        
+        return value.squeeze(-1)
+
+    def _init_weights(self, m):
+        """Initialize network weights.
+        
+        Args:
+            m: Module to initialize
+        """
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias) 

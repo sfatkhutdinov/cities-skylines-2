@@ -15,22 +15,45 @@ import os
 class PPOAgent:
     """Proximal Policy Optimization agent."""
     
-    def __init__(self, config):
+    def __init__(self, state_dim, action_dim, device=None, learning_rate=3e-4, 
+                gamma=0.99, gae_lambda=0.95, clip_param=0.2, value_coef=0.5, 
+                entropy_coef=0.01, max_grad_norm=0.5):
         """Initialize PPO agent.
         
         Args:
-            config: Hardware and training configuration
+            state_dim: Dimensions of the state (can be a tuple for images or int for vectors)
+            action_dim: Number of possible actions
+            device: Computation device
+            learning_rate: Learning rate for optimizer
+            gamma: Discount factor
+            gae_lambda: GAE lambda parameter
+            clip_param: PPO clipping parameter
+            value_coef: Value loss coefficient 
+            entropy_coef: Entropy bonus coefficient
+            max_grad_norm: Maximum gradient norm for clipping
         """
-        self.config = config
-        self.device = config.get_device()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_param = clip_param
+        self.value_coef = value_coef 
+        self.entropy_coef = entropy_coef
+        self.max_grad_norm = max_grad_norm
         
         # Initialize network
-        self.network = OptimizedNetwork(config)
+        self.network = OptimizedNetwork(
+            input_shape=state_dim,
+            num_actions=action_dim,
+            device=self.device
+        )
         
         # Setup optimizer
         self.optimizer = optim.Adam(
             self.network.parameters(),
-            lr=config.learning_rate
+            lr=self.learning_rate
         )
         
         # Initialize memory buffers
@@ -47,6 +70,13 @@ class PPOAgent:
         self.menu_penalty_decay = 0.98  # Slower decay rate (was 0.95)
         self.last_rewards = []  # Track recent rewards to detect large penalties
         self.extreme_penalty_threshold = -500.0  # Threshold for detecting extreme penalties
+        
+        # Keep track of the last state for continued episodes
+        self.last_state = None
+        
+        # Running statistics for reward normalization
+        self.rewards_mean = 0
+        self.rewards_std = 1
         
     def select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select an action using the current policy.
@@ -104,12 +134,27 @@ class PPOAgent:
         
         return action, log_prob, value
         
-    def update(self) -> Dict[str, float]:
+    def update(self, experiences=None) -> Dict[str, float]:
         """Update the agent using collected experience.
+        
+        Args:
+            experiences: List of (state, action, reward, next_state, log_prob, value, done) tuples
         
         Returns:
             dict: Training metrics
         """
+        # If experiences are provided, load them into the agent's buffers
+        if experiences is not None:
+            self._clear_memory()  # Clear previous experiences
+            
+            for state, action, reward, next_state, log_prob, value, done in experiences:
+                self.states.append(state)
+                self.actions.append(action)
+                self.rewards.append(reward)
+                self.action_probs.append(log_prob)
+                self.values.append(value)
+                self.dones.append(done)
+        
         # Check if we have any experience to learn from
         if not self.states or not self.actions:
             return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
@@ -148,74 +193,57 @@ class PPOAgent:
                 values_list.append(val)
             else:
                 values_list.append(torch.tensor([val], device=self.device))
-        values = torch.cat(values_list)
+        old_values = torch.cat(values_list)
+        
+        # Convert rewards and dones to tensors
+        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+        
+        # Normalize rewards for training stability
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         
         # Compute returns and advantages
-        returns = self._compute_returns()
+        returns = self._compute_returns(rewards, dones)
+        advantages = returns - old_values
         
-        # Check if returns is empty
-        if returns.numel() == 0:
-            self._clear_memory()
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
-            
-        advantages = returns - values
-        
-        # Normalize advantages
+        # Normalize advantages for training stability  
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # PPO update
-        policy_loss = 0
-        value_loss = 0
-        entropy = 0
-        
-        for _ in range(self.config.ppo_epochs):
-            # Get current action probabilities and values
-            action_probs, value_preds = self.network(states)
+        # PPO update loop
+        for _ in range(4):  # Default to 4 epochs
+            # Get new action probabilities and values
+            new_action_probs, new_values = self.network(states)
             
-            # Ensure action_probs has appropriate shape for indexing
-            if len(action_probs.shape) > 1 and action_probs.shape[0] == 1:
-                action_probs = action_probs.squeeze(0)
-                
-            # Compute ratio of new and old action probabilities
-            # Use diagonal indexing or gather depending on action_probs shape
-            if len(action_probs.shape) == 1:
-                # Use gather when action_probs is a 1D tensor
-                selected_probs = action_probs.gather(0, actions.squeeze())
-            else:
-                # For batched processing
-                batch_indices = torch.arange(actions.shape[0], device=self.device)
-                selected_probs = action_probs[batch_indices, actions.squeeze()]
-                
-            # Get corresponding old probabilities
-            old_selected_probs = old_action_probs.gather(0, actions.squeeze()) if old_action_probs.dim() == 1 else old_action_probs[batch_indices, actions.squeeze()]
+            # Get log probabilities for the chosen actions
+            new_log_probs = torch.log(new_action_probs.gather(1, actions.unsqueeze(1))).squeeze(1)
+            old_log_probs = torch.log(old_action_probs.gather(1, actions.unsqueeze(1))).squeeze(1)
             
-            ratio = selected_probs / (old_selected_probs + 1e-8)
+            # Compute policy ratio and clipped ratio
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            clipped_ratio = torch.clamp(ratio, 1 - self.clip_param, 1 + self.clip_param)
             
-            # Compute PPO loss terms
-            policy_loss_1 = ratio * advantages
-            policy_loss_2 = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
-            policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+            # Compute policy loss
+            policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
             
-            # Value loss
-            value_loss = 0.5 * (returns - value_preds).pow(2).mean()
+            # Compute value loss
+            value_loss = 0.5 * (returns - new_values).pow(2).mean()
             
-            # Compute entropy bonus (using full distributions)
-            entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-10), dim=-1).mean()
+            # Compute entropy bonus
+            entropy = -(new_action_probs * torch.log(new_action_probs + 1e-10)).sum(dim=1).mean()
             
             # Total loss
-            loss = (
-                policy_loss
-                + self.config.value_loss_coef * value_loss
-                - self.config.entropy_coef * entropy
-            )
+            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
             
-            # Optimize
+            # Update network
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.network.parameters(), self.config.max_grad_norm)
-            self.optimizer.step()
             
-        # Clear memory
+            # Gradient clipping to avoid exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+            
+            self.optimizer.step()
+        
+        # Clear memory after update
         self._clear_memory()
         
         # Return metrics
@@ -225,37 +253,44 @@ class PPOAgent:
             'entropy': entropy.item()
         }
         
-    def _compute_returns(self) -> torch.Tensor:
-        """Compute returns using GAE.
+    def _compute_returns(self, rewards: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
+        """Compute returns using Generalized Advantage Estimation (GAE).
         
+        Args:
+            rewards (torch.Tensor): List of rewards
+            dones (torch.Tensor): List of done flags
+            
         Returns:
             torch.Tensor: Computed returns
         """
-        # Check if we have any rewards
-        if not self.rewards:
-            return torch.tensor([], device=self.device)
+        # Get values from self.values
+        values = torch.cat([v.to(self.device) if isinstance(v, torch.Tensor) else 
+                           torch.tensor([v], device=self.device) for v in self.values])
+        
+        # Add a final value of 0 if the last state is terminal
+        if dones[-1]:
+            next_value = 0
+        else:
+            # Use the last value or estimate it from the last state
+            next_value = values[-1].item()
             
-        rewards = torch.tensor(self.rewards, device=self.device)
-        dones = torch.tensor(self.dones, device=self.device)
-        values = torch.cat(self.values)
+        next_value = torch.tensor([next_value], device=self.device)
+        values = torch.cat([values, next_value.unsqueeze(0)])
         
-        # Ensure we have at least 2 values for GAE calculation
-        if len(values) < 2:
-            return rewards
-        
-        returns = []
+        returns = torch.zeros_like(rewards)
         gae = 0
-        for r, d, v, next_v in zip(
-            reversed(rewards),
-            reversed(dones),
-            reversed(values[:-1]),
-            reversed(values[1:])
-        ):
-            delta = r + self.config.gamma * next_v * (1 - d) - v
-            gae = delta + self.config.gamma * self.config.gae_lambda * (1 - d) * gae
-            returns.insert(0, gae + v)
+        
+        for t in reversed(range(len(rewards))):
+            # Delta is the one step TD error
+            delta = rewards[t] + self.gamma * values[t+1] * (1 - dones[t]) - values[t]
             
-        return torch.tensor(returns, device=self.device)
+            # GAE recursively computes advantage by adding discounted delta terms
+            gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
+            
+            # Return is advantage plus value
+            returns[t] = gae + values[t]
+            
+        return returns
         
     def _clear_memory(self):
         """Clear experience memory buffers."""
