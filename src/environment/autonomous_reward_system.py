@@ -235,10 +235,14 @@ class StateDensityEstimator:
         
         # Use average distance to k nearest neighbors as novelty measure
         k = min(10, self.filled)  # Ensure k is not larger than number of states
-        if k <= 1:  # If we have 2 or fewer states
+        if k <= 2:  # If we have 2 or fewer states in memory
             return min(1.0, np.mean(distances) / 10.0)
             
-        # Get k nearest neighbors
+        # Get k nearest neighbors - ensure k is at least 3 to avoid np.partition errors
+        k = max(3, k)
+        if k > len(distances):
+            return min(1.0, np.mean(distances) / 10.0)
+            
         nearest_distances = np.partition(distances, k)[:k]
         novelty_score = np.mean(nearest_distances)
         
