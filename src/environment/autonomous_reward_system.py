@@ -7,12 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 import logging
 import time
 from collections import deque
 from src.config.hardware_config import HardwareConfig
 import cv2
+from skimage.metrics import structural_similarity as ssim
 
 logger = logging.getLogger(__name__)
 
@@ -41,26 +42,44 @@ class WorldModelCNN(nn.Module):
         ).to(self.device, dtype=self.dtype)
         
         # Feature representation (for novelty detection)
+        # Calculate the output size from encoder dynamically
+        with torch.no_grad():
+            # Get resolution from config
+            width, height = getattr(config, 'resolution', (1920, 1080))
+            # Scale down to match the expected input resolution for the model
+            model_width, model_height = 320, 240  # Typical processing resolution
+            # Create a dummy input to compute output shape - MUST use the same dtype as the encoder
+            dummy_input = torch.zeros(1, 3, model_height, model_width, 
+                                     device=self.device, dtype=self.dtype)
+            encoder_output = self.encoder(dummy_input)
+            flattened_size = encoder_output.numel() // encoder_output.size(0)
+            
         self.feature_layer = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 9 * 9, 512),  # Adjust dimensions as needed
+            nn.Linear(flattened_size, 512),  # Dynamically sized input
+            nn.ReLU()
+        ).to(self.device, dtype=self.dtype)
+        
+        # Action embedding layer - maps discrete action index to embedding
+        self.action_embedding = nn.Embedding(1000, 64).to(self.device, dtype=self.dtype)  # Support up to 1000 actions
+        
+        # Action fusion layer - combines action embedding with visual features
+        self.action_fusion = nn.Sequential(
+            nn.Linear(64, encoder_output.size(1) * encoder_output.size(2) * encoder_output.size(3)),
             nn.ReLU()
         ).to(self.device, dtype=self.dtype)
         
         # World model (predicts next frame)
         self.frame_predictor = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.Conv2d(64 + 1, 64, kernel_size=3, padding=1),  # +1 channel for action influence
             nn.ReLU(),
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.ConvTranspose2d(32, 3, kernel_size=8, stride=4, padding=2, output_padding=0)
         ).to(self.device, dtype=self.dtype)
         
-        # Action embedding
-        self.action_embedder = nn.Sequential(
-            nn.Linear(1, 64),  # Assumes action is a single discrete value
-            nn.ReLU()
-        ).to(self.device, dtype=self.dtype)
+        # Store encoder output shape for reshaping
+        self.encoder_shape = encoder_output.shape[1:]
         
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
@@ -91,21 +110,58 @@ class WorldModelCNN(nn.Module):
         Returns:
             torch.Tensor: Predicted next frame
         """
+        # Check if we have frames
+        if not frames:
+            # Return a zero tensor with default size if no frames available
+            return torch.zeros(3, 240, 320, device=self.device, dtype=self.dtype)
+            
         # Use the most recent frame
         frame = frames[-1].to(self.device, dtype=self.dtype)
+        
+        # Store original dimensions for later resizing
+        original_shape = frame.shape
+        
         if len(frame.shape) == 3:
             frame = frame.unsqueeze(0)  # Add batch dimension
         
         # Encode frame
         encoded = self.encoder(frame)
         
-        # Embed action (we'll ignore it for now as it complicates architecture)
-        # In a full implementation, we would condition the prediction on the action
+        # Embed and incorporate action
+        action_tensor = torch.tensor([action], device=self.device).long()
+        action_embedding = self.action_embedding(action_tensor)
         
-        # Predict next frame
-        predicted = self.frame_predictor(encoded)
+        # Reshape action embedding to match spatial dimensions of encoded frame
+        action_spatial = self.action_fusion(action_embedding).view(-1, *self.encoder_shape)
         
-        return predicted.squeeze(0)  # Remove batch dimension
+        # Create an action influence channel
+        batch_size, channels, height, width = encoded.shape
+        action_channel = torch.zeros((batch_size, 1, height, width), device=self.device, dtype=self.dtype)
+        
+        # Apply action influence
+        for b in range(batch_size):
+            action_channel[b, 0] = action_spatial[b, 0].view(height, width)
+        
+        # Concatenate features with action channel
+        combined_features = torch.cat([encoded, action_channel], dim=1)
+        
+        # Predict next frame using the combined features
+        predicted = self.frame_predictor(combined_features)
+        
+        # Ensure output has the same dimensions as input
+        if predicted.shape[-2:] != frame.shape[-2:]:
+            predicted = F.interpolate(
+                predicted, 
+                size=frame.shape[-2:],  # Match height and width of input
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+        # Restore original dimensions (remove batch if necessary)
+        if len(original_shape) == 3:
+            predicted = predicted.squeeze(0)
+            
+        return predicted
     
     def update(self, previous_frame: torch.Tensor, action: int, current_frame: torch.Tensor):
         """Update the world model based on observed transition.
@@ -123,9 +179,38 @@ class WorldModelCNN(nn.Module):
         if len(curr.shape) == 3:
             curr = curr.unsqueeze(0)  # Add batch dimension
         
-        # Predict next frame
+        # Encode previous frame
         encoded = self.encoder(prev)
-        predicted = self.frame_predictor(encoded)
+        
+        # Embed and incorporate action
+        action_tensor = torch.tensor([action], device=self.device).long()
+        action_embedding = self.action_embedding(action_tensor)
+        
+        # Reshape action embedding to match spatial dimensions of encoded frame
+        action_spatial = self.action_fusion(action_embedding).view(-1, *self.encoder_shape)
+        
+        # Create an action influence channel
+        batch_size, channels, height, width = encoded.shape
+        action_channel = torch.zeros((batch_size, 1, height, width), device=self.device, dtype=self.dtype)
+        
+        # Apply action influence
+        for b in range(batch_size):
+            action_channel[b, 0] = action_spatial[b, 0].view(height, width)
+        
+        # Concatenate features with action channel
+        combined_features = torch.cat([encoded, action_channel], dim=1)
+        
+        # Predict next frame
+        predicted = self.frame_predictor(combined_features)
+        
+        # Ensure tensors have the same shape before computing loss
+        if predicted.shape != curr.shape:
+            predicted = F.interpolate(
+                predicted, 
+                size=(curr.shape[2], curr.shape[3]),
+                mode='bilinear',
+                align_corners=False
+            )
         
         # Compute loss (MSE between predicted and actual)
         loss = F.mse_loss(predicted, curr)
@@ -178,8 +263,20 @@ class StateDensityEstimator:
         filled_memory = self.state_memory[:self.filled]
         distances = np.linalg.norm(filled_memory - state_np, axis=1)
         
+        # If only one state in memory, just return the distance to that state
+        if self.filled == 1:
+            return min(1.0, distances[0] / 10.0)
+        
         # Use average distance to k nearest neighbors as novelty measure
-        k = min(10, self.filled)
+        k = min(10, self.filled)  # Ensure k is not larger than number of states
+        if k <= 2:  # If we have 2 or fewer states in memory
+            return min(1.0, np.mean(distances) / 10.0)
+            
+        # Get k nearest neighbors - ensure k is at least 3 to avoid np.partition errors
+        k = max(3, k)
+        if k >= len(distances):
+            return min(1.0, np.mean(distances) / 10.0)
+            
         nearest_distances = np.partition(distances, k)[:k]
         novelty_score = np.mean(nearest_distances)
         
@@ -222,6 +319,9 @@ class TemporalAssociationMemory:
         self.frame_history = deque(maxlen=history_length)
         self.action_history = deque(maxlen=history_length)
         self.visual_change_history = deque(maxlen=history_length)
+        
+        # Initialize the visual change analyzer
+        self.visual_change_analyzer = VisualChangeAnalyzer()
         
         # For detecting UI elements 
         self.color_clusters = {
@@ -274,27 +374,55 @@ class TemporalAssociationMemory:
         Returns:
             float: Visual change score (-1 to 1, positive = improvement)
         """
+        # Convert tensors to numpy arrays if needed
+        if torch.is_tensor(frame1):
+            frame1 = frame1.cpu().numpy()
+        if torch.is_tensor(frame2):
+            frame2 = frame2.cpu().numpy()
+            
+        # Ensure correct channel ordering (from PyTorch's CHW to OpenCV's HWC)
+        if frame1.shape[0] == 3:  # If channels are first
+            frame1 = np.transpose(frame1, (1, 2, 0))
+        if frame2.shape[0] == 3:  # If channels are first
+            frame2 = np.transpose(frame2, (1, 2, 0))
+            
         # Convert to grayscale
-        if len(frame1.shape) == 3:
-            gray1 = cv2.cvtColor(frame1.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
-            gray2 = cv2.cvtColor(frame2.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
-        else:
-            gray1 = frame1
-            gray2 = frame2
+        current_gray = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+        previous_gray = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
         
         # Compute structural similarity
-        score, diff = cv2.compareSSIM(gray1, gray2, full=True)
+        from skimage.metrics import structural_similarity
+        score, diff = structural_similarity(previous_gray, current_gray, full=True, data_range=1.0)
         
-        # Compute visual change (positive values indicate improvement)
-        # This is a proxy for "good" vs "bad" outcomes that must be learned
-        # In a real implementation, we would have more sophisticated metrics
+        # Convert diff to numpy array (0-1 range)
+        diff_image = (1.0 - diff)
         
-        # For now, we'll assume any change is potentially good
-        # The agent will learn which changes are actually good over time
-        change_magnitude = np.mean(np.abs(diff))
+        # Compute visual change magnitude
+        change_magnitude = np.mean(np.abs(diff_image))
         
-        # Return signed change value
-        return change_magnitude
+        # Get predicted outcome based on visual patterns
+        if len(self.frame_history) > 100:  # Only start using the analyzer after some experience
+            # Get the predicted outcome for this visual change
+            predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_image)
+            
+            # Blend prediction with base magnitude (initially rely more on magnitude)
+            blend_factor = min(len(self.frame_history) / 10000.0, 0.8)  # Up to 80% from prediction
+            change_score = (1 - blend_factor) * change_magnitude * 5.0 + blend_factor * predicted_outcome
+        else:
+            change_score = change_magnitude * 5.0
+        
+        # Store the visual change for later analysis
+        if len(self.visual_change_history) >= 5:  # Wait for some outcomes to be available
+            # Use the average outcome over next few steps as the "true" outcome
+            past_outcomes = np.mean([o for o in list(self.visual_change_history)[-5:]])
+            # Update the analyzer with this pattern->outcome pair
+            self.visual_change_analyzer.update_association(diff_image, past_outcomes)
+        
+        # Store the current change score to correlate with future outcomes
+        self.visual_change_history.append(change_score)
+        
+        # Return signed change value in range [-1, 1]
+        return np.clip(change_score, -1.0, 1.0)
     
     def _update_color_associations(self, frame: np.ndarray, change_score: float):
         """Update associations between colors and outcomes.
@@ -574,6 +702,7 @@ class AutonomousRewardSystem:
         """
         self.config = config
         self.device = config.get_device()
+        self.dtype = torch.float32  # Add the missing dtype attribute
         
         # World model for prediction and feature extraction
         self.world_model = WorldModelCNN(config)
@@ -646,6 +775,27 @@ class AutonomousRewardSystem:
         self.total_steps += 1
         self._update_training_phase()
         
+        # Ensure the frame is correctly shaped and on the right device
+        if current_frame is None:
+            # In case of a missing frame, use a zero frame
+            height, width = getattr(self.config, 'resolution', (240, 320))
+            current_frame = torch.zeros(3, height, width, device=self.device, dtype=self.dtype)
+        else:
+            # Move to correct device
+            current_frame = current_frame.to(self.device, dtype=self.dtype)
+            
+            # Ensure dimensions match expected resolution
+            expected_height, expected_width = getattr(self.config, 'resolution', (240, 320))
+            if current_frame.shape[-2:] != (expected_height, expected_width):
+                # Reshape frame to match expected dimensions
+                current_frame = F.interpolate(
+                    current_frame.unsqueeze(0) if current_frame.dim() == 3 else current_frame,
+                    size=(expected_height, expected_width),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                current_frame = current_frame.squeeze(0) if current_frame.dim() == 4 else current_frame
+        
         # Store frame in history
         self.frame_history.append(current_frame)
         
@@ -697,27 +847,45 @@ class AutonomousRewardSystem:
         
         return reward
     
-    def _compute_prediction_error(self, predicted_frame: torch.Tensor, actual_frame: torch.Tensor) -> float:
+    def _compute_prediction_error(self, predicted: torch.Tensor, actual: torch.Tensor) -> float:
         """Compute prediction error between predicted and actual frames.
         
         Args:
-            predicted_frame (torch.Tensor): Predicted frame
-            actual_frame (torch.Tensor): Actual frame
+            predicted (torch.Tensor): Predicted frame
+            actual (torch.Tensor): Actual frame
             
         Returns:
-            float: Prediction error
+            float: Prediction error (MSE)
         """
-        # Convert to same device and format
-        predicted = predicted_frame.to(self.device)
-        actual = actual_frame.to(self.device)
-        
-        # Compute MSE
+        # Move tensors to the same device if needed
+        if predicted.device != actual.device:
+            predicted = predicted.to(actual.device)
+            
+        # Ensure both tensors have same batch dimension
         if len(predicted.shape) != len(actual.shape):
             if len(predicted.shape) < len(actual.shape):
                 predicted = predicted.unsqueeze(0)
             else:
                 actual = actual.unsqueeze(0)
+        
+        # Check for dimension mismatch and resize if needed
+        if predicted.shape != actual.shape:
+            # Get target shape (use actual frame dimensions)
+            _, c, h, w = actual.shape if len(actual.shape) == 4 else (1, *actual.shape)
+            
+            # Resize predicted to match actual dimensions
+            predicted = F.interpolate(
+                predicted.view(-1, *predicted.shape[-3:]) if len(predicted.shape) > 3 else predicted.unsqueeze(0),
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # Restore original batch dimension if needed
+            if len(actual.shape) == 3:
+                predicted = predicted.squeeze(0)
                 
+        # Compute mean squared error
         mse = F.mse_loss(predicted, actual).item()
         return mse
     
@@ -763,7 +931,8 @@ class AutonomousRewardSystem:
         previous_gray = cv2.cvtColor(previous_np, cv2.COLOR_RGB2GRAY)
         
         # Compute structural similarity
-        score, diff = cv2.compareSSIM(previous_gray, current_gray, full=True)
+        from skimage.metrics import structural_similarity
+        score, diff = structural_similarity(previous_gray, current_gray, full=True, data_range=1.0)
         
         # Convert diff to numpy array (0-1 range)
         diff_image = (1.0 - diff) 
@@ -830,91 +999,8 @@ class AutonomousRewardSystem:
             
         # Apply escalating penalty based on how long the agent has been stuck
         # This encourages the agent to learn to exit menus quickly
-        base_penalty = -0.2
-        escalation_factor = min(consecutive_menu_steps * 0.1, 1.0)
+        base_penalty = -5.0  # Increased from -0.2 to -5.0 for stronger discouragement
+        # Escalate much faster based on consecutive steps
+        escalation_factor = min(consecutive_menu_steps * 0.5, 10.0)  # Faster escalation, up to 10x
         
         return base_penalty * (1.0 + escalation_factor) 
-        
-    def calculate_action_reward(self, before_state: torch.Tensor, after_state: torch.Tensor, 
-                              action_info: Dict[str, Any], success: bool) -> float:
-        """Calculate reward based on state change and action information.
-        This method provides compatibility with the InputSimulator interface.
-        
-        Args:
-            before_state (torch.Tensor): State before action
-            after_state (torch.Tensor): State after action
-            action_info (Dict[str, Any]): Information about the action
-            success (bool): Whether the action succeeded
-            
-        Returns:
-            float: Calculated reward
-        """
-        # Extract action type and convert to a numeric action index
-        action_taken = 0  # Default action index
-        
-        # Map action types to simple numeric indices
-        action_type_mapping = {
-            "ui": 0,
-            "camera": 1,
-            "build": 2, 
-            "tool": 3,
-            "key": 4
-        }
-        
-        if "type" in action_info:
-            action_type = action_info.get("type", "")
-            action_taken = action_type_mapping.get(action_type, 0)
-            
-            # Incorporate more specific action information if available
-            if "action" in action_info:
-                action_name = action_info["action"]
-                # Could create more detailed action encoding based on specific actions
-        
-        # Use after_state as current frame for reward computation
-        base_reward = self.compute_reward(after_state, action_taken)
-        
-        # Apply success modifier
-        if not success:
-            # Reduce reward for failed actions
-            base_reward *= 0.5
-        else:
-            # Small bonus for successful actions to encourage learning
-            base_reward += 0.1
-            
-        # Add action-specific rewards
-        action_modifier = 0.0
-        
-        # Extract action type for specialized rewards
-        action_type = action_info.get("type", "")
-        
-        # Camera movement rewards - encourage exploration
-        if action_type == "camera":
-            # Small constant reward for camera movement
-            action_modifier += 0.05
-            
-        # UI interaction rewards
-        elif action_type == "ui":
-            # Bonus for UI interaction
-            action_modifier += 0.1
-            
-            # Check if it's a click in a new region
-            if "position" in action_info:
-                # This would track UI exploration, simplified here
-                action_modifier += 0.05
-                
-        # Building rewards - higher reward for construction actions
-        elif action_type in ["build", "tool"]:
-            action_modifier += 0.2
-        
-        # Apply the action modifier
-        total_reward = base_reward + action_modifier
-        
-        # Check if we're in a menu and apply menu penalty if needed
-        # This requires some way to detect menu state, simplifying here
-        in_menu = False  # This would need to be determined from state
-        if in_menu:
-            # Apply menu penalty, assuming we've been in menu for 1 step
-            menu_penalty = self.calculate_menu_penalty(True, 1)
-            total_reward += menu_penalty
-        
-        return total_reward 

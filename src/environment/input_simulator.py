@@ -9,20 +9,23 @@ from pynput.mouse import Button, Controller as MouseController
 import ctypes
 import pyautogui
 import torch
+import logging
 
 # Import Win32 user32 for more direct mouse control
 user32 = ctypes.WinDLL('user32', use_last_error=True)
+logger = logging.getLogger(__name__)
 
 class InputSimulator:
     def __init__(self):
         """Initialize input simulator for keyboard and mouse control."""
         self.keyboard = KeyboardController()
         self.mouse = MouseController()
+        self.screen_capture = None  # Will be set by the environment
         
         # Store current display resolution
         self.screen_width = win32api.GetSystemMetrics(0)
         self.screen_height = win32api.GetSystemMetrics(1)
-        print(f"Screen resolution: {self.screen_width}x{self.screen_height}")
+        logger.info(f"Screen resolution: {self.screen_width}x{self.screen_height}")
         
         # Initialize virtual key code mapping for all standard keys
         self.key_map = {
@@ -51,6 +54,9 @@ class InputSimulator:
         
         # Block escape key by default to prevent accidental menu toggling
         self.block_escape = True
+        
+        # Movement speed for camera control
+        self.movement_speed = 1.0
         
     def find_game_window(self) -> bool:
         """Find the Cities: Skylines II window handle."""
@@ -1325,3 +1331,12 @@ class InputSimulator:
         
         # Return the top N actions (name and type only)
         return [(name, action_type) for name, action_type, _ in sorted_actions[:top_n]] 
+    
+    def set_movement_speed(self, speed: float):
+        """Set the movement speed for camera control.
+        
+        Args:
+            speed (float): Movement speed multiplier (0.1 to 2.0)
+        """
+        self.movement_speed = max(0.1, min(2.0, speed))
+        logger.info(f"Set movement speed to {self.movement_speed}")

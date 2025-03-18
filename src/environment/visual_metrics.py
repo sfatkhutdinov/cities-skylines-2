@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Any
 from ..config.hardware_config import HardwareConfig
 import cv2
 import os
@@ -46,6 +46,12 @@ class VisualMetricsEstimator:
             'window_lights': []
         }
         self.ma_window = 10
+        
+        # Initialize menu detection variables
+        self.menu_reference = None
+        self.menu_reference_features = None
+        self.fallback_menu_detection_initialized = False
+        self.menu_color_samples = {}
         
     def estimate_population(self, frame: torch.Tensor) -> Tuple[int, Dict[str, float]]:
         """
@@ -149,317 +155,304 @@ class VisualMetricsEstimator:
         Combine various metrics to estimate population.
         Uses a weighted combination of different visual indicators.
         """
+        # Simplified model to convert visual metrics to population estimate
+        # In a full implementation, this would be a learned model
         weights = {
-            'building_density': 0.4,
-            'residential_areas': 0.3,
-            'traffic_density': 0.2,
-            'window_lights': 0.1
+            'building_density': 50000,
+            'residential_areas': 80000,
+            'traffic_density': 30000,
+            'window_lights': 40000
         }
         
-        # Compute weighted sum and scale to reasonable population range
-        weighted_sum = sum(metrics[k] * weights[k] for k in weights)
-        
-        # Scale to population (this would need calibration)
-        # Assuming maximum reasonable starting city population around 10000
-        estimated_population = int(weighted_sum * 10000)
-        
-        return max(0, estimated_population)  # Ensure non-negative
-        
+        estimated_population = sum(weights[k] * v for k, v in metrics.items())
+        return int(estimated_population)
+    
     def update_model(self, frame: torch.Tensor, reward: float):
-        """
-        Update the estimation model based on rewards.
-        This allows the model to learn from the success/failure of its estimates.
-        """
-        # This would be expanded to actually update the feature extractor
-        # based on reward signals from the environment
-        pass
-
-    def initialize_menu_detection(self, menu_reference_path):
-        """Load and prepare a reference screenshot of the menu for detection.
+        """Update visual metrics model based on reward feedback.
         
         Args:
-            menu_reference_path: Path to a screenshot of the menu
-            
-        Returns:
-            bool: True if successful, False otherwise
+            frame (torch.Tensor): Current frame
+            reward (float): Reward received
         """
+        # In a complete implementation, this would update the model weights
+        # to improve future population estimates
+        pass
+        
+    def initialize_menu_detection(self, menu_reference_path):
+        """Initialize menu detection using a reference screenshot.
+        
+        Args:
+            menu_reference_path (str): Path to menu reference image
+        """
+        if not os.path.exists(menu_reference_path):
+            logger.error(f"Menu reference image not found at {menu_reference_path}")
+            return False
+            
         try:
             # Load reference image
-            logger.info(f"Loading menu reference image from: {menu_reference_path}")
             self.menu_reference = cv2.imread(menu_reference_path)
-            
             if self.menu_reference is None:
                 logger.error(f"Failed to load menu reference image from {menu_reference_path}")
                 return False
                 
-            # Convert to RGB if needed
-            if len(self.menu_reference.shape) == 3 and self.menu_reference.shape[2] == 3:
-                # Already a color image
-                self.menu_reference_gray = cv2.cvtColor(self.menu_reference, cv2.COLOR_BGR2GRAY)
+            # Convert to grayscale for feature extraction
+            menu_gray = cv2.cvtColor(self.menu_reference, cv2.COLOR_BGR2GRAY)
+            
+            # Extract ORB features
+            orb = cv2.ORB_create(nfeatures=1000)
+            self.menu_reference_keypoints, self.menu_reference_descriptors = orb.detectAndCompute(menu_gray, None)
+            
+            if self.menu_reference_keypoints is None or len(self.menu_reference_keypoints) == 0:
+                logger.warning("No keypoints detected in menu reference image. Using color pattern detection instead.")
+                self.setup_fallback_menu_detection()
             else:
-                # Grayscale image
-                self.menu_reference_gray = self.menu_reference
+                logger.info(f"Initialized menu detection with {len(self.menu_reference_keypoints)} keypoints from reference image")
+                return True
                 
-            # Calculate histogram of reference image for comparison
-            self.menu_reference_hist = cv2.calcHist([self.menu_reference_gray], [0], None, [256], [0, 256])
-            cv2.normalize(self.menu_reference_hist, self.menu_reference_hist, 0, 1, cv2.NORM_MINMAX)
-            
-            # Set flag to indicate we have a reference
-            self.has_menu_reference = True
-            logger.info("Menu reference image loaded successfully")
-            return True
-            
         except Exception as e:
             logger.error(f"Error initializing menu detection: {e}")
-            self.has_menu_reference = False
+            self.setup_fallback_menu_detection()
             return False
             
-    def detect_main_menu(self, frame):
-        """Detect if the main menu is visible in the current frame.
+    def setup_fallback_menu_detection(self):
+        """Setup fallback menu detection based on color patterns."""
+        logger.info("Setting up fallback menu detection based on color patterns")
         
-        This method uses a combination of approaches:
-        1. If a reference image is available, it compares the current frame to it
-        2. If no reference image is available, it falls back to heuristic detection
+        # Define UI color patterns typical of menu screens
+        # These are common UI colors in darker menu overlays
+        self.menu_color_samples = {
+            'dark_overlay': [(0, 0, 0), (10, 10, 10), (20, 20, 20)],  # Dark semi-transparent overlay
+            'ui_highlight': [(200, 200, 200), (220, 220, 220), (240, 240, 240)],  # White UI elements
+            'button_blue': [(50, 100, 200), (70, 120, 220), (90, 140, 240)],  # Blue button colors
+            'text_color': [(230, 230, 230), (240, 240, 240), (250, 250, 250)]  # White text
+        }
+        
+        self.fallback_menu_detection_initialized = True
+        logger.info("Fallback menu detection initialized")
+        return True
+            
+    def detect_menu_fallback(self, frame: torch.Tensor) -> bool:
+        """Detect menu using fallback color and pattern detection.
         
         Args:
-            frame: The current frame to analyze
+            frame (torch.Tensor): Current frame [C, H, W]
             
         Returns:
-            bool: True if menu is detected, False otherwise
+            bool: True if menu detected, False otherwise
         """
-        # Ensure frame is a numpy array
+        # Convert tensor to numpy array for OpenCV processing
         if isinstance(frame, torch.Tensor):
-            frame_np = frame.permute(1, 2, 0).cpu().numpy()
-            # If normalized tensor (0-1), convert to 0-255 range
-            if frame_np.max() <= 1.0:
-                frame_np = (frame_np * 255).astype(np.uint8)
-        else:
-            frame_np = frame
+            # Ensure frame is on CPU and convert to numpy
+            if frame.device != torch.device('cpu'):
+                frame = frame.cpu()
             
-        # Convert to BGR if needed (OpenCV format)
-        if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
-            frame_bgr = frame_np
-        else:
-            # Unexpected format, try to convert or use as is
-            logger.warning(f"Unexpected frame format: {frame_np.shape}")
-            frame_bgr = frame_np
+            # Convert from [C, H, W] to [H, W, C] and normalize to 0-255
+            frame_np = frame.permute(1, 2, 0).numpy() * 255
+            frame_np = frame_np.astype(np.uint8)
             
-        # Convert to grayscale for processing
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if len(frame_bgr.shape) == 3 else frame_bgr
+            # Convert to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        else:
+            # Handle case where frame is already a numpy array
+            frame_bgr = frame
+            
+        # Convert to grayscale
+        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         
-        # If we have a reference image, use image comparison method
-        if hasattr(self, 'has_menu_reference') and self.has_menu_reference:
-            return self._detect_menu_with_reference(frame_bgr, frame_gray)
-        else:
-            # Fall back to heuristic detection
-            return self._detect_menu_with_heuristics(frame_bgr, frame_gray)
+        # If we have a reference image, try to match with it first
+        if hasattr(self, 'menu_reference') and self.menu_reference is not None:
+            menu_detected = self._detect_menu_with_reference(frame_bgr, frame_gray)
+            if menu_detected:
+                return True
+                
+        # If reference matching fails or unavailable, use fallback detection
+        if not hasattr(self, 'fallback_menu_detection_initialized') or not self.fallback_menu_detection_initialized:
+            self.setup_fallback_menu_detection()
             
+        # Use pattern and color detection as fallback
+        return self._detect_menu_with_heuristics(frame_bgr, frame_gray)
+        
     def _detect_menu_with_reference(self, frame_bgr, frame_gray):
-        """Detect menu using reference image comparison.
+        """Detect menu by matching against reference image.
         
         Args:
-            frame_bgr: BGR color frame
+            frame_bgr: BGR frame
             frame_gray: Grayscale frame
             
         Returns:
             bool: True if menu detected, False otherwise
         """
-        # Resize frame to match reference if they're different sizes
-        if frame_gray.shape != self.menu_reference_gray.shape:
-            frame_resized = cv2.resize(frame_gray, (self.menu_reference_gray.shape[1], self.menu_reference_gray.shape[0]))
-        else:
-            frame_resized = frame_gray
+        # Ensure we have reference keypoints
+        if not hasattr(self, 'menu_reference_keypoints') or self.menu_reference_keypoints is None:
+            return False
             
-        # Method 1: Structural similarity index (SSIM)
         try:
-            ssim_score = structural_similarity(frame_resized, self.menu_reference_gray)
-            logger.debug(f"SSIM score: {ssim_score}")
+            # Extract features from current frame
+            orb = cv2.ORB_create(nfeatures=1000)
+            keypoints, descriptors = orb.detectAndCompute(frame_gray, None)
             
-            # Method 2: Histogram comparison
-            frame_hist = cv2.calcHist([frame_resized], [0], None, [256], [0, 256])
-            cv2.normalize(frame_hist, frame_hist, 0, 1, cv2.NORM_MINMAX)
-            hist_match = cv2.compareHist(self.menu_reference_hist, frame_hist, cv2.HISTCMP_CORREL)
-            logger.debug(f"Histogram match: {hist_match}")
+            # Check if we found any keypoints
+            if keypoints is None or len(keypoints) == 0 or descriptors is None:
+                return False
+                
+            # Match features between reference and current frame
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = bf.match(self.menu_reference_descriptors, descriptors)
             
-            # Detect menu based on combined scores with more stringent thresholds
-            is_menu = (ssim_score > 0.65) or (hist_match > 0.95)
+            # Sort matches by distance
+            matches = sorted(matches, key=lambda x: x.distance)
             
-            if is_menu:
-                logger.info(f"Menu detected (SSIM: {ssim_score:.2f}, Hist: {hist_match:.2f})")
+            # Calculate match quality
+            good_matches = [m for m in matches if m.distance < 50]  # Lower distance is better
+            match_ratio = len(good_matches) / max(1, len(self.menu_reference_keypoints))
             
-            return is_menu
+            # Consider a menu detected if match quality is high enough
+            return match_ratio > 0.25  # At least 25% of keypoints matched
             
         except Exception as e:
             logger.error(f"Error in reference-based menu detection: {e}")
-            # Fall back to heuristic approach
-            return self._detect_menu_with_heuristics(frame_bgr, frame_gray)
+            return False
             
     def _detect_menu_with_heuristics(self, frame_bgr, frame_gray):
-        """Detect menu using heuristic methods when no reference image is available.
+        """Detect menu using heuristics based on UI patterns.
         
         Args:
-            frame_bgr: BGR color frame
+            frame_bgr: BGR frame
             frame_gray: Grayscale frame
             
         Returns:
             bool: True if menu detected, False otherwise
         """
-        # Extract frame dimensions
-        height, width = frame_gray.shape
+        # Several heuristics to detect menu screens
         
-        # Create regions of interest for menu detection
-        left_region = frame_gray[:, :int(width * 0.3)]  # Left 30% - where menu items appear
-        top_region = frame_gray[:int(height * 0.1), :]  # Top 10% - where logo appears
-        full_frame = frame_gray.copy()
+        # 1. Check for darkened overlay (common in pause menus)
+        dark_pixel_ratio = np.mean(frame_gray < 50) / np.mean(frame_gray < 200)
         
-        # Initialize menu indicators with confidence scores
-        menu_indicators = []
-        
-        # 1. Check for horizontal lines typical in menu UI
-        # Apply edge detection
-        edges = cv2.Canny(full_frame, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=width*0.2, maxLineGap=20)
+        # 2. Check for horizontal lines (UI elements like menus often have horizontal separators)
+        edges = cv2.Canny(frame_gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
         
         horizontal_lines = 0
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
-                # Check if the line is horizontal
-                if abs(y2 - y1) < 10:  # Small vertical difference = horizontal line
+                angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                if angle < 10 or angle > 170:  # Consider lines within 10 degrees of horizontal
                     horizontal_lines += 1
+                    
+        horizontal_line_score = horizontal_lines / max(1, len(lines) if lines is not None else 1)
         
-        if horizontal_lines >= 3:
-            score = min(1.0, horizontal_lines / 10.0)  # Score based on number of lines, max 1.0
-            menu_indicators.append(("horizontal_lines", score))
-            logger.debug(f"Menu indicator: {horizontal_lines} horizontal lines found (score: {score:.2f})")
+        # 3. Check for UI color patterns
+        ui_color_score = 0
+        for color_name, color_samples in self.menu_color_samples.items():
+            for color in color_samples:
+                # Create a mask for pixels close to this color
+                lower_bound = np.array([max(0, c - 20) for c in color])
+                upper_bound = np.array([min(255, c + 20) for c in color])
+                mask = cv2.inRange(frame_bgr, lower_bound, upper_bound)
+                
+                # Calculate percentage of pixels that match this color
+                color_ratio = np.count_nonzero(mask) / (mask.shape[0] * mask.shape[1])
+                ui_color_score += color_ratio
+                
+        # 4. Check for text-like patterns (high frequency content in grayscale)
+        text_pattern_score = 0
+        laplacian = cv2.Laplacian(frame_gray, cv2.CV_64F).var()
+        text_pattern_score = min(1.0, laplacian / 1000)  # Normalize
         
-        # 2. Check for menu button text (bright text in left region)
-        _, left_thresh = cv2.threshold(left_region, 200, 255, cv2.THRESH_BINARY)
-        white_pixels = np.sum(left_thresh == 255)
-        white_ratio = white_pixels / (left_region.shape[0] * left_region.shape[1])
+        # Combine scores with different weights
+        menu_score = (
+            dark_pixel_ratio * 0.3 +
+            horizontal_line_score * 0.2 +
+            ui_color_score * 0.3 +
+            text_pattern_score * 0.2
+        )
         
-        if white_ratio > 0.01:  # At least 1% bright pixels
-            score = min(1.0, white_ratio * 20)  # Scale ratio to score
-            menu_indicators.append(("bright_text", score))
-            logger.debug(f"Menu indicator: bright text detected (ratio: {white_ratio:.3f}, score: {score:.2f})")
+        # Define threshold for menu detection
+        menu_threshold = 0.25
         
-        # 3. Check for dark overlay (common in menu screens)
-        dark_pixels = np.sum(full_frame < 50)  # Count very dark pixels
-        dark_ratio = dark_pixels / (height * width)
-        
-        if dark_ratio > 0.3:  # More than 30% of the screen is very dark
-            score = min(1.0, dark_ratio)  # Use ratio directly as score
-            menu_indicators.append(("dark_overlay", score))
-            logger.debug(f"Menu indicator: dark overlay detected (ratio: {dark_ratio:.3f}, score: {score:.2f})")
-        
-        # 4. Check for aligned menu button arrangement
-        # Look for clusters of white pixels in the left region at regular vertical intervals
-        row_sums = np.sum(left_thresh, axis=1)
-        peaks = []
-        
-        for i in range(1, len(row_sums) - 1):
-            if row_sums[i] > row_sums[i-1] and row_sums[i] > row_sums[i+1] and row_sums[i] > 100:
-                peaks.append(i)
-        
-        # Check if we have multiple peaks with somewhat regular spacing
-        if len(peaks) >= 3:
-            intervals = [peaks[i+1] - peaks[i] for i in range(len(peaks) - 1)]
-            avg_interval = sum(intervals) / len(intervals)
-            interval_diffs = [abs(interval - avg_interval) for interval in intervals]
-            avg_diff = sum(interval_diffs) / len(interval_diffs)
-            
-            if avg_diff < 15:  # Fairly regular spacing
-                score = min(1.0, len(peaks) / 10.0)  # Score based on number of peaks
-                menu_indicators.append(("aligned_buttons", score))
-                logger.debug(f"Menu indicator: aligned menu buttons detected ({len(peaks)} buttons, score: {score:.2f})")
-        
-        # 5. NEW: Check for a bordered rectangle (menu container)
-        # Apply edge detection again with different parameters
-        edges2 = cv2.Canny(full_frame, 30, 200)
-        contours, _ = cv2.findContours(edges2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Look for large rectangular contours
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > (width * height * 0.1):  # At least 10% of screen
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = float(w) / h
-                # If it's a reasonable rectangle shape (not too extreme in aspect ratio)
-                if 0.2 < aspect_ratio < 5.0:
-                    rect_score = min(1.0, area / (width * height * 0.5))  # Score based on area
-                    menu_indicators.append(("menu_container", rect_score))
-                    logger.debug(f"Menu indicator: potential menu container found (area: {area}, score: {rect_score:.2f})")
-                    break
-        
-        # Determine if menu is present based on weighted indicators
-        if len(menu_indicators) >= 2:
-            # Calculate overall confidence score
-            total_score = sum(score for _, score in menu_indicators)
-            avg_score = total_score / len(menu_indicators)
-            confidence = avg_score * (1.0 + (len(menu_indicators) - 2) * 0.2)  # Boost for more indicators
-            
-            # Consider it a menu if we have strong confidence
-            is_menu = confidence > 0.5
-            
-            if is_menu:
-                logger.info(f"Menu detected with {len(menu_indicators)} indicators, confidence: {confidence:.2f}")
-                # Log all indicators
-                for name, score in menu_indicators:
-                    logger.info(f"  - {name}: {score:.2f}")
-            
-            return is_menu
-        
-        return False  # Not enough indicators
-
-    def save_current_frame_as_menu_reference(self, frame: torch.Tensor, save_path: str = "menu_reference.png"):
-        """Save the current frame as a menu reference image.
+        # Return detection result
+        return menu_score > menu_threshold
+    
+    def detect_main_menu(self, frame: torch.Tensor) -> bool:
+        """Detect if the current frame shows a menu.
         
         Args:
-            frame (torch.Tensor): Current frame to save as reference
-            save_path (str): Path to save the reference image
-        
+            frame (torch.Tensor): Current frame [C, H, W]
+            
         Returns:
-            bool: True if successfully saved, False otherwise
+            bool: True if menu detected, False otherwise
+        """
+        return self.detect_menu_fallback(frame)
+        
+    def save_current_frame_as_menu_reference(self, frame: torch.Tensor, save_path: str) -> bool:
+        """Save current frame as menu reference image.
+        
+        Args:
+            frame (torch.Tensor): Current frame [C, H, W]
+            save_path (str): Path to save the reference image
+            
+        Returns:
+            bool: Success status
         """
         try:
-            # Convert frame to numpy for OpenCV processing if it's a tensor
-            if isinstance(frame, torch.Tensor):
-                frame_np = frame.permute(1, 2, 0).cpu().numpy()  # [C,H,W] -> [H,W,C]
+            # Convert tensor to numpy array
+            if frame.device != torch.device('cpu'):
+                frame = frame.cpu()
                 
-                # If normalized, convert to 0-255 range
-                if frame_np.max() <= 1.0:
-                    frame_np = (frame_np * 255).astype(np.uint8)
-            else:
-                frame_np = frame.copy()
-                
-            # Convert RGB to BGR for OpenCV
+            frame_np = frame.permute(1, 2, 0).numpy() * 255
+            frame_np = frame_np.astype(np.uint8)
+            
+            # Convert to BGR for OpenCV
             frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
             
             # Save image
             cv2.imwrite(save_path, frame_bgr)
             
-            # Also update our reference image
-            self.menu_reference_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            # Also initialize menu detection with this image
+            self.menu_reference = frame_bgr
             
-            print(f"Saved menu reference image to {save_path}")
+            # Extract features
+            frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            orb = cv2.ORB_create(nfeatures=1000)
+            self.menu_reference_keypoints, self.menu_reference_descriptors = orb.detectAndCompute(frame_gray, None)
+            
+            logger.info(f"Saved menu reference image to {save_path} and initialized detection with {len(self.menu_reference_keypoints)} keypoints")
             return True
+            
         except Exception as e:
-            print(f"Error saving menu reference image: {e}")
+            logger.error(f"Error saving menu reference image: {e}")
             return False
-
-    def calculate_reward(self, frame):
-        """Calculate a reward based on visual metrics from the given frame.
+            
+    def update_model(self, frame: torch.Tensor, reward: float):
+        """Update the model based on reward feedback.
         
         Args:
-            frame: The current observation frame
+            frame (torch.Tensor): Current frame
+            reward (float): Reward received
+        """
+        # Would update model parameters based on reward signal
+        pass
+        
+    def calculate_reward(self, frame):
+        """Calculate a reward signal based on visual assessment.
+        
+        Args:
+            frame (torch.Tensor): Current frame
             
         Returns:
-            float: The calculated reward
+            float: Reward value
         """
-        # This is a placeholder implementation
-        # In a real environment, you would implement more sophisticated reward calculations
-        # based on visual features like population numbers, budget, or other game metrics
+        # Estimate population
+        population, metrics = self.estimate_population(frame)
         
-        # For now, we'll return a small positive reward for each valid step
-        # This encourages exploration
-        return 0.01 
+        # Reward is based on population and visual quality
+        reward = 0.001 * population
+        
+        # Add bonus for balanced metrics
+        variance = np.var(list(metrics.values()))
+        balance_bonus = 1.0 / (1.0 + variance)
+        
+        reward += 10.0 * balance_bonus
+        
+        return reward
