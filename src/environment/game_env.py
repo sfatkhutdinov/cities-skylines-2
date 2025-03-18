@@ -11,7 +11,7 @@ import logging
 from typing import Dict, List, Tuple, Optional, Any
 import os
 from .visual_metrics import VisualMetricsEstimator
-from .reward_system import RewardSystem
+from .autonomous_reward_system import AutonomousRewardSystem
 from .optimized_capture import OptimizedScreenCapture
 from src.utils.performance_safeguards import PerformanceSafeguards
 from .input_simulator import InputSimulator
@@ -78,7 +78,8 @@ class CitiesEnvironment:
                 logger.error(f"Failed to initialize menu detection: {e}")
                 self.has_menu_reference = False
         
-        self.reward_system = RewardSystem(self.config)
+        # Use autonomous reward system
+        self.reward_system = AutonomousRewardSystem(self.config)
         self.safeguards = PerformanceSafeguards(self.config)
         
         # Define action space
@@ -630,8 +631,8 @@ class CitiesEnvironment:
                     # Update the current frame to see if we're still in the menu
                     self.current_frame = self.screen_capture.capture_frame()
         
-        # Calculate reward using visual metrics
-        reward = self.visual_estimator.calculate_reward(self.current_frame)
+        # Calculate reward using autonomous reward system
+        reward = self.reward_system.compute_reward(self.current_frame, action_index)
         
         # Apply menu penalty if a menu is detected
         menu_detected = self.visual_estimator.detect_main_menu(self.current_frame)

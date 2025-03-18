@@ -6,6 +6,6 @@ from .game_env import CitiesEnvironment
 from .input_simulator import InputSimulator
 from .optimized_capture import OptimizedScreenCapture
 from .visual_metrics import VisualMetricsEstimator
-from .reward_system import RewardSystem
+from .autonomous_reward_system import AutonomousRewardSystem
 
-__all__ = ['CitiesEnvironment', 'InputSimulator', 'OptimizedScreenCapture'] 
+__all__ = ['CitiesEnvironment', 'InputSimulator', 'OptimizedScreenCapture', 'VisualMetricsEstimator', 'AutonomousRewardSystem'] 
