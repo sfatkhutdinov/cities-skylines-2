@@ -170,18 +170,26 @@ class PPOAgent:
             for state, action, reward, next_state, log_prob, value, done in experiences:
                 self.states.append(state)
                 self.actions.append(action)
-                
-                # Ensure we have action probs - if not, we'll need to compute them later
-                # We don't store them here to avoid recomputing during experience collection
-                
-                self.values.append(value)
                 self.rewards.append(reward)
                 self.dones.append(done)
+                self.values.append(value)
         
         # Check if memory is empty
         if not self.states:
             logger.warning("Cannot update with empty memory")
             return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+        
+        # Ensure all memory arrays have the same length - there might be a bug in collection
+        min_length = min(len(self.states), len(self.actions), len(self.rewards), len(self.dones), len(self.values))
+        if min_length < len(self.states):
+            logger.warning(f"Truncating memory: States: {len(self.states)}, min length: {min_length}")
+            self.states = self.states[:min_length]
+            self.actions = self.actions[:min_length]
+            self.rewards = self.rewards[:min_length]
+            self.dones = self.dones[:min_length]
+            self.values = self.values[:min_length]
+            if self.action_probs:
+                self.action_probs = self.action_probs[:min_length]
             
         # Convert states to a single tensor
         states = torch.stack(self.states).to(self.device)
@@ -199,19 +207,6 @@ class PPOAgent:
                 action_tensors.append(torch.tensor([action], device=self.device))
         actions = torch.cat(action_tensors)
         
-        # If action_probs is empty, we need to compute them now
-        if not self.action_probs:
-            with torch.no_grad():
-                for state, action in zip(self.states, self.actions):
-                    state_tensor = torch.tensor(state, device=self.device) if not isinstance(state, torch.Tensor) else state.to(self.device)
-                    if len(state_tensor.shape) == 3:  # [C, H, W]
-                        state_tensor = state_tensor.unsqueeze(0)  # Add batch dimension
-                    action_probs, _ = self.network(state_tensor)
-                    self.action_probs.append(action_probs.squeeze(0))
-        
-        # Process action probabilities
-        old_action_probs = torch.stack([p.to(self.device) for p in self.action_probs])
-        
         # Process values
         values_list = []
         for val in self.values:
@@ -225,9 +220,28 @@ class PPOAgent:
                 values_list.append(torch.tensor([val], device=self.device))
         old_values = torch.cat(values_list)
         
+        # If action_probs is empty, we need to compute them now
+        if not self.action_probs or len(self.action_probs) != len(self.states):
+            logger.debug("Computing action probabilities")
+            self.action_probs = []
+            with torch.no_grad():
+                for state in self.states:
+                    state_tensor = torch.tensor(state, device=self.device) if not isinstance(state, torch.Tensor) else state.to(self.device)
+                    if len(state_tensor.shape) == 3:  # [C, H, W]
+                        state_tensor = state_tensor.unsqueeze(0)  # Add batch dimension
+                    action_probs, _ = self.network(state_tensor)
+                    self.action_probs.append(action_probs.squeeze(0))
+        
+        # Process action probabilities
+        old_action_probs = torch.stack([p.to(self.device) for p in self.action_probs])
+        
         # Convert rewards and dones to tensors
         rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
         dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+        
+        # Check tensor sizes before normalization
+        logger.debug(f"Shapes - states: {states.shape}, actions: {actions.shape}, rewards: {rewards.shape}, " + 
+                     f"dones: {dones.shape}, old_values: {old_values.shape}, old_action_probs: {old_action_probs.shape}")
         
         # Normalize rewards for training stability
         if len(rewards) > 1 and rewards.std() > 0:
@@ -235,20 +249,45 @@ class PPOAgent:
         
         # Compute returns and advantages
         returns = self._compute_returns(rewards, dones)
+        
+        # Debug prints
+        logger.debug(f"Returns shape: {returns.shape}, old_values shape: {old_values.shape}")
+        
+        # Ensure returns and old_values have the same shape
+        if returns.shape != old_values.shape:
+            logger.warning(f"Shape mismatch between returns and old_values! Returns: {returns.shape}, Old values: {old_values.shape}")
+            min_len = min(len(returns), len(old_values))
+            returns = returns[:min_len]
+            old_values = old_values[:min_len]
+        
         advantages = returns - old_values
         
         # Normalize advantages for training stability
         if len(advantages) > 1 and advantages.std() > 0:  
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
+        # Make sure everything is the same length
+        batch_size = min(len(states), len(actions), len(returns), len(advantages), len(old_action_probs))
+        states = states[:batch_size]
+        actions = actions[:batch_size]
+        returns = returns[:batch_size]
+        advantages = advantages[:batch_size]
+        old_action_probs = old_action_probs[:batch_size]
+        
+        # Store metrics for return
+        policy_loss_val = 0
+        value_loss_val = 0
+        entropy_val = 0
+        
         # PPO update loop
-        for _ in range(4):  # Default to 4 epochs
-            # Get new action probabilities and values
+        for epoch in range(4):  # Default to 4 epochs
+            # Compute action probabilities and values for this epoch
             new_action_probs, new_values = self.network(states)
             
             # Get log probabilities for the chosen actions
-            new_log_probs = torch.log(new_action_probs.gather(1, actions.unsqueeze(1))).squeeze(1)
-            old_log_probs = torch.log(old_action_probs.gather(1, actions.unsqueeze(1))).squeeze(1)
+            action_indices = actions.unsqueeze(1)
+            new_log_probs = torch.log(new_action_probs.gather(1, action_indices)).squeeze(1)
+            old_log_probs = torch.log(old_action_probs.gather(1, action_indices)).squeeze(1)
             
             # Compute policy ratio and clipped ratio
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -274,12 +313,17 @@ class PPOAgent:
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
             
             self.optimizer.step()
+            
+            # Store last epoch values for metrics
+            policy_loss_val = policy_loss.item()
+            value_loss_val = value_loss.item()
+            entropy_val = entropy.item()
         
         # Calculate metrics
         metrics = {
-            'policy_loss': policy_loss.item(),
-            'value_loss': value_loss.item(),
-            'entropy': entropy.item()
+            'policy_loss': policy_loss_val,
+            'value_loss': value_loss_val,
+            'entropy': entropy_val
         }
         
         # Clear memory for next update
