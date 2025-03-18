@@ -688,7 +688,7 @@ class CitiesEnvironment:
         width, height = self._get_screen_dimensions()
         # Calculate center and margins
         center_x, center_y = width // 2, height // 2
-        margin = 100  # Pixels from edge to avoid
+        margin = 0  # Pixels from edge to avoid
         
         # Random offsets for more varied camera movements
         rand_x = random.randint(-100, 100)
