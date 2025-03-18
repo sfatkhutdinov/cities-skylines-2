@@ -8,6 +8,7 @@ from pynput.keyboard import Key, Controller as KeyboardController
 from pynput.mouse import Button, Controller as MouseController
 import ctypes
 import pyautogui
+import torch
 
 # Import Win32 user32 for more direct mouse control
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -234,10 +235,28 @@ class InputSimulator:
         except Exception as e:
             print(f"Error using Alt+Tab fallback: {e}")
         
-        # Fallback: return True to avoid blocking, but warn user
+        # Fallback: return False since we couldn't properly focus the window
         print(f"WARNING: Failed to focus game window after trying methods: {', '.join(methods_tried)}")
-        print("Continuing anyway. User may need to manually focus the game window.")
-        return True  # Return True to allow operation to continue
+        
+        # Check if window still exists at least
+        if win32gui.IsWindow(self.game_hwnd):
+            # If the window exists but we can't focus it, try once more
+            try:
+                win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                time.sleep(0.5)
+                win32gui.SetForegroundWindow(self.game_hwnd)
+                time.sleep(0.2)
+                if win32gui.GetForegroundWindow() == self.game_hwnd:
+                    return True
+            except:
+                pass
+        else:
+            # Window no longer exists, reset the handle
+            self.game_hwnd = None
+            print("Game window no longer exists. Will attempt to find it again next time.")
+            
+        # Return False to indicate failure
+        return False
         
     def mouse_move(self, x: int, y: int, relative: bool = False, use_win32: bool = True):
         """Move the mouse to a position.
@@ -318,7 +337,7 @@ class InputSimulator:
             except:
                 pass
         
-    def mouse_click(self, x: int, y: int, button: str = 'left', double: bool = False):
+    def mouse_click(self, x: int, y: int, button: str = 'left', double: bool = False) -> bool:
         """Perform mouse click at specified coordinates.
         
         Args:
@@ -326,30 +345,55 @@ class InputSimulator:
             y (int): Y coordinate
             button (str): 'left', 'right', or 'middle'
             double (bool): Whether to perform double click
+            
+        Returns:
+            bool: True if click was successful, False otherwise
         """
+        # First ensure the game window is focused
+        if not self.ensure_game_window_focused():
+            print(f"Failed to focus game window before mouse click at ({x},{y})")
+            return False
+            
         # Move to target position using our improved mouse_move
-        self.mouse_move(x, y)
-        time.sleep(0.1)
-        
-        # Map button string to pynput Button
-        button_map = {
-            'left': Button.left,
-            'right': Button.right,
-            'middle': Button.middle
-        }
-        btn = button_map.get(button, Button.left)
-        
-        # Perform click(s)
-        self.mouse.click(btn, 1)
-        time.sleep(0.1)
-        
-        if double:
+        try:
+            self.mouse_move(x, y)
             time.sleep(0.1)
+            
+            # Verify cursor position after move
+            current_x, current_y = win32api.GetCursorPos()
+            if abs(current_x - x) > 5 or abs(current_y - y) > 5:
+                print(f"Mouse position verification failed: requested ({x},{y}), got ({current_x},{current_y})")
+                # Try one more time
+                self.mouse_move(x, y)
+                time.sleep(0.1)
+                current_x, current_y = win32api.GetCursorPos()
+                if abs(current_x - x) > 5 or abs(current_y - y) > 5:
+                    print(f"Mouse position verification failed again, proceeding anyway")
+            
+            # Map button string to pynput Button
+            button_map = {
+                'left': Button.left,
+                'right': Button.right,
+                'middle': Button.middle
+            }
+            btn = button_map.get(button, Button.left)
+            
+            # Perform click(s)
             self.mouse.click(btn, 1)
             time.sleep(0.1)
             
+            if double:
+                time.sleep(0.1)
+                self.mouse.click(btn, 1)
+                time.sleep(0.1)
+                
+            return True
+        except Exception as e:
+            print(f"Error during mouse click at ({x},{y}): {e}")
+            return False
+        
     def mouse_drag(self, start: Tuple[int, int], end: Tuple[int, int],
-                  button: str = 'left', duration: float = 0.2):
+                  button: str = 'left', duration: float = 0.2) -> bool:
         """Perform mouse drag operation.
         
         Args:
@@ -357,41 +401,105 @@ class InputSimulator:
             end (Tuple[int, int]): Ending coordinates (x, y)
             button (str): 'left', 'right', or 'middle'
             duration (float): Duration of drag operation in seconds
+            
+        Returns:
+            bool: True if drag was successful, False otherwise
         """
+        # First ensure the game window is focused
+        if not self.ensure_game_window_focused():
+            print(f"Failed to focus game window before mouse drag")
+            return False
+            
         x1, y1 = start
         x2, y2 = end
         
-        # Map button string to pynput Button
-        button_map = {
-            'left': Button.left,
-            'right': Button.right,
-            'middle': Button.middle
-        }
-        btn = button_map.get(button, Button.left)
-        
-        # Move to start position using improved mouse_move
-        self.mouse_move(x1, y1)
-        time.sleep(0.1)
-        
-        # Print drag operation details for debugging
-        print(f"Dragging: ({x1},{y1}) -> ({x2},{y2}) with {button} button")
-        
-        # Press button
-        self.mouse.press(btn)
-        time.sleep(0.1)
-        
-        # Smooth movement
-        steps = max(5, int(duration * 60))  # At least 5 steps, up to 60 updates per second
-        for i in range(1, steps + 1):
-            t = i / steps
-            x = int(x1 + (x2 - x1) * t)
-            y = int(y1 + (y2 - y1) * t)
-            self.mouse_move(x, y)
-            time.sleep(duration / steps)
+        try:
+            # Map button string to pynput Button
+            button_map = {
+                'left': Button.left,
+                'right': Button.right,
+                'middle': Button.middle
+            }
+            btn = button_map.get(button, Button.left)
             
-        # Release button
-        self.mouse.release(btn)
-        time.sleep(0.1)
+            # Verify coordinates are within screen bounds
+            screen_width, screen_height = self.get_screen_dimensions()
+            if not (0 <= x1 < screen_width and 0 <= y1 < screen_height and
+                    0 <= x2 < screen_width and 0 <= y2 < screen_height):
+                print(f"Warning: Drag coordinates out of bounds. Screen: {screen_width}x{screen_height}, " +
+                      f"Start: ({x1},{y1}), End: ({x2},{y2})")
+                # Adjust coordinates to be within bounds
+                x1 = max(0, min(x1, screen_width - 1))
+                y1 = max(0, min(y1, screen_height - 1))
+                x2 = max(0, min(x2, screen_width - 1))
+                y2 = max(0, min(y2, screen_height - 1))
+            
+            # Move to start position using improved mouse_move
+            self.mouse_move(x1, y1)
+            time.sleep(0.1)
+            
+            # Verify start position
+            current_x, current_y = win32api.GetCursorPos()
+            if abs(current_x - x1) > 5 or abs(current_y - y1) > 5:
+                print(f"Mouse drag start position verification failed: requested ({x1},{y1}), got ({current_x},{current_y})")
+                # Try one more time
+                self.mouse_move(x1, y1)
+                time.sleep(0.1)
+            
+            # Print drag operation details for debugging
+            print(f"Dragging: ({x1},{y1}) -> ({x2},{y2}) with {button} button")
+            
+            # Press button
+            self.mouse.press(btn)
+            time.sleep(0.1)
+            
+            # Smooth movement with more steps for precision
+            steps = max(10, int(duration * 120))  # At least 10 steps, up to 120 updates per second
+            distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            # If distance is very short, use fewer steps
+            if distance < 50:
+                steps = max(5, steps // 2)
+                
+            for i in range(1, steps + 1):
+                t = i / steps
+                # Use a smoother easing function for more natural movement
+                # This uses an ease-in-out curve
+                if t < 0.5:
+                    ease_t = 2 * t * t
+                else:
+                    ease_t = -1 + (4 - 2 * t) * t
+                
+                x = int(x1 + (x2 - x1) * ease_t)
+                y = int(y1 + (y2 - y1) * ease_t)
+                self.mouse_move(x, y)
+                # Adjust timing based on step count to maintain total duration
+                time.sleep(duration / steps)
+                
+            # Release button
+            self.mouse.release(btn)
+            time.sleep(0.1)
+            
+            # Verify end position as a final check
+            current_x, current_y = win32api.GetCursorPos()
+            end_pos_success = (abs(current_x - x2) <= 10 and abs(current_y - y2) <= 10)
+            if not end_pos_success:
+                print(f"Mouse drag end position verification: requested ({x2},{y2}), got ({current_x},{current_y})")
+                
+            return True
+        except Exception as e:
+            print(f"Error during mouse drag {start} -> {end}: {e}")
+            # Make sure to release the button on error
+            try:
+                button_map = {
+                    'left': Button.left,
+                    'right': Button.right,
+                    'middle': Button.middle
+                }
+                btn = button_map.get(button, Button.left)
+                self.mouse.release(btn)
+            except:
+                pass
+            return False
         
     def mouse_scroll(self, clicks: int):
         """Scroll the mouse wheel.
@@ -469,24 +577,32 @@ class InputSimulator:
         self.mouse.release(Button.right)
         time.sleep(0.1)
         
-    def key_press(self, key: str, duration: float = 0.1):
+    def key_press(self, key: str, duration: float = 0.1) -> bool:
         """Press a key with a short duration.
         
         Args:
             key (str): Key to press
             duration (float): How long to hold the key
+            
+        Returns:
+            bool: True if successful, False otherwise
         """
+        # First ensure the game window is focused
+        if not self.ensure_game_window_focused():
+            print(f"Failed to focus game window before key press: {key}")
+            # We'll still attempt the key press, but log the issue
+        
         # Check for escape key with improved safety logic
         if key.lower() in ['escape', 'esc']:
             if hasattr(self, 'block_escape') and self.block_escape:
                 print("WARNING: Blocked ESC key press - using safe menu handling instead")
                 return self.safe_menu_handling()
         
-        # Check for potentially problematic key presses
-        dangerous_keys = ['f4']
+        # Check for potentially problematic key presses and block them
+        dangerous_keys = ['f4', 'alt+f4', 'ctrl+w', 'alt+tab']
         if key.lower() in dangerous_keys:
-            print(f"WARNING: Potentially risky key press detected: {key}")
-            # Continue but log warning
+            print(f"WARNING: Blocked dangerous key press: {key}")
+            return False
         
         try:
             # Get the key from the map
@@ -496,14 +612,38 @@ class InputSimulator:
                 # If not in map, try direct key
                 k = key
                 
+            # Log the key press action
+            print(f"Pressing key: {key} for {duration:.2f}s")
+            
             # Press and release with specified duration
             self.keyboard.press(k)
-            time.sleep(duration)
+            
+            # Use an adaptive timeout based on duration
+            # For very short presses (< 0.1s), use a minimum of 0.05s
+            actual_duration = max(0.05, duration)
+            time.sleep(actual_duration)
+            
             self.keyboard.release(k)
             time.sleep(0.05)  # Small delay after release
+            
+            # Verify that the key was released properly
+            try:
+                # For most keys we can't directly verify, but we can make sure the keyboard state is reset
+                self.keyboard.release(k)  # Try releasing again to ensure it's released
+            except:
+                pass
+            
             return True
         except Exception as e:
             print(f"Error pressing key {key}: {str(e)}")
+            
+            # Try to ensure key is released on error
+            try:
+                if key in self.key_map:
+                    self.keyboard.release(self.key_map[key])
+            except:
+                pass
+                
             return False
             
     def safe_menu_handling(self):
@@ -516,29 +656,34 @@ class InputSimulator:
         # Get screen dimensions
         screen_width, screen_height = self.get_screen_dimensions()
         
-        # EXACT coordinates provided by user: 720x513
-        primary_resume_button = (720, 513)  # Exact coordinates for RESUME GAME button
+        # Reference coordinates for resume button at 1920x1080 resolution
+        # These are relative positions within the window (percentages of screen dimensions)
+        primary_resume_button_rel = (0.375, 0.475)  # ~720/1920, ~513/1080
         
-        # Create a more comprehensive grid of positions around the main button
-        # to increase chances of hitting the right spot
+        # Calculate actual pixel position based on current screen resolution
+        primary_resume_button = (
+            int(primary_resume_button_rel[0] * screen_width),
+            int(primary_resume_button_rel[1] * screen_height)
+        )
+        print(f"Primary resume button calculated at {primary_resume_button} for {screen_width}x{screen_height}")
+        
+        # Create a comprehensive grid of positions around the main button
+        # using relative offsets to scale properly on all resolutions
         grid_positions = []
-        for x_offset in range(-30, 31, 10):  # -30 to +30 in steps of 10
-            for y_offset in range(-30, 31, 10):  # -30 to +30 in steps of 10
-                grid_positions.append((
-                    primary_resume_button[0] + x_offset,
-                    primary_resume_button[1] + y_offset
-                ))
+        relative_offsets = [(-0.02, -0.02), (0, -0.02), (0.02, -0.02),
+                           (-0.02, 0), (0, 0), (0.02, 0),
+                           (-0.02, 0.02), (0, 0.02), (0.02, 0.02)]
         
-        # Scale coordinates for different resolutions
-        if screen_width != 1920 or screen_height != 1080:
-            x_scale = screen_width / 1920
-            y_scale = screen_height / 1080
-            scaled_positions = []
-            for x, y in grid_positions:
-                scaled_positions.append((int(x * x_scale), int(y * y_scale)))
-        else:
-            # Use exact positions for 1920x1080
-            scaled_positions = grid_positions
+        for x_offset_rel, y_offset_rel in relative_offsets:
+            x_offset = int(x_offset_rel * screen_width)
+            y_offset = int(y_offset_rel * screen_height)
+            grid_positions.append((
+                primary_resume_button[0] + x_offset,
+                primary_resume_button[1] + y_offset
+            ))
+        
+        # No need for additional scaling since we calculated based on current resolution
+        scaled_positions = grid_positions
         
         # Add additional fallback positions with wider coverage
         additional_positions = [
@@ -651,12 +796,14 @@ class InputSimulator:
             self.mouse_drag(start, end, duration=0.3)
             time.sleep(0.3)
             
-        # Strategy 4: Final attempt with more key combinations
+        # Strategy 4: Final attempt with safer key combinations
         print("Strategy 4: Final keyboard attempts")
-        # Try some additional key combinations as last resort
-        self.key_combination(['alt', 'f4'], duration=0.05)  # Very brief Alt+F4 to trigger dialog handling without closing
+        # Try safer key combinations as last resort
+        self.key_press('escape', 0.1)  # Controlled use of escape key
         time.sleep(0.1)
-        self.key_press('n', 0.1)  # Press 'n' for "No" if "Do you want to quit" appears
+        self.key_press('enter', 0.1)  # Enter key often confirms dialog options
+        time.sleep(0.2)
+        self.key_press('n', 0.1)  # Press 'n' for "No" if confirmation dialog appears
         time.sleep(0.2)
         
         # Reset mouse to center of screen to allow full movement after menu handling
@@ -679,46 +826,101 @@ class InputSimulator:
             # Fallback to primary monitor resolution
             return win32api.GetSystemMetrics(0), win32api.GetSystemMetrics(1)
             
-    def key_combination(self, keys: List[str], duration: float = 0.1, allow_focus_keys: bool = False):
+    def key_combination(self, keys: List[str], duration: float = 0.1, allow_focus_keys: bool = False) -> bool:
         """Press a combination of keys simultaneously.
         
         Args:
             keys (List[str]): List of key names from key_map
             duration (float): Duration to hold the keys in seconds
             allow_focus_keys (bool): If True, allow certain dangerous combinations like Alt+Tab when used for window focusing
+            
+        Returns:
+            bool: True if successful, False otherwise
         """
+        # First ensure the game window is focused (unless this is a focus operation)
+        if not allow_focus_keys and not self.ensure_game_window_focused():
+            print(f"Failed to focus game window before key combination: {keys}")
+            # We'll still attempt the key combo, but log the issue
+        
         # Safety check: prevent dangerous key combinations
         dangerous_combinations = [
             ['alt', 'tab'],
             ['alt', 'f4'],
             ['ctrl', 'w'],
             ['alt', 'escape'],
-            ['ctrl', 'alt', 'delete']
+            ['ctrl', 'alt', 'delete'],
+            ['windows', 'l'],
+            ['windows', 'd'],
+            ['windows', 'e'],
+            ['ctrl', 'shift', 'esc']
         ]
         
-        # If allow_focus_keys is True, we won't block alt+tab specifically
-        if allow_focus_keys and len(keys) == 2 and 'alt' in [k.lower() for k in keys] and 'tab' in [k.lower() for k in keys]:
+        # Convert all keys to lowercase for consistent comparison
+        lower_keys = [k.lower() for k in keys]
+        
+        # If allow_focus_keys is True, we won't block alt+tab specifically when used for window focusing
+        if allow_focus_keys and len(keys) == 2 and 'alt' in lower_keys and 'tab' in lower_keys:
             print("Allowing Alt+Tab for window focusing")
         else:
             # Check if requested combination contains a dangerous pattern
             for dangerous_combo in dangerous_combinations:
-                if all(k.lower() in [key.lower() for key in keys] for k in dangerous_combo):
+                # Convert to set for easier subset checking
+                combo_set = set(dangerous_combo)
+                keys_set = set(lower_keys)
+                
+                if combo_set.issubset(keys_set):
                     print(f"WARNING: Blocked dangerous key combination: {keys}")
                     return False
         
-        # Press all keys
-        pressed_keys = []
-        for key in keys:
-            key_code = self.key_map.get(key.lower())
-            if key_code is not None:
-                self.keyboard.press(key_code)
-                pressed_keys.append(key_code)
+        try:
+            # Log the key combination
+            print(f"Pressing key combination: {'+'.join(keys)} for {duration:.2f}s")
+            
+            # Press all keys
+            pressed_keys = []
+            for key in keys:
+                key_code = self.key_map.get(key.lower())
+                if key_code is not None:
+                    self.keyboard.press(key_code)
+                    pressed_keys.append(key_code)
+                    # Small delay between presses to ensure they register
+                    time.sleep(0.02)
+                else:
+                    print(f"Warning: Key '{key}' not found in key map, skipping")
+                    
+            # Use an adaptive timeout based on duration
+            # For very short presses (< 0.1s), use a minimum of 0.05s
+            actual_duration = max(0.05, duration)
+            time.sleep(actual_duration)
+            
+            # Release all keys in reverse order
+            for key_code in reversed(pressed_keys):
+                self.keyboard.release(key_code)
+                # Small delay between releases
+                time.sleep(0.02)
                 
-        time.sleep(duration)
-        
-        # Release all keys in reverse order
-        for key_code in reversed(pressed_keys):
-            self.keyboard.release(key_code)
+            # Additional safety: ensure all keys are released by releasing them again
+            time.sleep(0.05)
+            for key_code in pressed_keys:
+                try:
+                    self.keyboard.release(key_code)
+                except:
+                    pass
+                    
+            return True
+        except Exception as e:
+            print(f"Error executing key combination {keys}: {e}")
+            
+            # Emergency release of all keys on error
+            for key in keys:
+                try:
+                    key_code = self.key_map.get(key.lower())
+                    if key_code is not None:
+                        self.keyboard.release(key_code)
+                except:
+                    pass
+                    
+            return False
             
     def press_key(self, key: str):
         """Press a key without releasing it.
@@ -802,4 +1004,324 @@ class InputSimulator:
         btn = button_map.get(button, Button.left)
         
         # Release button
-        self.mouse.release(btn) 
+        self.mouse.release(btn)
+
+    # Cities: Skylines 2 specific helper methods
+    
+    def cs2_toggle_pause(self) -> bool:
+        """Toggle game pause state.
+        
+        Returns:
+            bool: Success status
+        """
+        return self.key_press('space')
+        
+    def cs2_change_game_speed(self, speed: int) -> bool:
+        """Change game speed.
+        
+        Args:
+            speed (int): 1-3 for normal, fast, fastest
+            
+        Returns:
+            bool: Success status
+        """
+        if speed < 1 or speed > 3:
+            print(f"Invalid game speed: {speed}. Must be 1-3.")
+            return False
+            
+        return self.key_press(str(speed))
+        
+    def cs2_toggle_info_view(self, view_type: str) -> bool:
+        """Toggle an information view.
+        
+        Args:
+            view_type (str): Type of view ('economy', 'progression', 'transport', etc.)
+            
+        Returns:
+            bool: Success status
+        """
+        view_keys = {
+            'progression': 'p',
+            'economy': 'z', 
+            'transportation': 'x',
+            'information': 'c',
+            'statistics': 'v',
+            'map': 'm'
+        }
+        
+        if view_type.lower() in view_keys:
+            return self.key_press(view_keys[view_type.lower()])
+        else:
+            print(f"Unknown info view: {view_type}")
+            return False
+            
+    def cs2_bulldoze(self) -> bool:
+        """Activate bulldoze tool.
+        
+        Returns:
+            bool: Success status
+        """
+        return self.key_press('b')
+        
+    def cs2_select_build_tool(self, tool: str) -> bool:
+        """Select a building tool.
+        
+        Args:
+            tool (str): Tool name ('road', 'zone', 'water', etc.)
+            
+        Returns:
+            bool: Success status
+        """
+        # First ensure we're in the main game view
+        if not self.ensure_game_window_focused():
+            return False
+            
+        # Map of common tools and their typical UI locations (as ratios of screen dimensions)
+        tool_positions = {
+            'road': (0.1, 0.1),           # Top left menu, first icon
+            'zone_residential': (0.1, 0.2),  # Top left, second row
+            'zone_commercial': (0.1, 0.25),
+            'zone_industrial': (0.1, 0.3),
+            'water': (0.1, 0.4),
+            'electricity': (0.1, 0.5),
+            'services': (0.1, 0.6)
+        }
+        
+        if tool.lower() in tool_positions:
+            # Get screen dimensions
+            width, height = self.get_screen_dimensions()
+            
+            # Calculate pixel positions
+            x, y = tool_positions[tool.lower()]
+            x_px = int(x * width)
+            y_px = int(y * height)
+            
+            # Click on the tool icon
+            return self.mouse_click(x_px, y_px)
+        else:
+            print(f"Unknown building tool: {tool}")
+            return False
+            
+    def cs2_save_game(self) -> bool:
+        """Quick save the game.
+        
+        Returns:
+            bool: Success status
+        """
+        return self.key_press('f5')
+        
+    def cs2_load_game(self) -> bool:
+        """Quick load the game.
+        
+        Returns:
+            bool: Success status
+        """
+        # Be very careful with load operations - don't want to lose progress
+        print("WARNING: Load game operation requested")
+        return False  # Disabled for safety - require explicit UI navigation
+
+    def verify_action_success(self, action_name: str, timeout: float = 2.0) -> bool:
+        """Verify that an action was successful by checking for visual changes.
+        
+        This method requires that the input simulator has access to the screen_capture object.
+        
+        Args:
+            action_name (str): Name of the action to verify (for logging)
+            timeout (float): Maximum time to wait for visual confirmation in seconds
+            
+        Returns:
+            bool: True if action appears successful, False otherwise
+        """
+        # Check if we have access to screen capture
+        if not hasattr(self, 'screen_capture'):
+            print(f"Cannot verify action '{action_name}' - no screen capture available")
+            return True  # Assume success if we can't verify
+        
+        try:
+            # Capture before state if not already captured
+            if not hasattr(self, 'before_action_frame'):
+                # Store current frame for comparison
+                self.before_action_frame = self.screen_capture.capture_frame()
+                print(f"Stored pre-action state for '{action_name}'")
+                return True  # This is just initialization
+                
+            # Wait briefly for the game to respond
+            time.sleep(0.2)
+            
+            # Capture the current frame
+            current_frame = self.screen_capture.capture_frame()
+            
+            # Compare with before state
+            if torch.is_tensor(current_frame) and torch.is_tensor(self.before_action_frame):
+                # Calculate frame difference
+                diff = torch.abs(current_frame - self.before_action_frame).mean().item()
+                
+                # Clear the stored frame to avoid reusing it
+                del self.before_action_frame
+                
+                # Check if there was a significant change
+                change_threshold = 0.01  # Adjust based on testing
+                if diff > change_threshold:
+                    print(f"Action '{action_name}' verified - detected visual change: {diff:.4f}")
+                    return True
+                else:
+                    print(f"Action '{action_name}' may have failed - minimal visual change: {diff:.4f}")
+                    return False
+            else:
+                print(f"Could not compare frames for action '{action_name}' - incompatible types")
+                return True  # Assume success if we can't verify
+                
+        except Exception as e:
+            print(f"Error verifying action '{action_name}': {e}")
+            # Clean up if needed
+            if hasattr(self, 'before_action_frame'):
+                del self.before_action_frame
+            return True  # Assume success on error
+            
+    def retry_on_failure(self, action_func, action_name: str, max_attempts: int = 3, *args, **kwargs):
+        """Execute an action and retry if it fails.
+        
+        Args:
+            action_func: The function to call
+            action_name (str): Name of the action for logging
+            max_attempts (int): Maximum number of retry attempts
+            *args, **kwargs: Arguments to pass to the action function
+            
+        Returns:
+            The result of the action function, or False if all attempts fail
+        """
+        # Store a frame before the action
+        if hasattr(self, 'screen_capture'):
+            self.before_action_frame = self.screen_capture.capture_frame()
+            
+        for attempt in range(max_attempts):
+            # Execute the action
+            result = action_func(*args, **kwargs)
+            
+            # If action failed in its own error handling, retry
+            if not result:
+                print(f"Action '{action_name}' failed on attempt {attempt+1}/{max_attempts}")
+                time.sleep(0.5)  # Wait before retry
+                continue
+                
+            # Verify success with visual feedback
+            if self.verify_action_success(action_name):
+                if attempt > 0:
+                    print(f"Action '{action_name}' succeeded on attempt {attempt+1}")
+                return result
+            elif attempt < max_attempts - 1:
+                print(f"Action '{action_name}' verification failed, retrying ({attempt+1}/{max_attempts})")
+                time.sleep(0.5)  # Wait before retry
+                
+        # If we get here, all attempts failed
+        print(f"Action '{action_name}' failed after {max_attempts} attempts")
+        return False
+
+    def connect_to_reward_system(self, reward_system):
+        """Connect this input simulator to a reward system for reinforcement learning.
+        
+        Args:
+            reward_system: The reward system object to use for feedback
+        """
+        self.reward_system = reward_system
+        print(f"Input simulator connected to reward system")
+        
+    def execute_with_feedback(self, action_func, action_name: str, action_type: str, *args, **kwargs) -> Tuple[bool, float]:
+        """Execute an action and get reward feedback for reinforcement learning.
+        
+        This method requires the input simulator to be connected to a reward system.
+        
+        Args:
+            action_func: The function to call
+            action_name (str): Name of the action for logging
+            action_type (str): Type of action for reward calculation 
+                              ('ui', 'camera', 'build', etc.)
+            *args, **kwargs: Arguments to pass to the action function
+            
+        Returns:
+            Tuple[bool, float]: (success status, reward)
+        """
+        # Check if we have a reward system
+        if not hasattr(self, 'reward_system'):
+            print(f"Warning: No reward system connected, can't get feedback for '{action_name}'")
+            # Execute without feedback
+            success = self.retry_on_failure(action_func, action_name, *args, **kwargs)
+            return success, 0.0
+            
+        # Prepare action info for reward calculation
+        action_info = {
+            "type": action_type,
+            "action": action_name,
+            "args": args,
+            "kwargs": kwargs
+        }
+        
+        # Check if we have a screen capture system for before/after states
+        if hasattr(self, 'screen_capture'):
+            # Capture state before action
+            before_state = self.screen_capture.capture_frame()
+            
+            # Execute action
+            success = self.retry_on_failure(action_func, action_name, *args, **kwargs)
+            
+            # Capture state after action
+            after_state = self.screen_capture.capture_frame()
+            
+            # Get reward based on the action and state change
+            try:
+                reward = self.reward_system.calculate_action_reward(
+                    before_state, 
+                    after_state,
+                    action_info,
+                    success
+                )
+                
+                print(f"Action '{action_name}' received reward: {reward:.4f}")
+                
+                # Store successful actions with positive rewards for learning
+                if success and reward > 0 and hasattr(self, 'successful_actions'):
+                    self.successful_actions.append((action_name, action_type, reward))
+                    
+                    # Keep only the last 100 successful actions
+                    if len(self.successful_actions) > 100:
+                        self.successful_actions.pop(0)
+                        
+                return success, reward
+                
+            except Exception as e:
+                print(f"Error calculating reward for action '{action_name}': {e}")
+                return success, 0.0
+        else:
+            # No screen capture, just execute the action
+            success = self.retry_on_failure(action_func, action_name, *args, **kwargs)
+            return success, 0.0
+            
+    def get_action_suggestions(self, current_state=None, top_n: int = 5) -> List[Tuple[str, str]]:
+        """Get suggested actions based on previous successes.
+        
+        Args:
+            current_state: Optional state tensor to consider for context
+            top_n (int): Number of suggestions to return
+            
+        Returns:
+            List[Tuple[str, str]]: List of (action_name, action_type) suggestions
+        """
+        # Initialize successful actions list if not already present
+        if not hasattr(self, 'successful_actions'):
+            self.successful_actions = []
+            
+        # If we have no history, return some basic actions
+        if not self.successful_actions:
+            default_suggestions = [
+                ('move_up', 'camera'),
+                ('move_down', 'camera'),
+                ('click_random', 'ui'),
+                ('rotate_right', 'camera')
+            ]
+            return default_suggestions[:top_n]
+            
+        # Sort actions by reward
+        sorted_actions = sorted(self.successful_actions, key=lambda x: x[2], reverse=True)
+        
+        # Return the top N actions (name and type only)
+        return [(name, action_type) for name, action_type, _ in sorted_actions[:top_n]] 
