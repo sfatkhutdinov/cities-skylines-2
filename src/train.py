@@ -42,27 +42,38 @@ except Exception as e:
 from typing import Dict, List, Tuple
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Cities: Skylines 2 RL agent")
-    parser.add_argument("--num_episodes", type=int, default=10000, help="Number of episodes to train")
-    parser.add_argument("--max_steps", type=int, default=100, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for updates")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Train reinforcement learning agent")
+    
+    # Training parameters
+    parser.add_argument("--num_episodes", type=int, default=1000, help="Number of episodes to train for")
+    parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for updates")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
+    parser.add_argument("--clip_param", type=float, default=0.2, help="PPO clipping parameter")
+    
+    # Checkpointing and resumption
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--checkpoint_freq", type=int, default=100, help="Episodes between checkpoints")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
-    parser.add_argument("--mock", action="store_true", help="Use mock environment for training without the actual game")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--resolution", type=str, default="320x240", help="Resolution for screen capture (WxH)")
-    parser.add_argument("--action_delay", type=float, default=1.0, help="Minimum delay between actions (seconds)")
-    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
-    parser.add_argument("--resume_best", action="store_true", help="Resume training from best checkpoint")
-    parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")
-    parser.add_argument("--capture_menu", action="store_true", help="Capture a menu screenshot at startup (assumes you're starting from the menu)")
-    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--autosave_interval", type=int, default=15, help="Minutes between auto-saves")
     parser.add_argument("--backup_checkpoints", type=int, default=5, help="Number of backup checkpoints to keep")
+    parser.add_argument("--fresh_start", action="store_true", help="Force starting training from scratch, ignoring existing checkpoints")
+    parser.add_argument("--use_best", action="store_true", help="Resume training from best checkpoint instead of latest")
+    
+    # Environment settings
+    parser.add_argument("--mock_env", action="store_true", help="Use mock environment for testing")
+    parser.add_argument("--disable_menu_detection", action="store_true", help="Disable menu detection")
+    
+    # Monitoring and logging
+    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    
+    # Hardware acceleration
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU usage even if GPU is available")
     parser.add_argument("--fp16", action="store_true", help="Use mixed precision (FP16) if available")
+    
     return parser.parse_args()
 
 def collect_trajectory(env, agent, max_steps, render=False):
@@ -433,7 +444,7 @@ def train():
     
     log_file = log_dir / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
-        level=logging.INFO if not args.debug else logging.DEBUG,
+        level=logging.INFO if not args.verbose else logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler(log_file),
@@ -457,26 +468,22 @@ def train():
     
     # Create environment and agent
     env = CitiesEnvironment(
-        config=config, 
-        mock_mode=args.mock, 
-        menu_screenshot_path=args.menu_screenshot
+        config=config,
+        mock_mode=args.mock_env,
+        enable_menu_detection=not args.disable_menu_detection
     )
-    # Set minimum delay between actions
-    env.min_action_delay = args.action_delay
-    logger.info(f"Environment initialized with mock mode: {args.mock}, action delay: {args.action_delay}s")
     
-    # If user requested to capture menu screenshot at startup
-    if args.capture_menu and not args.mock:
-        logger.info("Capturing menu screenshot at startup (assuming game is showing menu)")
-        menu_path = "menu_reference.png"
-        if env.capture_menu_reference(menu_path):
-            logger.info(f"Successfully captured menu screenshot to {menu_path}")
-        else:
-            logger.warning("Failed to capture menu screenshot")
-    
-    logger.info("Initializing agent...")
-    agent = PPOAgent(config)
-    logger.info("Agent initialized")
+    agent = PPOAgent(
+        state_dim=env.observation_space.shape,
+        action_dim=env.action_space.n,
+        device=config.get_device(),
+        learning_rate=args.learning_rate,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_param=args.clip_param,
+        value_coef=0.5,
+        entropy_coef=0.01
+    )
     
     # Connect environment and agent for better coordination
     env.agent = agent
@@ -493,24 +500,44 @@ def train():
     # Set up signal handlers for graceful termination
     setup_signal_handlers(checkpoint_manager)
     
-    # Handle checkpoint resumption if requested
+    # Handle checkpoint resumption (auto-resume by default unless fresh_start is specified)
     start_episode = 0
     checkpoint_loaded = False
     best_reward = float("-inf")
     
-    if args.resume or args.resume_best:
-        if args.resume_best:
+    # Check if we have any checkpoints available
+    best_exists = (checkpoint_dir / "best_model.pt").exists()
+    latest = find_latest_checkpoint(checkpoint_dir)
+    has_checkpoints = best_exists or latest is not None
+    
+    # Determine if we should try to resume
+    should_resume = has_checkpoints and not args.fresh_start
+    
+    if should_resume:
+        # First try loading the best model if specifically requested
+        if args.use_best and best_exists:
+            logger.info("Auto-resuming from best checkpoint...")
             episode = checkpoint_manager.load_checkpoint(use_best=True)
             if episode is not None:
                 checkpoint_loaded = True
-        elif args.resume:
+                logger.info(f"Successfully resumed from best checkpoint (episode {episode})")
+        # Otherwise try loading the latest checkpoint
+        elif latest:
+            episode_num, _ = latest
+            logger.info(f"Auto-resuming from latest checkpoint (episode {episode_num})...")
             episode = checkpoint_manager.load_checkpoint()
             if episode is not None:
                 start_episode = episode
                 checkpoint_loaded = True
+                logger.info(f"Successfully resumed from episode {episode}")
         
         if not checkpoint_loaded:
-            logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
+            logger.warning("No valid checkpoints found or loading failed. Starting training from scratch.")
+    else:
+        if args.fresh_start and has_checkpoints:
+            logger.info("Checkpoints found but --fresh_start flag specified. Starting training from scratch.")
+        elif not has_checkpoints:
+            logger.info("No existing checkpoints found. Starting new training run.")
     
     # Initialize wandb if enabled
     if args.use_wandb:
