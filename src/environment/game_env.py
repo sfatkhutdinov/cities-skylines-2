@@ -488,231 +488,167 @@ class CitiesEnvironment:
         logger.info(f"Game speed set to level {speed_level}")
         time.sleep(0.2)  # Give time for speed change to take effect
     
-    def step(self, action_index: int) -> Tuple[torch.Tensor, float, bool, dict]:
-        """Take an action in the environment.
+    def step(self, action_idx: int):
+        """Take a step in the environment by performing an action.
         
         Args:
-            action_index: Index of the action to take
+            action_idx (int): Index of the action to perform
             
         Returns:
-            observation: The next observation (frame)
-            reward: The reward for the action
-            done: Whether the episode is done
-            info: Additional information
+            tuple: (next_state, reward, done, info)
         """
-        # Check if we need to delay before taking another action
+        # Get action details
+        if action_idx not in self.actions:
+            print(f"Warning: Invalid action index {action_idx}, using random action instead")
+            action_idx = random.choice(list(self.actions.keys()))
+            
+        action = self.actions[action_idx]
+        
+        # Skip menu-triggering actions if we're suppressing them
+        if self.suppress_menu_actions:
+            if action.get('type') == 'time' and action.get('action') == 'open_pause_menu':
+                # Skip directly opening the pause menu if we're suppressing menu actions
+                print(f"Suppressing menu action: {action_idx} ({action.get('type')}/{action.get('action')})")
+                # Use a safer action instead like zooming in slightly
+                action_idx = 4  # zoom_in action
+                action = self.actions[action_idx]
+                
+            # Decrement the suppression counter
+            self.menu_action_suppression_steps -= 1
+            if self.menu_action_suppression_steps <= 0:
+                self.suppress_menu_actions = False
+                print("Menu action suppression ended")
+        
+        # Perform the action
+        reward = 0
+        done = False
+        info = {}
+        
+        # Check if we were in a menu before this action
+        was_in_menu = False
+        if not self.mock_mode:
+            # Capture frame before action to detect if we're in a menu
+            pre_frame = self.screen_capture.capture_frame()
+            was_in_menu = self.visual_estimator.detect_main_menu(pre_frame)
+            
+            if was_in_menu:
+                # If we're in a menu and have been for a while, try to exit it
+                self.menu_stuck_counter += 1
+                print(f"In menu before action (stuck for {self.menu_stuck_counter} steps)")
+                
+                # After being stuck for a while, try to exit more aggressively
+                if self.menu_stuck_counter >= 5:
+                    print(f"Attempting to exit menu - stuck for {self.menu_stuck_counter} steps")
+                    self.input_simulator.safe_menu_handling()
+                    
+                    # Check if we successfully exited
+                    post_exit_frame = self.screen_capture.capture_frame()
+                    still_in_menu = self.visual_estimator.detect_main_menu(post_exit_frame)
+                    
+                    if not still_in_menu:
+                        # Successfully exited the menu
+                        print("Successfully exited menu through safe_menu_handling")
+                        self.menu_stuck_counter = 0
+                        
+                        # Suppress menu actions for a while to prevent getting stuck again
+                        self.suppress_menu_actions = True
+                        self.menu_action_suppression_steps = self.max_menu_suppression_steps
+                        
+                        # Apply a small recovery bonus to reward
+                        reward += 5.0
+                        
+                        # Replace the current action with a wait to let things settle
+                        action_idx = 59  # wait_short action
+                        action = self.actions[action_idx]
+                    else:
+                        # Still in menu, apply menu penalty
+                        menu_penalty = self.reward_system.calculate_menu_penalty(True, self.menu_stuck_counter)
+                        reward += menu_penalty
+                        info['menu_penalty'] = menu_penalty
+            else:
+                # Reset counter if we're not in a menu
+                self.menu_stuck_counter = 0
+                
+        # Execute the action if we're not in mock mode
+        if not self.mock_mode:
+            if not self.execute_action(action_idx, action):
+                # Action execution failed, apply a small penalty
+                reward -= 0.5
+                info['action_failed'] = True
+        else:
+            # Mock action execution with random reward
+            time.sleep(0.1)
+            reward += (random.random() - 0.4) * 2  # Random reward between -0.8 and 0.8
+        
+        # Update state counter
+        self.steps_taken += 1
+        
+        # Get the next state
+        if not self.mock_mode:
+            next_state = self.screen_capture.capture_frame()
+            self.current_frame = next_state
+        else:
+            # Add some noise to the mock frame to simulate change
+            self.mock_frame = torch.clamp(self.mock_frame + (torch.rand_like(self.mock_frame) - 0.5) * 0.1, 0, 1)
+            next_state = self.mock_frame
+        
+        # Check if the episode is done (max steps reached)
+        if self.steps_taken >= self.max_steps:
+            done = True
+            info['timeout'] = True
+            
+        # After action execution, check if we're in a menu now
+        now_in_menu = False
+        if not self.mock_mode:
+            now_in_menu = self.visual_estimator.detect_main_menu(next_state)
+            info['menu_detected'] = now_in_menu
+            
+            # If we weren't in a menu before but are now, this action caused it
+            if now_in_menu and not was_in_menu:
+                print(f"Action {action_idx} ({action.get('type')}/{action.get('action')}) triggered a menu")
+                
+                # Apply a penalty for activating a menu
+                menu_penalty = self.reward_system.calculate_menu_penalty(True, 1)
+                reward += menu_penalty
+                info['menu_transition_penalty'] = menu_penalty
+                
+                # Start counting how long we're stuck in the menu
+                self.menu_stuck_counter = 1
+                
+            # Track consecutive menu steps for penalty calculation
+            info['menu_stuck_counter'] = self.menu_stuck_counter
+        
+        # Calculate reward based on the current state
+        if not self.mock_mode:
+            # Get base reward from the visual state change
+            state_reward = self.reward_system.calculate_reward(next_state, action)
+            reward += state_reward
+            info['state_reward'] = state_reward
+        
+        # Apply reward scale
+        reward = reward * self.config.reward_scale
+        
+        # Clip reward to prevent extreme values
+        reward = max(min(reward, 1000.0), self.max_menu_penalty)
+        
+        # Check frame rate and system performance
+        if time.time() - self.last_optimization_check > self.optimization_interval:
+            self.safeguards.check_and_optimize()
+            self.last_optimization_check = time.time()
+            
+        # Safety check: if reward is extremely negative, log it as a warning
+        if reward < -100.0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Very negative reward: {reward} - possible menu penalty or other issue")
+            
+        # Delay to maintain minimum action interval
         elapsed = time.time() - self.last_action_time
         if elapsed < self.min_action_delay:
             time.sleep(self.min_action_delay - elapsed)
-            
-        # In mock mode, just increment counter and return mock frame
-        if self.mock_mode:
-            self.steps_taken += 1
-            self.current_frame = self.screen_capture.capture_frame()
-            return self.current_frame, 0.0, False, {}
-            
-        # Ensure Cities: Skylines II window is focused
-        if not self.input_simulator.ensure_game_window_focused():
-            logger.warning("Could not focus Cities: Skylines II window during step - trying to recover")
-            if not self.input_simulator.find_game_window():
-                raise RuntimeError("Cities: Skylines II window not found during step")
-                
-        # First check if we're in a menu before executing action
-        pre_action_frame = self.screen_capture.capture_frame()
-        if self.visual_estimator.detect_main_menu(pre_action_frame):
-            logger.info("Menu detected before action - attempting to exit menu first")
-            
-            # Try pressing escape once to exit the menu
-            logger.info("Trying single Escape key press to exit menu")
-            self.input_simulator.block_escape = False  # Temporarily allow Escape
-            self.input_simulator.key_press('escape')
-            self.input_simulator.block_escape = True   # Re-block Escape
-            time.sleep(0.7)
-            
-            # Check if we're still in a menu
-            if self.visual_estimator.detect_main_menu(self.screen_capture.capture_frame()):
-                logger.info("Still in menu after Escape key, trying to click 'RESUME GAME' button")
-                
-                # Now try clicking Resume Game button
-                width, height = self._get_screen_dimensions()
-                
-                # Try several potential positions for the resume game button, starting with exact coordinates from screenshot
-                resume_positions = [
-                    (int(width * 0.45), int(height * 0.387)),   # Exact position from screenshot
-                    (int(width * 0.452), int(height * 0.39)),   # Slightly adjusted
-                    (450, 387),                                 # Absolute coordinates from screenshot
-                    (int(width * 0.288), int(height * 0.27)),   # Previous position from logs
-                    (int(width * 0.5), int(height * 0.5))       # Center of screen
-                ]
-                
-                # Try each position
-                for resume_x, resume_y in resume_positions:
-                    self.input_simulator.mouse_click(resume_x, resume_y)
-                    time.sleep(0.7)
-                    
-                    # Check if we're out of the menu
-                    if not self.visual_estimator.detect_main_menu(self.screen_capture.capture_frame()):
-                        break
-        
-        # Get action details
-        if action_index < 0 or action_index >= len(self.actions):
-            logger.warning(f"Invalid action index: {action_index}")
-            action_index = 0  # Default to first action
-        
-        action_info = self.actions[action_index]
-        
-        # Check if we should suppress menu-opening actions
-        if self.suppress_menu_actions and action_info.get("type") == "time" and action_info.get("action") == "open_pause_menu":
-            logger.info("Suppressing menu-opening action due to recent menu exit")
-            # Replace with a harmless action like waiting
-            harmless_actions = [i for i, a in enumerate(self.actions) if a.get("type") == "time" and a.get("action") == "wait_short"]
-            if harmless_actions:
-                action_index = harmless_actions[0]
-                action_info = self.actions[action_index]
-                logger.info(f"Replaced with action: {action_info}")
-        
-        # Now execute the selected action
-        self._execute_action(action_info)
         self.last_action_time = time.time()
         
-        # Increment step counter
-        self.steps_taken += 1
-        
-        # Wait for a short period to let the game update
-        # This delay is calibrated based on the game's response time
-        time.sleep(0.2)
-        
-        # Capture new frame after action
-        self.current_frame = self.screen_capture.capture_frame()
-        
-        # Check if we ended up in a menu after the action (in case the action triggered a menu)
-        if self.visual_estimator.detect_main_menu(self.current_frame):
-            logger.info("Menu detected after action - trying to exit menu")
-            
-            # Try pressing escape once to exit the menu
-            logger.info("Trying single Escape key press to exit menu")
-            self.input_simulator.block_escape = False  # Temporarily allow Escape
-            self.input_simulator.key_press('escape')
-            self.input_simulator.block_escape = True   # Re-block Escape
-            time.sleep(0.7)
-            
-            # Update the current frame to see if we're still in the menu
-            self.current_frame = self.screen_capture.capture_frame()
-            
-            # If still in menu, try clicking buttons
-            if self.visual_estimator.detect_main_menu(self.current_frame):
-                logger.info("Still in menu after Escape key, trying to click 'RESUME GAME' button")
-                menu_exit_attempts = 0
-                max_exit_attempts = 3
-                
-                while self.visual_estimator.detect_main_menu(self.current_frame) and menu_exit_attempts < max_exit_attempts:
-                    menu_exit_attempts += 1
-                    logger.info(f"Attempting to click menu buttons (attempt {menu_exit_attempts}/{max_exit_attempts})")
-                    
-                    # Try clicking Resume Game button at different positions
-                    width, height = self._get_screen_dimensions()
-                    
-                    # Try several potential positions for the resume game button
-                    resume_positions = [
-                        (int(width * 0.45), int(height * 0.387)),   # Exact position from screenshot
-                        (int(width * 0.452), int(height * 0.39)),   # Slightly adjusted
-                        (450, 387),                                 # Absolute coordinates from screenshot
-                        (int(width * 0.288), int(height * 0.27)),   # Previous position from logs
-                        (int(width * 0.5), int(height * 0.5))       # Center of screen
-                    ]
-                    
-                    # Try the position corresponding to the current attempt
-                    position_index = min(menu_exit_attempts - 1, len(resume_positions) - 1)
-                    resume_x, resume_y = resume_positions[position_index]
-                    self.input_simulator.mouse_click(resume_x, resume_y)
-                    time.sleep(0.7)
-                    
-                    # Update the current frame to see if we're still in the menu
-                    self.current_frame = self.screen_capture.capture_frame()
-        
-        # Calculate reward using visual metrics
-        reward = self.visual_estimator.calculate_reward(self.current_frame)
-        
-        # Apply menu penalty if a menu is detected
-        menu_detected = self.visual_estimator.detect_main_menu(self.current_frame)
-        menu_penalty = 0.0
-        
-        if menu_detected:
-            # Increment the counter for consecutive menu steps
-            self.menu_stuck_counter += 1
-            
-            # Calculate escalating penalty based on how long the agent has been stuck
-            menu_penalty = self.reward_system.calculate_menu_penalty(menu_detected, self.menu_stuck_counter)
-            
-            # Apply penalty but don't let it exceed the maximum defined penalty
-            menu_penalty = max(menu_penalty, self.max_menu_penalty)
-            
-            reward += menu_penalty
-            logger.info(f"Applied menu penalty: {menu_penalty} (consecutive menu steps: {self.menu_stuck_counter}, total reward: {reward})")
-            
-            # Try to exit the menu immediately to prevent getting stuck
-            if self.menu_stuck_counter > 1:
-                logger.info("Stuck in menu for multiple steps - attempting to exit")
-                
-                # Click directly on the RESUME GAME button with exact coordinates
-                width, height = self._get_screen_dimensions()
-                
-                # Exact coordinates from user: (720, 513) for 1920x1080 resolution
-                resume_x, resume_y = (720, 513)
-                
-                # Scale for different resolutions
-                if width != 1920 or height != 1080:
-                    x_scale = width / 1920
-                    y_scale = height / 1080
-                    resume_x = int(resume_x * x_scale)
-                    resume_y = int(resume_y * y_scale)
-                    
-                logger.info(f"Clicking RESUME GAME at coordinates: ({resume_x}, {resume_y})")
-                self.input_simulator.mouse_click(resume_x, resume_y)
-                time.sleep(1.0)
-                
-                # If still in menu, try the safe handling method
-                if self.visual_estimator.detect_main_menu(self.screen_capture.capture_frame()):
-                    self.input_simulator.safe_menu_handling()
-                
-                # Reset mouse position after trying to exit menu
-                self._reset_mouse_position()
-        else:
-            # If we just exited a menu, handle transition properly
-            if self.menu_stuck_counter > 0:
-                logger.info("Successfully exited menu - restoring normal gameplay")
-                # Reset mouse to allow free movement
-                self._reset_mouse_position()
-                
-                # Enable menu action suppression for a while
-                self.suppress_menu_actions = True
-                self.menu_action_suppression_steps = self.max_menu_suppression_steps
-                logger.info(f"Enabling menu action suppression for {self.max_menu_suppression_steps} steps")
-            
-            # Reset the menu counter when not in menu
-            self.menu_stuck_counter = 0
-            
-            # Decrement suppression counter if active
-            if self.suppress_menu_actions:
-                self.menu_action_suppression_steps -= 1
-                if self.menu_action_suppression_steps <= 0:
-                    self.suppress_menu_actions = False
-                    logger.info("Menu action suppression ended")
-        
-        # Check if episode should terminate (using step limit for now)
-        done = self.steps_taken >= self.max_steps
-        
-        # Prepare info dict
-        info = {
-            'steps': self.steps_taken,
-            'action_type': action_info["type"],
-            'action': action_info["action"],
-            'menu_detected': self.visual_estimator.detect_main_menu(self.current_frame),
-            'menu_penalty': menu_penalty if menu_detected else 0.0,
-            'menu_stuck_counter': self.menu_stuck_counter
-        }
-        
-        return self.current_frame, reward, done, info
+        return next_state, reward, done, info
     
     def _execute_action(self, action_info: Dict[str, Any]):
         """Execute the specified action in the game."""

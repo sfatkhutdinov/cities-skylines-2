@@ -245,18 +245,51 @@ class PPOAgent:
         if not hasattr(self, 'menu_action_indices'):
             self.menu_action_indices = []
             self.menu_action_penalties = {}
+            
+        # Perform quick sanity check on action index
+        if action_idx < 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Invalid menu action index: {action_idx}")
+            return
         
         # Add to the set of menu actions if not already there
         if action_idx not in self.menu_action_indices:
             self.menu_action_indices.append(action_idx)
         
-        # Update penalty value (use max to ensure it only increases)
+        # Update penalty value using progressive approach
         current_penalty = self.menu_action_penalties.get(action_idx, 0.0)
-        self.menu_action_penalties[action_idx] = max(current_penalty, penalty)
+        
+        # Progressive penalty: more penalizing with repeated occurrences
+        if current_penalty <= 0.2:
+            # First occurrence - light penalty
+            new_penalty = max(current_penalty, penalty * 0.5)
+        elif current_penalty <= 0.5:
+            # Second occurrence - medium penalty
+            new_penalty = max(current_penalty, penalty * 0.75) 
+        else:
+            # Repeated occurrences - full or increased penalty
+            new_penalty = max(current_penalty, penalty * 1.2)  # Can exceed original penalty
+            
+        # Cap at 0.95 to always leave some probability
+        new_penalty = min(0.95, new_penalty)
+        
+        # Store updated penalty
+        self.menu_action_penalties[action_idx] = new_penalty
         
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"Registered menu action {action_idx} with penalty {self.menu_action_penalties[action_idx]}")
+        
+        # If this is a high-penalty action, also penalize similar actions
+        if new_penalty > 0.7:
+            # Penalize adjacent action indices (likely similar actions)
+            for adj_idx in [action_idx-1, action_idx+1]:
+                if adj_idx >= 0 and adj_idx not in self.menu_action_indices:
+                    # Apply a reduced penalty to adjacent actions
+                    self.menu_action_indices.append(adj_idx)
+                    self.menu_action_penalties[adj_idx] = min(0.3, new_penalty * 0.4)
+                    logger.info(f"Added related action {adj_idx} with reduced penalty {self.menu_action_penalties[adj_idx]}")
 
     def decay_menu_penalties(self):
         """Gradually reduce penalties for menu actions over time."""

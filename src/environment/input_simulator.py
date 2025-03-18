@@ -476,11 +476,17 @@ class InputSimulator:
             key (str): Key to press
             duration (float): How long to hold the key
         """
-        # Completely prevent ESC key from being pressed unless explicitly allowed
+        # Check for escape key with improved safety logic
         if key.lower() in ['escape', 'esc']:
             if hasattr(self, 'block_escape') and self.block_escape:
                 print("WARNING: Blocked ESC key press - using safe menu handling instead")
                 return self.safe_menu_handling()
+        
+        # Check for potentially problematic key presses
+        dangerous_keys = ['f4']
+        if key.lower() in dangerous_keys:
+            print(f"WARNING: Potentially risky key press detected: {key}")
+            # Continue but log warning
         
         try:
             # Get the key from the map
@@ -502,7 +508,7 @@ class InputSimulator:
             
     def safe_menu_handling(self):
         """Safely handle menu toggling without using Escape key.
-        Uses alternative methods like clicking menu buttons.
+        Uses multiple strategies to exit menus including clicks and key combinations.
         
         Returns:
             bool: Success status
@@ -547,19 +553,70 @@ class InputSimulator:
             # Try standard button positions
             (int(screen_width * 0.25), int(screen_height * 0.8)),
             (int(screen_width * 0.75), int(screen_height * 0.8)),
+            # Add more positions covering the whole dialog area
+            (int(screen_width * 0.5), int(screen_height * 0.4)),  # Top-center
+            (int(screen_width * 0.5), int(screen_height * 0.6)),  # Mid-center
+            (int(screen_width * 0.25), int(screen_height * 0.6)),  # Mid-left
+            (int(screen_width * 0.75), int(screen_height * 0.6)),  # Mid-right
+        ]
+        
+        # Add more targeted button positions for Cities Skylines 2 specific menus
+        cs2_specific_buttons = [
+            # Resume game button at different positions based on menu type
+            (int(screen_width * 0.375), int(screen_height * 0.475)),  # Main menu resume
+            (int(screen_width * 0.5), int(screen_height * 0.4)),      # Pause menu resume
+            (int(screen_width * 0.5), int(screen_height * 0.35)),     # Options dialog OK button
+            (int(screen_width * 0.75), int(screen_height * 0.9)),     # Bottom right (common for OK/Cancel)
+            (int(screen_width * 0.8), int(screen_height * 0.1)),      # Top-right X button (settings)
+            (int(screen_width * 0.95), int(screen_height * 0.05)),    # Close button corner
         ]
         
         # Prioritize primary position and nearby grid, then add fallbacks
-        click_positions = [primary_resume_button] + scaled_positions[:10] + additional_positions
+        click_positions = [primary_resume_button] + scaled_positions[:10] + cs2_specific_buttons + additional_positions
         
-        print("Attempting to exit menu by clicking RESUME GAME button")
+        print("Attempting to exit menu using multiple strategies")
         
-        # Try positions in two passes with different patterns
+        # First attempt: Try specific key combinations known to close menus
+        key_combinations = [
+            ('enter', 0.2),      # Enter key - confirm dialogs
+            ('space', 0.2),      # Space - can dismiss some dialogs
+            ('escape', 0.2),     # Escape - now allowed in controlled manner
+            ('tab', 0.2),        # Tab - may move focus to OK button in some dialogs
+            ('tab+enter', 0.3),  # Tab to focus + Enter to confirm
+        ]
+        
+        print("Strategy 1: Trying key combinations")
+        for keys, wait_time in key_combinations:
+            if '+' in keys:
+                # Handle combination like tab+enter
+                combo_keys = keys.split('+')
+                for key in combo_keys[:-1]:
+                    self.key_press(key, 0.1)
+                    time.sleep(0.1)
+                # Press the last key after others
+                self.key_press(combo_keys[-1], 0.1)
+            else:
+                # Single key press
+                # We're explicitly allowing escape here in a controlled context
+                temp_block_state = self.block_escape
+                if keys == 'escape':
+                    self.block_escape = False
+                    
+                self.key_press(keys, 0.1)
+                
+                # Restore original escape blocking state
+                if keys == 'escape':
+                    self.block_escape = temp_block_state
+                    
+            time.sleep(wait_time)
+            
+        # Strategy 2: Click Resume button (with different patterns)
+        print("Strategy 2: Clicking at common resume button locations")
         for attempt in range(2):
             # First pass tries fewer positions with longer waits
             # Second pass tries more positions with shorter waits
             positions_to_try = click_positions[:5] if attempt == 0 else click_positions
-            wait_time = 1.0 if attempt == 0 else 0.3
+            wait_time = 0.8 if attempt == 0 else 0.2
             
             for i, (x, y) in enumerate(positions_to_try):
                 # Ensure coordinates are within screen bounds
@@ -568,26 +625,44 @@ class InputSimulator:
                 
                 print(f"Clicking at position {i+1}/{len(positions_to_try)}: ({x}, {y})")
                 
-                # Move to position and click
+                # Move to position and try both click and double-click
                 self.mouse_move(x, y, use_win32=True)
-                time.sleep(0.1)  # Small delay before clicking
+                time.sleep(0.1)
+                
+                # Try left click
                 self.mouse_click(x, y)
-                time.sleep(wait_time)  # Wait for click to register
+                time.sleep(wait_time)
+                
+                # Try double click on same spot
+                if i < 3:  # Only for the most likely positions
+                    self.mouse_click(x, y, double=True)
+                    time.sleep(wait_time)
+        
+        # Strategy 3: Try clicking and dragging (for sliders or special UI elements)
+        print("Strategy 3: Attempting click and drag operations")
+        center_x, center_y = screen_width // 2, screen_height // 2
+        drag_patterns = [
+            ((center_x, center_y), (center_x + 100, center_y)),     # Drag right
+            ((center_x, center_y), (center_x, center_y - 100)),     # Drag up
+            ((center_x, center_y + 100), (center_x, center_y - 100)) # Drag up long
+        ]
+        
+        for start, end in drag_patterns:
+            self.mouse_drag(start, end, duration=0.3)
+            time.sleep(0.3)
             
-            # After each pass, try pressing Enter key as an additional option
-            self.key_press('enter', 0.1)
-            time.sleep(0.5)
-            
-            # Try space bar too
-            self.key_press('space', 0.1)
-            time.sleep(0.5)
+        # Strategy 4: Final attempt with more key combinations
+        print("Strategy 4: Final keyboard attempts")
+        # Try some additional key combinations as last resort
+        self.key_combination(['alt', 'f4'], duration=0.05)  # Very brief Alt+F4 to trigger dialog handling without closing
+        time.sleep(0.1)
+        self.key_press('n', 0.1)  # Press 'n' for "No" if "Do you want to quit" appears
+        time.sleep(0.2)
         
         # Reset mouse to center of screen to allow full movement after menu handling
         print("Resetting mouse to center position")
-        center_x, center_y = screen_width // 2, screen_height // 2
         self.mouse_move(center_x, center_y, use_win32=True)
         
-        # Return mouse control to normal
         return True
 
     def get_screen_dimensions(self):
