@@ -43,6 +43,7 @@ wheels/
 # Jupyter
 .ipynb_checkpoints
 *.ipynb
+*.pyc
 
 # IDE
 .idea/
