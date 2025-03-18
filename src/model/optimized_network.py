@@ -7,6 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ConvBlock(nn.Module):
     """Optimized convolutional block with batch normalization."""
@@ -96,6 +99,18 @@ class OptimizedNetwork(nn.Module):
         
         # Move the model to the appropriate device
         self.to(config.get_device())
+        
+        # Apply PyTorch 2.0 compile optimization if available
+        if hasattr(torch, 'compile') and torch.cuda.is_available():
+            try:
+                logger.info("Applying PyTorch 2.0 model compilation for hardware optimization")
+                self.conv_layers = torch.compile(self.conv_layers)
+                self.fc_layers = torch.compile(self.fc_layers)
+                self.policy_head = torch.compile(self.policy_head)
+                self.value_head = torch.compile(self.value_head)
+                logger.info("Model compilation successful - this should improve performance")
+            except Exception as e:
+                logger.warning(f"PyTorch model compilation failed: {e}. Continuing with standard model.")
         
     def _calculate_conv_output_size(self, in_channels, height, width):
         """Calculate the size of the flattened features after convolution."""

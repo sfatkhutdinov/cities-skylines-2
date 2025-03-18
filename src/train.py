@@ -8,6 +8,7 @@ import sys
 import time
 import signal
 import datetime
+import os
 
 # Set up logging
 logging.basicConfig(
@@ -78,167 +79,92 @@ def collect_trajectory(
     env: CitiesEnvironment,
     agent: PPOAgent,
     max_steps: int,
-    total_steps: int,
-    checkpoint_dir: Path,
-    step_checkpoint_freq: int
-) -> Tuple[Dict[str, torch.Tensor], float, int]:
-    """Collect a trajectory of experiences.
+    device: torch.device,
+    args
+) -> Tuple[list, list, list, list, list, list, list, float]:
+    """Collect a trajectory of experience.
     
     Args:
-        env (CitiesEnvironment): Game environment
-        agent (PPOAgent): RL agent
-        max_steps (int): Maximum steps to collect
-        total_steps (int): Current total steps completed
-        checkpoint_dir (Path): Directory to save checkpoints
-        step_checkpoint_freq (int): Steps between checkpoints
+        env: Environment to collect from
+        agent: Agent to collect with
+        max_steps: Maximum steps to collect
+        device: Device to use
+        args: Command line arguments
         
     Returns:
-        Tuple[Dict[str, torch.Tensor], float, int]:
-            - experiences: Dictionary of experiences
-            - episode_reward: Total reward for episode
-            - episode_length: Length of episode
+        Tuple of (states, actions, log_probs, rewards, values, dones, next_states, total_reward)
     """
     states = []
     next_states = []
     actions = []
-    rewards = []
-    intrinsic_rewards = []
-    total_rewards = []  # Combined extrinsic and intrinsic rewards
     log_probs = []
+    rewards = []
     values = []
     dones = []
-    action_infos = []  # Store action info for better debugging
+    total_reward = 0.0
     
     state = env.reset()
-    episode_reward = 0
-    episode_intrinsic_reward = 0
-    episode_length = 0
     
-    # Track previous actions and their results for menu detection
-    previous_action_idx = None
-    was_in_menu = False
+    # Define mini-batch size for parallel processing
+    mini_batch_size = min(8, max_steps)  # Process up to 8 steps at once
     
-    for step in range(max_steps):
-        # Step-based checkpoint
-        current_total_steps = total_steps + step
-        if step_checkpoint_freq > 0 and current_total_steps > 0 and current_total_steps % step_checkpoint_freq == 0:
-            checkpoint_path = checkpoint_dir / f"step_checkpoint_{current_total_steps}.pt"
-            agent.save(checkpoint_path)
-            logger.info(f"Saved step-based checkpoint at step {current_total_steps}")
+    for step in range(0, max_steps, mini_batch_size):
+        # Limit batch size to remaining steps
+        current_batch_size = min(mini_batch_size, max_steps - step)
         
-        # Convert state to tensor if it's not already
-        if not isinstance(state, torch.Tensor):
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        else:
-            state_tensor = state.unsqueeze(0) if state.dim() == 3 else state
+        # Initialize batch storage
+        batch_states = []
+        batch_actions = []
+        batch_log_probs = []
+        batch_values = []
+        batch_next_states = []
+        batch_rewards = []
+        batch_dones = []
         
-        # Select action
-        action, log_prob, value = agent.select_action(state_tensor)
-        
-        # Take step in environment
-        action_idx = action.item()
-        action_info = env.actions[action_idx]
-        next_state, reward, done, info = env.step(action_idx)
-        
-        # Store next state in agent for curiosity module
-        agent.store_next_state(next_state)
-        
-        # Compute intrinsic curiosity reward
-        intrinsic_reward = agent.compute_intrinsic_reward(state, next_state, action_idx)
-        
-        # Combine extrinsic and intrinsic rewards
-        total_reward = reward + intrinsic_reward
-        
-        # Update agent's tracking of rewards for this action
-        agent.update_from_reward(action_idx, reward)
-        
-        # Check if we transitioned into a menu and register the action that caused it
-        current_in_menu = info.get('menu_detected', False)
-        
-        if current_in_menu and not was_in_menu and previous_action_idx is not None:
-            # We just entered a menu, and we know the action that did it
-            logger.warning(f"Detected menu transition after action {previous_action_idx} ({env.actions[previous_action_idx]})")
+        # Collect experience for the mini-batch
+        for i in range(current_batch_size):
+            batch_states.append(state)
             
-            # Register the action with the agent to avoid it in the future
-            # Increased penalty from 0.7 to 0.8 for more aggressive avoidance
-            agent.register_menu_action(previous_action_idx, penalty=0.8)
-        
-        # Store current menu state for next iteration
-        was_in_menu = current_in_menu
-        previous_action_idx = action_idx
-        
-        # Decay menu penalties occasionally to allow for exploration
-        if episode_length % 25 == 0:  # More frequent decay (was 50)
-            agent.decay_menu_penalties()
-        
-        # Store experience
-        states.append(state)
-        next_states.append(next_state)
-        actions.append(action_idx)
-        rewards.append(reward)
-        intrinsic_rewards.append(intrinsic_reward)
-        total_rewards.append(total_reward)
-        log_probs.append(log_prob.item())
-        values.append(value.item())
-        dones.append(done)
-        action_infos.append(action_info)
-        
-        episode_reward += reward
-        episode_intrinsic_reward += intrinsic_reward
-        episode_length += 1
-        
-        # Log interesting actions (UI exploration)
-        if action_info["type"] in ["ui", "ui_position"]:
-            logger.info(f"UI Action: {action_info}")
-        
-        # Log high curiosity reward actions
-        if intrinsic_reward > 0.1:
-            logger.info(f"High curiosity reward ({intrinsic_reward:.4f}) for action: {action_info}")
-        
-        # If we get an extremely negative reward, log and consider early termination
-        if reward < -500:
-            logger.warning(f"Extremely negative reward: {reward} - possible menu penalty")
+            # If this is the last step in the batch, we'll use the results
+            # Otherwise we're just pre-filling the batch
+            if i == current_batch_size - 1:
+                # Process the entire batch at once using the batch action selection
+                batch_tensor = torch.stack(batch_states)
+                with torch.inference_mode():
+                    batch_actions_tensor, batch_log_probs_tensor, batch_values_tensor = agent.select_action_batch(batch_tensor)
+                
+                # Now execute each action in the environment and collect results
+                for j in range(current_batch_size):
+                    # Get the action for this position in the batch
+                    action = batch_actions_tensor[j].item()
+                    log_prob = batch_log_probs_tensor[j]
+                    value = batch_values_tensor[j]
+                    
+                    # Execute in environment
+                    next_state, reward, done, info = env.step(action)
+                    total_reward += reward
+                    
+                    # Store transition
+                    states.append(batch_states[j])
+                    actions.append(action)
+                    log_probs.append(log_prob)
+                    values.append(value)
+                    rewards.append(reward)
+                    dones.append(done)
+                    next_states.append(next_state)
+                    
+                    # Prepare for next iteration
+                    state = next_state
+                    
+                    if done:
+                        # If episode is done, don't continue
+                        break
             
-            # If we're stuck in a menu for too long (10+ steps), try to reset
-            if info.get('menu_stuck_counter', 0) > 10:
-                logger.error(f"Stuck in menu for {info.get('menu_stuck_counter')} steps - forcing exit")
-                # Try clicking the resume button more aggressively
-                env.input_simulator.safe_menu_handling()
-        
+        # If episode ended in the middle of the batch, break out of main loop
         if done:
             break
-            
-        state = next_state
     
-    # Log summary of intrinsic rewards
-    logger.info(f"Episode intrinsic reward: {episode_intrinsic_reward:.4f}")
-    
-    # Convert lists to tensors
-    if isinstance(states[0], torch.Tensor):
-        states_tensor = torch.stack(states)
-    else:
-        states_tensor = torch.FloatTensor(np.array(states))
-    
-    if isinstance(next_states[0], torch.Tensor):
-        next_states_tensor = torch.stack(next_states)
-    else:
-        next_states_tensor = torch.FloatTensor(np.array(next_states))
-        
-    experiences = {
-        "states": states_tensor,
-        "next_states": next_states_tensor,
-        "actions": torch.LongTensor(actions),
-        "rewards": torch.FloatTensor(rewards),
-        "intrinsic_rewards": torch.FloatTensor(intrinsic_rewards),
-        "total_rewards": torch.FloatTensor(total_rewards),
-        "log_probs": torch.FloatTensor(log_probs),
-        "values": torch.FloatTensor(values),
-        "dones": torch.BoolTensor(dones),
-        "action_infos": action_infos,  # For analysis
-        "info": info  # Store final info
-    }
-    
-    return experiences, episode_reward, episode_length
+    return states, actions, log_probs, rewards, values, dones, next_states, total_reward
 
 def find_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint file in the given directory."""
@@ -288,7 +214,7 @@ def find_latest_checkpoint(checkpoint_dir):
         # For step or time checkpoints, return episode 0 since we don't know the episode
         return (0, latest[2])  # Return (0, file_path)
 
-def train():
+def main():
     """Main training loop."""
     global stop_training
     logger.info("Starting training...")
@@ -418,77 +344,101 @@ def train():
     last_time_checkpoint = time.time()
     
     for episode in range(start_episode, args.num_episodes):
-        if stop_training:
-            logger.info("Training interrupted by user. Saving final checkpoint...")
-            # Save interrupt checkpoint
-            interrupt_path = checkpoint_dir / f"interrupt_checkpoint.pt"
-            agent.save(interrupt_path)
-            logger.info(f"Saved interrupt checkpoint to {interrupt_path}")
-            break
-            
-        episode_start_time = time.time()
+        logger.info(f"Starting episode {episode+1}/{args.num_episodes}")
         
-        # Check if it's time for a time-based checkpoint
-        current_time = time.time()
-        time_elapsed = (current_time - last_time_checkpoint) / 60  # Convert to minutes
-        if args.time_checkpoint_freq > 0 and time_elapsed >= args.time_checkpoint_freq:
-            time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            checkpoint_path = checkpoint_dir / f"time_checkpoint_{time_str}.pt"
-            agent.save(checkpoint_path)
-            logger.info(f"Saved time-based checkpoint after {time_elapsed:.1f} minutes")
-            last_time_checkpoint = current_time
+        # Implement dynamic resolution scheduling
+        if episode == 0:
+            # Start with lower resolution for faster initial learning
+            env.screen_capture.process_resolution = (320, 180)
+            agent.network.expected_width = 320
+            agent.network.expected_height = 180
+            logger.info("Using initial low resolution (320x180) for faster learning")
+        elif episode == 1000:
+            # Increase to medium resolution
+            env.screen_capture.process_resolution = (384, 216)
+            agent.network.expected_width = 384
+            agent.network.expected_height = 216
+            logger.info("Increasing to medium resolution (384x216)")
+        elif episode == 3000:
+            # Increase to target resolution
+            env.screen_capture.process_resolution = (480, 270)
+            agent.network.expected_width = 480
+            agent.network.expected_height = 270
+            logger.info("Increasing to target resolution (480x270)")
         
-        # Collect experience
-        logger.info(f"Starting episode {episode}...")
-        experiences, episode_reward, episode_length = collect_trajectory(
+        # Wait for previous async update to complete if active
+        if hasattr(agent, 'is_updating') and agent.is_updating:
+            logger.info("Waiting for previous async update to complete...")
+            while agent.is_updating:
+                time.sleep(0.1)  # Small sleep to prevent CPU spin
+        
+        # Collect trajectory
+        trajectory_start_time = time.time()
+        states, actions, log_probs, rewards, values, dones, next_states, episode_reward = collect_trajectory(
             env=env,
             agent=agent,
             max_steps=args.max_steps,
-            total_steps=total_steps,
-            checkpoint_dir=checkpoint_dir,
-            step_checkpoint_freq=args.step_checkpoint_freq
+            device=args.device,
+            args=args
         )
+        trajectory_time = time.time() - trajectory_start_time
         
-        # Update total steps
-        total_steps += episode_length
+        # Convert lists to tensors for the agent
+        if states and isinstance(states[0], torch.Tensor):
+            states_tensor = torch.stack(states)
+        else:
+            states_tensor = torch.FloatTensor(np.array(states)) if states else torch.FloatTensor([])
         
-        # Calculate average intrinsic reward
-        avg_intrinsic_reward = experiences["intrinsic_rewards"].mean().item()
+        if next_states and isinstance(next_states[0], torch.Tensor):
+            next_states_tensor = torch.stack(next_states)
+        else:
+            next_states_tensor = torch.FloatTensor(np.array(next_states)) if next_states else torch.FloatTensor([])
         
-        # Get total combined reward
-        total_episode_reward = episode_reward + experiences["intrinsic_rewards"].sum().item()
+        # Store experience in agent's memory
+        for i in range(len(states)):
+            agent.remember(
+                states[i], 
+                actions[i], 
+                log_probs[i], 
+                rewards[i], 
+                values[i], 
+                dones[i], 
+                next_states[i] if i < len(next_states) else None
+            )
         
-        # Update the agent
-        update_metrics = agent.update()
+        # Start asynchronous update
+        logger.info(f"Starting async update for episode {episode+1}")
+        agent.update_async()
         
-        # Calculate episode time
-        episode_time = time.time() - episode_start_time
-        episode_times.append(episode_time)
-        avg_time = sum(episode_times[-10:]) / min(len(episode_times), 10)
+        # While update is happening asynchronously, we can do other work
+        # like logging, checkpointing, etc.
+        
+        # Save checkpoint if it's time
+        if (episode + 1) % args.checkpoint_freq == 0:
+            checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_{episode+1}.pt")
+            agent.save(checkpoint_path)
+            logger.info(f"Saved checkpoint to {checkpoint_path}")
+        
+        # Occasionally save time-based checkpoint
+        current_time = time.time()
+        if args.time_checkpoint_freq > 0 and current_time - last_time_checkpoint >= args.time_checkpoint_freq * 60:
+            time_checkpoint_path = os.path.join(args.checkpoint_dir, f"time_checkpoint_{int(current_time)}.pt")
+            agent.save(time_checkpoint_path)
+            logger.info(f"Saved time-based checkpoint to {time_checkpoint_path}")
+            last_time_checkpoint = current_time
         
         # Log metrics
-        metrics = {
-            "episode": episode,
-            "reward": episode_reward,
-            "intrinsic_reward": avg_intrinsic_reward,
-            "total_reward": total_episode_reward,
-            "episode_length": episode_length,
-            "time": episode_time,
-            "avg_time": avg_time,
-            "total_steps": total_steps,
-            **update_metrics
-        }
+        logger.info(f"Episode {episode+1}: Reward={episode_reward:.2f}, Steps={len(states)}")
         
-        logger.info(f"Episode {episode}: " 
-                    f"reward={episode_reward:.2f}, "
-                    f"intrinsic={avg_intrinsic_reward:.4f}, "
-                    f"total={total_episode_reward:.2f}, "
-                    f"length={episode_length}, "
-                    f"time={episode_time:.2f}s, "
-                    f"total_steps={total_steps}")
-        
-        if use_wandb:
-            wandb.log(metrics)
+        # Optional: wait for update to complete before next episode
+        # Uncomment if you want to ensure update completes before next trajectory
+        # while agent.is_updating:
+        #     time.sleep(0.1)
+            
+        # Check if we should stop training
+        if stop_training:
+            logger.info("Stopping training due to interrupt signal")
+            break
         
         # Check if episode ended stuck in a menu
         if experiences.get('info', {}).get('menu_detected', False):
@@ -524,13 +474,6 @@ def train():
             best_reward = episode_reward
             agent.save(checkpoint_dir / "best_model.pt")
             logger.info(f"Saved new best model with reward: {best_reward:.2f}")
-            
-        # Save periodic checkpoint
-        if (episode + 1) % args.checkpoint_freq == 0:
-            agent.save(checkpoint_dir / f"checkpoint_{episode+1}.pt")
-            logger.info(f"Saved periodic checkpoint at episode {episode+1}")
-            
-        print(f"Episode {episode+1}/{args.num_episodes} - Reward: {episode_reward:.2f}")
         
         # Add a delay between episodes to prevent system resource issues
         time.sleep(2.0)
@@ -542,4 +485,4 @@ def train():
     logger.info("Training completed")
 
 if __name__ == "__main__":
-    train() 
+    main() 

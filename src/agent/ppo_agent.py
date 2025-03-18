@@ -7,8 +7,12 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from typing import Tuple, Dict, Any
+import threading
+import logging
 from model.optimized_network import OptimizedNetwork
 from agent.curiosity_module import IntrinsicCuriosityModule
+
+logger = logging.getLogger(__name__)
 
 class PPOAgent:
     """Proximal Policy Optimization agent."""
@@ -71,6 +75,10 @@ class PPOAgent:
         self.last_rewards = []  # Track recent rewards to detect large penalties
         self.extreme_penalty_threshold = -500.0  # Threshold for detecting extreme penalties
         
+        # Add threading lock for thread safety
+        self.update_lock = threading.Lock()
+        self.is_updating = False
+        
     def select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select an action using the current policy.
         
@@ -122,6 +130,55 @@ class PPOAgent:
         
         return action, log_prob, value
         
+    def select_action_batch(self, states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select actions for a batch of states using the current policy.
+        
+        This method is optimized for parallel experience collection.
+        
+        Args:
+            states (torch.Tensor): Batch of environment states [B, C, H, W]
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (actions, log_probs, values)
+        """
+        # Ensure states are on the correct device
+        if states.device != self.device:
+            states = states.to(self.device)
+            
+        # Get action probabilities and values for the entire batch at once
+        with torch.no_grad():
+            action_probs_batch, values_batch = self.network(states)
+            
+            # Apply penalties to menu-opening actions if needed
+            if self.menu_action_indices and hasattr(self, 'menu_action_penalties'):
+                # Create a penalty mask (default 1.0 for all actions)
+                penalty_mask = torch.ones_like(action_probs_batch)
+                
+                # Apply specific penalties to known menu actions
+                for action_idx, penalty in self.menu_action_penalties.items():
+                    if 0 <= action_idx < penalty_mask.size(1):
+                        # Reduce probability of this action by the penalty factor
+                        penalty_mask[:, action_idx] = torch.max(
+                            torch.tensor(0.1, device=self.device), 
+                            torch.tensor(1.0 - penalty, device=self.device)
+                        )
+                
+                # Apply the mask to reduce probabilities of problematic actions
+                action_probs_batch = action_probs_batch * penalty_mask
+                
+                # Renormalize probabilities
+                action_probs_batch = action_probs_batch / action_probs_batch.sum(dim=1, keepdim=True)
+            
+        # Sample actions from probability distributions
+        actions = torch.multinomial(action_probs_batch, 1)
+        
+        # Get log probabilities for sampled actions
+        log_probs = torch.log(
+            torch.gather(action_probs_batch, 1, actions)
+        )
+        
+        return actions, log_probs, values_batch
+        
     def compute_intrinsic_reward(self, state, next_state, action):
         """Compute intrinsic reward using the curiosity module.
         
@@ -165,6 +222,35 @@ class PPOAgent:
             print(f"Error computing curiosity reward: {str(e)}")
             return 0.0
         
+    def update_async(self) -> None:
+        """Asynchronously update the agent in a separate thread.
+        
+        This allows experience collection to continue while the update is processed.
+        
+        Returns:
+            None: Update happens asynchronously
+        """
+        if self.is_updating:
+            logger.debug("Update already in progress, skipping")
+            return
+            
+        # Start update in a separate thread
+        self.is_updating = True
+        update_thread = threading.Thread(target=self._update_thread)
+        update_thread.daemon = True  # Thread will exit when main program exits
+        update_thread.start()
+        
+    def _update_thread(self) -> None:
+        """Internal method to perform the update in a separate thread."""
+        try:
+            with self.update_lock:
+                update_results = self.update()
+                logger.debug(f"Async update complete: {update_results}")
+        except Exception as e:
+            logger.error(f"Error in async update thread: {e}")
+        finally:
+            self.is_updating = False
+            
     def update(self) -> Dict[str, float]:
         """Update the agent using collected experience.
         
@@ -263,12 +349,19 @@ class PPOAgent:
         self._clear_memory()
         
         # Return metrics
-        return {
+        metrics = {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
             'entropy': entropy.item(),
             'icm_loss': icm_loss.item() if isinstance(icm_loss, torch.Tensor) else icm_loss
         }
+        
+        # After update, clear memory and free GPU memory
+        self._clear_memory()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # More aggressive memory cleanup
+            
+        return metrics
         
     def _compute_returns(self) -> torch.Tensor:
         """Compute returns using GAE.
@@ -360,8 +453,6 @@ class PPOAgent:
         current_penalty = self.menu_action_penalties.get(action_idx, 0.0)
         self.menu_action_penalties[action_idx] = max(current_penalty, penalty)
         
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"Registered menu action {action_idx} with penalty {self.menu_action_penalties[action_idx]}")
 
     def decay_menu_penalties(self):
