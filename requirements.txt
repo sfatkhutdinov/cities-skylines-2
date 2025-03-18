@@ -1,24 +1,37 @@
 # Core packages
-numpy>=1.24.0
-torch>=2.0.0
-torchvision>=0.15.0
-opencv-python>=4.7.0
-pillow>=10.0.0 
+numpy>=2.2.0
+torch>=2.5.0
+torchvision>=0.20.0
+opencv-python>=4.11.0
+pillow>=11.0.0 
+imageio>=2.37.0
+scikit-image>=0.25.0
+scipy>=1.15.0
 
 # Environment interaction
-pynput>=1.7.6
-mss>=9.0.1  # for fast screen capture
-pywin32>=306  # for Windows API access
+pynput>=1.8.0
+mss>=10.0.0  # for fast screen capture
+pywin32>=310  # for Windows API access
 pyautogui>=0.9.54  # for GUI automation
+ctypes-callable>=1.0.0  # for Windows API calls
 
 # Reinforcement learning
-gymnasium>=0.29.0
-stable-baselines3>=2.0.0  # optional RL implementation
+gymnasium>=1.1.0
+cloudpickle>=3.1.0
 
 # Visualization and logging
-wandb>=0.15.0  # for experiment tracking
-tensorboard>=2.14.0
+wandb>=0.19.0  # for experiment tracking
+tensorboard>=2.19.0
 matplotlib>=3.7.0  # for plotting
 
 # Performance monitoring
-psutil>=5.9.0  # system resource monitoring 
+psutil>=7.0.0  # system resource monitoring
+
+# Utilities
+pydantic>=2.10.0
+requests>=2.32.0
+PyYAML>=6.0.0
+pandas>=2.2.0
+pathlib>=1.0.1  # for path manipulation
+deque-dict>=0.1.0  # for ordered dictionary with deque functionality
+pickle5>=0.0.12  # for serialization 
