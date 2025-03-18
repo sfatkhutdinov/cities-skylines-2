@@ -45,8 +45,8 @@ The system consists of several interconnected components:
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/cities-skylines-2-agent.git
-cd cities-skylines-2-agent
+git clone https://github.com/sfatkhutdinov/cities-skylines-2.git
+cd cities-skylines-2
 ```
 
 2. Create and activate a virtual environment:
