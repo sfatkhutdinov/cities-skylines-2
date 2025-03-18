@@ -57,133 +57,89 @@ def parse_args():
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     return parser.parse_args()
 
-def collect_trajectory(
-    env: CitiesEnvironment,
-    agent: PPOAgent,
-    max_steps: int
-) -> Tuple[Dict[str, torch.Tensor], float, int]:
-    """Collect a trajectory of experiences.
+def collect_trajectory(env, agent, max_steps, render=False):
+    """Collect trajectory of experience from environment.
     
     Args:
-        env (CitiesEnvironment): Game environment
-        agent (PPOAgent): RL agent
-        max_steps (int): Maximum steps to collect
+        env: Environment to collect trajectory from
+        agent: Agent to use for actions
+        max_steps: Maximum number of steps to collect
+        render: Whether to render the environment
         
     Returns:
-        Tuple[Dict[str, torch.Tensor], float, int]:
-            - experiences: Dictionary of experiences
-            - episode_reward: Total reward for episode
-            - episode_length: Length of episode
+        experiences: List of experience tuples
+        total_reward: Total reward for episode
+        total_steps: Total steps taken
     """
-    states = []
-    actions = []
-    rewards = []
-    log_probs = []
-    values = []
-    dones = []
-    action_infos = []  # Store action info for better debugging
-    
     state = env.reset()
-    episode_reward = 0
-    episode_length = 0
     
-    # Track previous actions and their results for menu detection
-    previous_action_idx = None
-    was_in_menu = False
+    experiences = []
+    done = False
+    total_reward = 0
+    total_steps = 0
     
-    for _ in range(max_steps):
-        # Convert state to tensor if it's not already
-        if not isinstance(state, torch.Tensor):
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        else:
-            state_tensor = state.unsqueeze(0) if state.dim() == 3 else state
-        
+    # For tracking menu transitions
+    in_menu = False
+    menu_transition_count = 0
+    consecutive_menu_steps = 0
+    
+    for step in range(max_steps):
         # Select action
-        action, log_prob, value = agent.select_action(state_tensor)
+        action, log_prob, value = agent.select_action(state)
         
-        # Take step in environment
-        action_idx = action.item()
-        action_info = env.actions[action_idx]
-        next_state, reward, done, info = env.step(action_idx)
+        # Check if we're in a menu before taking action
+        pre_action_in_menu = env.check_menu_state()
         
-        # Update agent's tracking of rewards for this action
-        agent.update_from_reward(action_idx, reward)
-        
-        # Check if we transitioned into a menu and register the action that caused it
-        current_in_menu = info.get('menu_detected', False)
-        
-        if current_in_menu and not was_in_menu and previous_action_idx is not None:
-            # We just entered a menu, and we know the action that did it
-            logger.warning(f"Detected menu transition after action {previous_action_idx} ({env.actions[previous_action_idx]})")
+        if pre_action_in_menu:
+            consecutive_menu_steps += 1
             
-            # Register the action with the agent to avoid it in the future
-            # Increased penalty from 0.7 to 0.8 for more aggressive avoidance
-            agent.register_menu_action(previous_action_idx, penalty=0.8)
+            # If stuck in menu for too long, try recovery
+            if consecutive_menu_steps >= 3:
+                logger.info(f"Stuck in menu for {consecutive_menu_steps} steps, attempting recovery")
+                try:
+                    env.input_simulator.handle_menu_recovery(retries=2)
+                except Exception as e:
+                    logger.error(f"Menu recovery failed: {e}")
+                
+                # Re-check menu state after recovery attempt
+                in_menu = env.check_menu_state()
+                if not in_menu:
+                    logger.info("Successfully recovered from menu state")
+                    consecutive_menu_steps = 0
+        else:
+            consecutive_menu_steps = 0
         
-        # Store current menu state for next iteration
-        was_in_menu = current_in_menu
-        previous_action_idx = action_idx
+        # Execute action in environment
+        next_state, reward, done, info = env.step(action.item())
         
-        # Decay menu penalties occasionally to allow for exploration
-        if episode_length % 25 == 0:  # More frequent decay (was 50)
-            agent.decay_menu_penalties()
+        # Check if we just entered or exited a menu
+        menu_detected = info.get("menu_detected", False)
+        
+        # Handle menu transition for learning
+        if not pre_action_in_menu and menu_detected:
+            # We just entered a menu
+            menu_transition_count += 1
+            logger.info(f"Action {action.item()} caused menu transition (count: {menu_transition_count})")
+            
+            # Register this action as a menu-opening action with the agent
+            if hasattr(agent, 'register_menu_action'):
+                agent.register_menu_action(action.item(), penalty=0.7)
         
         # Store experience
-        states.append(state)
-        actions.append(action_idx)
-        rewards.append(reward)
-        log_probs.append(log_prob.item())
-        values.append(value.item())
-        dones.append(done)
-        action_infos.append(action_info)
+        experiences.append((state, action, reward, next_state, log_prob, value, done))
         
-        episode_reward += reward
-        episode_length += 1
+        # Update state
+        state = next_state
+        total_reward += reward
+        total_steps += 1
         
-        # Log interesting actions (UI exploration)
-        if action_info["type"] in ["ui", "ui_position"]:
-            logger.info(f"UI Action: {action_info}")
-        
-        # If we get an extremely negative reward, log and consider early termination
-        if reward < -500:
-            logger.warning(f"Extremely negative reward: {reward} - possible menu penalty")
+        if render:
+            env.render()
             
-            # If we're stuck in a menu for too long (10+ steps), try to reset
-            if info.get('menu_stuck_counter', 0) > 10:
-                logger.error(f"Stuck in menu for {info.get('menu_stuck_counter')} steps - forcing exit")
-                # Try clicking the resume button more aggressively
-                env.input_simulator.safe_menu_handling()
-        
         if done:
             break
             
-        state = next_state
-    
-    # Convert lists to tensors
-    if isinstance(states[0], torch.Tensor):
-        states_tensor = torch.stack(states)
-    else:
-        states_tensor = torch.FloatTensor(np.array(states))
-        
-    # Create next_states by shifting the states list and repeating the last state
-    next_states_list = states[1:] + [states[-1]]
-    if isinstance(next_states_list[0], torch.Tensor):
-        next_states = torch.stack(next_states_list)
-    else:
-        next_states = torch.FloatTensor(np.array(next_states_list))
-    
-    experiences = {
-        "states": states_tensor,
-        "next_states": next_states,
-        "actions": torch.LongTensor(actions),
-        "rewards": torch.FloatTensor(rewards),
-        "log_probs": torch.FloatTensor(log_probs),
-        "values": torch.FloatTensor(values),
-        "dones": torch.BoolTensor(dones),
-        "action_infos": action_infos  # For analysis
-    }
-    
-    return experiences, episode_reward, episode_length
+    return experiences, total_reward, total_steps
 
 def find_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint file in the given directory."""
@@ -212,41 +168,46 @@ def find_latest_checkpoint(checkpoint_dir):
     return episodes[-1]  # Returns (episode_number, file_path)
 
 def train():
-    """Main training loop."""
-    logger.info("Starting training...")
+    """Train the agent."""
     args = parse_args()
     
-    # Set debug level if requested
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
+    # Setup logging
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
     
-    # Parse resolution 
-    try:
-        width, height = map(int, args.resolution.split('x'))
-        logger.info(f"Using resolution: {width}x{height}")
-    except:
-        logger.warning(f"Invalid resolution format: {args.resolution}, using default 320x240")
-        width, height = 320, 240
+    log_file = log_dir / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    
+    logger.info(f"Starting training with arguments: {args}")
     
     # Create checkpoint directory
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Created checkpoint directory at {checkpoint_dir}")
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
     
-    # Initialize environment and config
-    logger.info("Initializing environment...")
-    logger.info("Initializing config...")
+    # Load hardware config
     config = HardwareConfig(
-        learning_rate=args.learning_rate,
         batch_size=args.batch_size,
-        device=args.device,
-        resolution=(height, width),  # Use resolution from args
-        frame_stack=1  # Explicitly set frame_stack to 1 to avoid channel mismatch
+        learning_rate=args.learning_rate
     )
-    # Add mock_mode flag to config for the model to use
-    config.mock_mode = args.mock
-    logger.info(f"Config initialized with device: {config.device}, mock mode: {args.mock}")
+    
+    # Update config with command-line args
+    config.gamma = args.gamma
+    config.frame_skip = args.frame_skip
+    
+    # Set PPO-specific parameters
+    config.ppo_epochs = args.ppo_epochs
+    config.clip_range = args.clip_range
+    config.value_loss_coef = args.value_loss_coef
+    config.entropy_coef = args.entropy_coef
+    config.max_grad_norm = args.max_grad_norm
+    config.gae_lambda = args.gae_lambda
     
     # Initialize environment with config
     env = CitiesEnvironment(
@@ -270,6 +231,9 @@ def train():
     logger.info("Initializing agent...")
     agent = PPOAgent(config)
     logger.info("Agent initialized")
+    
+    # Connect environment and agent for better coordination
+    env.agent = agent
     
     # Handle checkpoint resumption if requested
     start_episode = 0
@@ -335,9 +299,46 @@ def train():
         
         # Collect trajectory
         experiences, episode_reward, episode_length = collect_trajectory(
-            env, agent, args.max_steps
+            env, agent, args.max_steps, render=args.render
         )
         logger.info(f"Collected trajectory - Length: {episode_length}, Reward: {episode_reward:.2f}")
+        
+        # Process experiences for PPO update
+        if experiences:
+            # Extract components
+            states = []
+            actions = []
+            rewards = []
+            log_probs = []
+            values = []
+            dones = []
+            
+            for state, action, reward, next_state, log_prob, value, done in experiences:
+                states.append(state)
+                actions.append(action.item())
+                rewards.append(reward)
+                log_probs.append(log_prob.item())
+                values.append(value.item())
+                dones.append(done)
+            
+            # Store in agent memory
+            agent.states = states
+            agent.actions = [torch.tensor([a]) for a in actions]  # Convert to tensor
+            agent.rewards = rewards
+            agent.dones = dones
+            
+            # Update agent policy
+            metrics = agent.update()
+            logger.info(f"Updated agent - Metrics: {metrics}")
+            
+            # Log episode results to wandb if enabled
+            if args.use_wandb:
+                wandb.log({
+                    "episode": episode,
+                    "episode_reward": episode_reward,
+                    "episode_length": episode_length,
+                    **metrics
+                })
         
         # Check if episode ended stuck in a menu
         current_frame = env.screen_capture.capture_frame()
@@ -345,44 +346,7 @@ def train():
         
         if menu_detected:
             logger.warning("Episode ended while stuck in a menu - taking corrective action")
-            
-            # Try clicking the RESUME GAME button directly with exact coordinates
-            width, height = env._get_screen_dimensions()
-            
-            # Exact coordinates from user: (720, 513) for 1920x1080 resolution
-            resume_x, resume_y = (720, 513)
-            
-            # Scale for different resolutions
-            if width != 1920 or height != 1080:
-                x_scale = width / 1920
-                y_scale = height / 1080
-                resume_x = int(resume_x * x_scale)
-                resume_y = int(resume_y * y_scale)
-            
-            logger.info(f"Clicking RESUME GAME at exact coordinates: ({resume_x}, {resume_y})")
-            
-            # Click multiple times with delays
-            for _ in range(3):
-                env.input_simulator.mouse_click(resume_x, resume_y)
-                time.sleep(1.0)
-            
-            # If still in menu, try the safe handling method
-            if env.visual_estimator.detect_main_menu(env.screen_capture.capture_frame()):
-                logger.info("Still in menu, trying safe menu handling method")
-                env.input_simulator.safe_menu_handling()
-        
-        # Update agent
-        metrics = agent.update()
-        logger.info(f"Updated agent - Metrics: {metrics}")
-        
-        # Log episode results to wandb if enabled
-        if args.use_wandb:
-            wandb.log({
-                "episode": episode,
-                "episode_reward": episode_reward,
-                "episode_length": episode_length,
-                **metrics
-            })
+            env.input_simulator.handle_menu_recovery(retries=3)
         
         # Save checkpoint if best reward
         if episode_reward > best_reward:

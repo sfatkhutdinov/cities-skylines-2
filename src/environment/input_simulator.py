@@ -1022,19 +1022,47 @@ class InputSimulator:
         return self.key_press('space')
         
     def cs2_change_game_speed(self, speed: int) -> bool:
-        """Change game speed.
+        """Change game speed in Cities Skylines 2.
         
         Args:
-            speed (int): 1-3 for normal, fast, fastest
-            
+            speed (int): Speed level (0-4)
+                0 = Pause
+                1 = Normal
+                2 = Fast
+                3 = Faster
+                4 = Fastest
+                
         Returns:
-            bool: Success status
+            bool: Success flag
         """
-        if speed < 1 or speed > 3:
-            print(f"Invalid game speed: {speed}. Must be 1-3.")
+        if not self.ensure_game_window_focused():
+            logger.warning("Failed to focus game window for speed change")
             return False
             
-        return self.key_press(str(speed))
+        # Map speed level to key
+        speed_keys = {
+            0: "0",  # Pause
+            1: "1",  # Normal
+            2: "2",  # Fast 
+            3: "3",  # Faster
+            4: "4"   # Fastest
+        }
+        
+        # Ensure speed is within valid range
+        speed = max(0, min(4, speed))
+        
+        # Get the corresponding key
+        key = speed_keys.get(speed, "1")  # Default to normal speed
+        
+        # Press the key to change speed
+        success = self.key_press(key, duration=0.1)
+        
+        if success:
+            logger.info(f"Changed game speed to level {speed}")
+        else:
+            logger.warning(f"Failed to change game speed to level {speed}")
+            
+        return success
         
     def cs2_toggle_info_view(self, view_type: str) -> bool:
         """Toggle an information view.

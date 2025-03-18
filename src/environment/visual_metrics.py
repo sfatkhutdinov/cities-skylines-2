@@ -7,12 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from src.config.hardware_config import HardwareConfig
 import cv2
 import os
 import logging
 from skimage.metrics import structural_similarity
+from src.environment.visual_change_analyzer import VisualChangeAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ class VisualMetricsEstimator:
             'normal_gameplay': []  # Stores feature vectors of normal gameplay
         }
         self.max_patterns = 50  # Maximum number of patterns to store
+        
+        # Initialize visual change analyzer
+        self.visual_change_analyzer = VisualChangeAnalyzer()
     
     def initialize_menu_detection(self, menu_reference_path):
         """Initialize menu detection with reference image."""
@@ -776,3 +780,45 @@ class VisualMetricsEstimator:
         except Exception as e:
             logger.error(f"Error finding 'RESUME GAME' button: {e}")
             return False, (0, 0) 
+
+    def get_visual_change_score(self, current_frame: np.ndarray) -> float:
+        """Get visual change score between current frame and previous frame.
+        
+        Args:
+            current_frame: Current frame
+            
+        Returns:
+            float: Visual change score (0.0 to 1.0)
+        """
+        if current_frame is None:
+            return 0.0
+            
+        if not hasattr(self, 'previous_frame') or self.previous_frame is None:
+            self.previous_frame = current_frame.copy()
+            return 0.0
+            
+        # Use visual change analyzer to get the score
+        score = self.visual_change_analyzer.get_visual_change_score(self.previous_frame, current_frame)
+        
+        # Update previous frame
+        self.previous_frame = current_frame.copy()
+        
+        return score
+        
+    def detect_ui_elements(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Detect UI elements in a frame.
+        
+        Args:
+            frame: Input frame
+            
+        Returns:
+            List[Tuple[int, int, int, int]]: List of UI element bounding boxes (x, y, w, h)
+        """
+        from src.utils.image_utils import ImageUtils
+        
+        # Create image utils if not already created
+        if not hasattr(self, 'image_utils'):
+            self.image_utils = ImageUtils()
+            
+        # Use image utils to detect UI elements
+        return self.image_utils.detect_ui_elements(frame) 

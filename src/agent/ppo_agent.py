@@ -112,16 +112,40 @@ class PPOAgent:
             return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
             
         # Convert lists to tensors
-        states = torch.cat(self.states)
-        actions = torch.cat(self.actions)
+        states = torch.stack([s for s in self.states if isinstance(s, torch.Tensor)])
+        
+        # Handle actions which may be tensors or indices
+        action_tensors = []
+        for action in self.actions:
+            if isinstance(action, torch.Tensor):
+                action_tensors.append(action)
+            else:
+                # Convert int to tensor
+                action_tensors.append(torch.tensor([action], device=self.device))
+        actions = torch.cat(action_tensors)
         
         # Check if we have action probabilities
         if not self.action_probs:
             self._clear_memory()
             return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
             
-        old_action_probs = torch.cat(self.action_probs)
-        values = torch.cat(self.values)
+        # Process action probabilities - may be tensor or list
+        probs_list = []
+        for prob in self.action_probs:
+            if isinstance(prob, torch.Tensor):
+                probs_list.append(prob)
+            else:
+                probs_list.append(torch.tensor(prob, device=self.device))
+        old_action_probs = torch.stack(probs_list) if all(p.dim() == 1 for p in probs_list) else torch.cat(probs_list)
+        
+        # Process values
+        values_list = []
+        for val in self.values:
+            if isinstance(val, torch.Tensor):
+                values_list.append(val)
+            else:
+                values_list.append(torch.tensor([val], device=self.device))
+        values = torch.cat(values_list)
         
         # Compute returns and advantages
         returns = self._compute_returns()
@@ -137,22 +161,42 @@ class PPOAgent:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # PPO update
+        policy_loss = 0
+        value_loss = 0
+        entropy = 0
+        
         for _ in range(self.config.ppo_epochs):
             # Get current action probabilities and values
             action_probs, value_preds = self.network(states)
             
+            # Ensure action_probs has appropriate shape for indexing
+            if len(action_probs.shape) > 1 and action_probs.shape[0] == 1:
+                action_probs = action_probs.squeeze(0)
+                
             # Compute ratio of new and old action probabilities
-            ratio = action_probs / old_action_probs
+            # Use diagonal indexing or gather depending on action_probs shape
+            if len(action_probs.shape) == 1:
+                # Use gather when action_probs is a 1D tensor
+                selected_probs = action_probs.gather(0, actions.squeeze())
+            else:
+                # For batched processing
+                batch_indices = torch.arange(actions.shape[0], device=self.device)
+                selected_probs = action_probs[batch_indices, actions.squeeze()]
+                
+            # Get corresponding old probabilities
+            old_selected_probs = old_action_probs.gather(0, actions.squeeze()) if old_action_probs.dim() == 1 else old_action_probs[batch_indices, actions.squeeze()]
+            
+            ratio = selected_probs / (old_selected_probs + 1e-8)
             
             # Compute PPO loss terms
-            policy_loss = -torch.min(
-                ratio * advantages,
-                torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
-            ).mean()
+            policy_loss_1 = ratio * advantages
+            policy_loss_2 = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
+            policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
             
+            # Value loss
             value_loss = 0.5 * (returns - value_preds).pow(2).mean()
             
-            # Compute entropy bonus
+            # Compute entropy bonus (using full distributions)
             entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-10), dim=-1).mean()
             
             # Total loss

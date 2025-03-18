@@ -658,6 +658,9 @@ class AutonomousRewardSystem:
         # Temporal association memory for action-outcome associations
         self.association_memory = TemporalAssociationMemory(config)
         
+        # Visual change analyzer for pattern recognition
+        self.visual_change_analyzer = VisualChangeAnalyzer(memory_size=1000)
+        
         # Track history for predicting outcomes
         self.frame_history = []
         self.max_history_length = 5
@@ -684,185 +687,253 @@ class AutonomousRewardSystem:
         # Default max menu penalty
         self.max_menu_penalty = -20.0
         
-    def compute_reward(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor) -> float:
-        """Compute reward for the current state-action-next_state transition.
+    def compute_reward(self, prev_frame: np.ndarray, action_idx: int, curr_frame: np.ndarray) -> float:
+        """Compute reward based on visual changes without using domain knowledge.
+        
+        This method only looks at raw visual changes between frames and uses
+        intrinsic motivation approaches without any game-specific knowledge.
         
         Args:
-            prev_frame (torch.Tensor): Previous frame (before action)
-            action_idx (int): Index of the action taken
-            curr_frame (torch.Tensor): Current frame (after action)
+            prev_frame: Previous frame
+            action_idx: Index of the action taken
+            curr_frame: Current frame after action
             
         Returns:
             float: Computed reward
         """
-        # Calculate multiple reward components
-        
-        # 1. Prediction error reward (novelty)
-        prediction_reward = self._prediction_error_reward(prev_frame, action_idx, curr_frame)
-        
-        # 2. Visual change reward (structural changes)
-        visual_change_reward = self._visual_change_reward(prev_frame, curr_frame)
-        
-        # 3. State density reward (exploration)
-        state_embedding = self._get_state_embedding(curr_frame)
-        density_reward = self._density_reward(state_embedding)
-        
-        # 4. Temporal association reward (learned preferences)
-        association_reward = self._association_reward(prev_frame, action_idx, curr_frame)
-        
-        # Combine reward components with weights
-        reward = (
-            0.3 * prediction_reward +    # 30% weight for prediction error
-            0.4 * visual_change_reward + # 40% weight for visual changes
-            0.1 * density_reward +       # 10% weight for exploration
-            0.2 * association_reward     # 20% weight for learned preferences
-        )
-        
-        # Apply adaptive normalization
-        reward = self._normalize_reward(reward)
-        
-        # Update components with new data
-        self._update(prev_frame, action_idx, curr_frame, reward)
-        
-        return reward
-        
+        # Input validation
+        if prev_frame is None or curr_frame is None:
+            return 0.0
+            
+        try:
+            # Ensure we're using the right device and dtype
+            device = self.device
+            dtype = self.dtype
+            
+            # Convert frames to tensors if they aren't already
+            if not isinstance(prev_frame, torch.Tensor):
+                prev_frame = torch.from_numpy(prev_frame).to(device=device, dtype=dtype)
+            if not isinstance(curr_frame, torch.Tensor):
+                curr_frame = torch.from_numpy(curr_frame).to(device=device, dtype=dtype)
+                
+            # Normalize if needed
+            if prev_frame.max() > 1.0:
+                prev_frame = prev_frame / 255.0
+            if curr_frame.max() > 1.0:
+                curr_frame = curr_frame / 255.0
+                
+            # Ensure correct shape
+            if len(prev_frame.shape) == 3:
+                prev_frame = prev_frame.unsqueeze(0)
+            if len(curr_frame.shape) == 3:
+                curr_frame = curr_frame.unsqueeze(0)
+                
+            # Compute reward components
+            prediction_error_reward = self._prediction_error_reward(prev_frame, action_idx, curr_frame)
+            visual_change_reward = self._visual_change_reward(prev_frame, curr_frame)
+            density_reward = self._density_reward(curr_frame)
+            association_reward = self._association_reward(prev_frame, action_idx, curr_frame)
+            
+            # Combine reward components
+            total_reward = (
+                0.4 * prediction_error_reward +
+                0.3 * visual_change_reward +
+                0.2 * density_reward +
+                0.1 * association_reward
+            )
+            
+            # Update internal state
+            self._update_state(prev_frame, action_idx, curr_frame, total_reward)
+            
+            # Apply adaptive normalization
+            normalized_reward = self._normalize_reward(total_reward)
+            
+            return normalized_reward
+            
+        except Exception as e:
+            logger.error(f"Error computing reward: {e}")
+            return 0.0
+    
     def _prediction_error_reward(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor) -> float:
-        """Compute reward component based on prediction error.
+        """Compute reward based on world model prediction error.
+        
+        This rewards the agent for exploring states that are hard to predict,
+        encouraging exploration of novel situations.
         
         Args:
-            prev_frame (torch.Tensor): Previous frame
-            action_idx (int): Action index
-            curr_frame (torch.Tensor): Current frame
+            prev_frame: Previous frame
+            action_idx: Action index
+            curr_frame: Current frame
             
         Returns:
             float: Prediction error reward
         """
-        # Update frame history
-        self._update_frame_history(prev_frame)
-        
-        # Get prediction of current frame based on previous frames and action
-        predicted_frame = self.world_model.predict_next_frame(self.frame_history, action_idx)
-        
-        # Compute prediction error
-        if predicted_frame is not None and curr_frame is not None:
-            if isinstance(predicted_frame, torch.Tensor) and isinstance(curr_frame, torch.Tensor):
-                # Ensure frames are on the same device
-                if predicted_frame.device != curr_frame.device:
-                    predicted_frame = predicted_frame.to(curr_frame.device)
-                
-                # Compute L2 error
-                error = torch.mean((predicted_frame - curr_frame) ** 2).item()
-                
-                # Scale error to reasonable range - novelty is both good and bad
-                # Small errors (gradual change) -> positive reward
-                # Large errors (unexpected change) -> negative reward
-                # Tuned thresholds based on typical prediction errors
-                if error < 0.05:
-                    # Small errors are generally good (progress)
-                    return max(0.0, 0.5 - error * 10.0)  # +0.5 to 0.0 as error increases
-                else:
-                    # Large errors can be disruptive/bad (failures, menus, etc.)
-                    return -min(1.0, (error - 0.05) * 5.0)  # 0.0 to -1.0 as error increases
-        
-        # Default to small positive reward if prediction unavailable
-        return 0.01
+        try:
+            # Predict next frame using world model
+            predicted_frame = self.world_model.predict_next_frame(prev_frame, action_idx)
+            
+            # Calculate prediction error
+            prediction_error = F.mse_loss(predicted_frame, curr_frame)
+            
+            # Scale prediction error to a reward
+            # Higher error = higher reward (encourages exploration)
+            # But not too high (clip to avoid pursuing completely random states)
+            reward = torch.clamp(prediction_error, 0.0, 1.0).item()
+            
+            return reward
+        except Exception as e:
+            logger.error(f"Error computing prediction error reward: {e}")
+            return 0.0
     
     def _visual_change_reward(self, prev_frame: torch.Tensor, curr_frame: torch.Tensor) -> float:
-        """Compute reward component based on visual change.
+        """Compute reward based on visual change between frames.
+        
+        This rewards the agent for actions that cause visual changes,
+        encouraging interaction with the environment.
         
         Args:
-            prev_frame (torch.Tensor): Previous frame
-            curr_frame (torch.Tensor): Current frame
+            prev_frame: Previous frame
+            curr_frame: Current frame
             
         Returns:
             float: Visual change reward
         """
-        # Convert to numpy for OpenCV
-        prev_np = prev_frame.detach().cpu().numpy()
-        curr_np = curr_frame.detach().cpu().numpy()
-        
-        # Ensure correct format
-        if len(prev_np.shape) == 3:
-            prev_np = prev_np.transpose(1, 2, 0)
-            curr_np = curr_np.transpose(1, 2, 0)
+        try:
+            # Convert to numpy for visual change calculation if needed
+            if isinstance(prev_frame, torch.Tensor):
+                prev_frame_np = prev_frame.squeeze().cpu().numpy()
+            else:
+                prev_frame_np = prev_frame
+                
+            if isinstance(curr_frame, torch.Tensor):
+                curr_frame_np = curr_frame.squeeze().cpu().numpy()
+            else:
+                curr_frame_np = curr_frame
+                
+            # Calculate visual change using our analyzer
+            diff_pattern = cv2.absdiff(
+                prev_frame_np.transpose(1, 2, 0) if prev_frame_np.ndim == 3 else prev_frame_np, 
+                curr_frame_np.transpose(1, 2, 0) if curr_frame_np.ndim == 3 else curr_frame_np
+            )
             
-        # Convert to grayscale
-        prev_gray = cv2.cvtColor(prev_np, cv2.COLOR_RGB2GRAY)
-        curr_gray = cv2.cvtColor(curr_np, cv2.COLOR_RGB2GRAY)
-        
-        # Compute structural similarity
-        from skimage.metrics import structural_similarity
-        score, diff = structural_similarity(prev_gray, curr_gray, full=True, data_range=1.0)
-        
-        # Convert diff to numpy array (0-1 range)
-        diff_image = (1.0 - diff) 
-        
-        # Compute visual change magnitude
-        change_magnitude = np.mean(np.abs(diff_image))
-        
-        # Get predicted outcome based on visual patterns
-        if len(self.frame_history) > 100:  # Only start using the analyzer after some experience
-            # Get the predicted outcome for this visual change
-            predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_image)
+            # Compute mean pixel change
+            mean_diff = np.mean(diff_pattern)
             
-            # Blend prediction with base magnitude (initially rely more on magnitude)
-            blend_factor = min(len(self.frame_history) / 10000.0, 0.8)  # Up to 80% from prediction
-            change_score = (1 - blend_factor) * change_magnitude * 5.0 + blend_factor * predicted_outcome
-        else:
-            change_score = change_magnitude * 5.0
-        
-        # Store the visual change for later analysis
-        if len(self.reward_history) >= 5:  # Wait for some outcomes to be available
-            # Use the average outcome over next few steps as the "true" outcome
-            past_outcomes = np.mean([o for o in list(self.reward_history)[-5:]])
-            # Update the analyzer with this pattern->outcome pair
-            self.visual_change_analyzer.update_association(diff_image, past_outcomes)
-        
-        # Store the current change score to correlate with future outcomes
-        self.reward_history.append(change_score)
-        
-        # Return signed change value in range [-1, 1]
-        return np.clip(change_score, -1.0, 1.0)
+            # Use visual change analyzer to predict outcome from this pattern
+            predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_pattern)
+            
+            # Update association memory
+            self.visual_change_analyzer.update_association(diff_pattern, mean_diff)
+            
+            # Combine raw change and predicted outcome
+            reward = 0.7 * mean_diff + 0.3 * predicted_outcome
+            
+            return float(reward)
+        except Exception as e:
+            logger.error(f"Error computing visual change reward: {e}")
+            return 0.0
     
-    def _get_state_embedding(self, frame: torch.Tensor) -> torch.Tensor:
-        """Get state embedding from frame."""
-        return self.feature_extractor(frame)
-    
-    def _density_reward(self, state_embedding: torch.Tensor) -> float:
-        """Compute reward component based on state density."""
-        return self.density_estimator.compute_novelty(state_embedding)
+    def _density_reward(self, curr_frame: torch.Tensor) -> float:
+        """Compute reward based on state density estimation.
+        
+        This rewards the agent for visiting rare states, encouraging exploration.
+        
+        Args:
+            curr_frame: Current frame
+            
+        Returns:
+            float: Density reward
+        """
+        try:
+            # Extract features from frame
+            with torch.no_grad():
+                features = self.world_model.encode_frame(curr_frame)
+                
+            # Compute density (novelty) of this state
+            density = self.density_estimator.compute_novelty(features)
+            
+            # Update density estimator
+            self.density_estimator.update(features)
+            
+            # Lower density = higher reward (encourage exploration of rare states)
+            reward = 1.0 - torch.clamp(density, 0.0, 1.0).item()
+            
+            return reward
+        except Exception as e:
+            logger.error(f"Error computing density reward: {e}")
+            return 0.0
     
     def _association_reward(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor) -> float:
-        """Compute reward component based on temporal association."""
-        return self.association_memory.evaluate_stability(curr_frame, [prev_frame])
+        """Compute reward based on temporal association memory.
+        
+        This rewards the agent for learning action-outcome associations.
+        
+        Args:
+            prev_frame: Previous frame
+            action_idx: Action index
+            curr_frame: Current frame
+            
+        Returns:
+            float: Association reward
+        """
+        try:
+            # Extract features from frames
+            with torch.no_grad():
+                prev_features = self.world_model.encode_frame(prev_frame)
+                curr_features = self.world_model.encode_frame(curr_frame)
+                
+            # Compute association score
+            score = self.association_memory.evaluate_stability(curr_features, [prev_features])
+            
+            # Update association memory
+            self.association_memory.update(prev_features, action_idx, curr_features)
+            
+            return score.item()
+        except Exception as e:
+            logger.error(f"Error computing association reward: {e}")
+            return 0.0
     
-    def _normalize_reward(self, reward: float) -> float:
-        """Apply adaptive normalization to reward."""
-        # Update reward history
+    def _update_state(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor, reward: float) -> None:
+        """Update internal state with new experience.
+        
+        Args:
+            prev_frame: Previous frame
+            action_idx: Action index
+            curr_frame: Current frame
+            reward: Computed reward
+        """
+        # Store reward in history for normalization
         self.reward_history.append(reward)
-        
-        # Compute moving average of rewards
-        if len(self.reward_history) > self.history_size:
+        if len(self.reward_history) > 100:  # Keep limited history
             self.reward_history.pop(0)
-        average_reward = np.mean(self.reward_history)
-        
-        # Scale and shift reward
-        scaled_reward = self.reward_scale * (reward - average_reward) + self.reward_shift
-        
-        return scaled_reward
-    
-    def _update(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor, reward: float):
-        """Update components with new data."""
-        self._update_frame_history(prev_frame)
-        self.density_estimator.update(self._get_state_embedding(curr_frame))
-        self.association_memory.update(prev_frame, action_idx, curr_frame)
-        
-    def _update_frame_history(self, frame: torch.Tensor):
-        """Update frame history."""
-        self.frame_history.append(frame.detach().cpu().numpy())
+            
+        # Update frame history
+        self.frame_history.append(curr_frame.detach().cpu())
         if len(self.frame_history) > self.max_history_length:
             self.frame_history.pop(0)
+    
+    def _normalize_reward(self, reward: float) -> float:
+        """Normalize reward based on recent history.
         
+        Args:
+            reward: Raw reward value
+            
+        Returns:
+            float: Normalized reward
+        """
+        if not self.reward_history:
+            return reward
+            
+        # Compute mean and std of recent rewards
+        mean_reward = np.mean(self.reward_history)
+        std_reward = np.std(self.reward_history) + 1e-8  # Avoid division by zero
+        
+        # Normalize reward (z-score normalization)
+        normalized = (reward - mean_reward) / std_reward
+        
+        # Clip to avoid extreme values
+        return float(np.clip(normalized, -5.0, 5.0))
+
     def calculate_menu_penalty(self, in_menu: bool, consecutive_menu_steps: int = 0) -> float:
         """Calculate penalty for getting stuck in menus.
         
