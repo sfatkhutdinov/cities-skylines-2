@@ -624,16 +624,18 @@ class CitiesEnvironment:
             # Very low probability to be in a menu (5%)
             return random.random() < 0.05
             
-        # Use menu handler if available
-        if hasattr(self, 'menu_handler') and self.menu_handler is not None:
-            return self.menu_handler.detect_menu()
-            
-        # Fallback to visual estimator
-        current_frame = self.screen_capture.get_latest_frame()
+        # Get current frame
+        current_frame = self.screen_capture.capture_frame()
         if current_frame is None:
             logger.warning("Failed to capture frame for menu detection")
             return False
             
+        # Use menu handler if available
+        if hasattr(self, 'menu_handler') and self.menu_handler is not None:
+            menu_detected, _, _ = self.menu_handler.detect_menu(current_frame)
+            return menu_detected
+            
+        # Fallback to visual estimator
         return self.visual_estimator.detect_main_menu(current_frame)
     
     def _handle_menu_recovery(self, retries: int = 2) -> bool:

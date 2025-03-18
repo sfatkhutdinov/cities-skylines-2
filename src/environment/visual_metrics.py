@@ -31,6 +31,7 @@ class VisualMetricsEstimator:
         self.menu_reference = None
         self.menu_matcher = cv2.SIFT_create()
         self.menu_flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), {})
+        self.menu_detection_initialized = False
         
         # Feature extraction for general use
         self.feature_extractor = nn.Sequential(
@@ -62,6 +63,7 @@ class VisualMetricsEstimator:
                     logger.info(f"Loaded menu reference image from {menu_reference_path}")
                     # Pre-compute keypoints and descriptors
                     self.menu_kp, self.menu_desc = self.menu_matcher.detectAndCompute(self.menu_reference, None)
+                    self.menu_detection_initialized = True
                     return True
                 else:
                     logger.warning(f"Failed to load menu reference image from {menu_reference_path}")
@@ -822,15 +824,24 @@ class VisualMetricsEstimator:
         if current_frame is None:
             return 0.0
             
+        # Convert PyTorch tensor to numpy if needed
+        if isinstance(current_frame, torch.Tensor):
+            current_frame_np = current_frame.detach().cpu().numpy()
+            # Convert from PyTorch's CHW format to HWC format if needed
+            if len(current_frame_np.shape) == 3 and current_frame_np.shape[0] == 3:
+                current_frame_np = current_frame_np.transpose(1, 2, 0)
+        else:
+            current_frame_np = current_frame
+            
         if not hasattr(self, 'previous_frame') or self.previous_frame is None:
-            self.previous_frame = current_frame.copy()
+            self.previous_frame = current_frame_np.copy()
             return 0.0
             
         # Use visual change analyzer to get the score
-        score = self.visual_change_analyzer.get_visual_change_score(self.previous_frame, current_frame)
+        score = self.visual_change_analyzer.get_visual_change_score(self.previous_frame, current_frame_np)
         
         # Update previous frame
-        self.previous_frame = current_frame.copy()
+        self.previous_frame = current_frame_np.copy()
         
         return score
         
@@ -845,9 +856,30 @@ class VisualMetricsEstimator:
         """
         from src.utils.image_utils import ImageUtils
         
+        # Convert PyTorch tensor to numpy if needed
+        if isinstance(frame, torch.Tensor):
+            frame_np = frame.detach().cpu().numpy()
+            # Convert from PyTorch's CHW format to HWC format if needed
+            if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:
+                frame_np = frame_np.transpose(1, 2, 0)
+            # Ensure values are in range 0-255 and uint8 type for OpenCV
+            if frame_np.max() <= 1.0:
+                frame_np = (frame_np * 255).astype(np.uint8)
+            else:
+                frame_np = frame_np.astype(np.uint8)
+        else:
+            # If already numpy array, ensure it's uint8 type
+            if frame.dtype != np.uint8:
+                if frame.max() <= 1.0:
+                    frame_np = (frame * 255).astype(np.uint8)
+                else:
+                    frame_np = frame.astype(np.uint8)
+            else:
+                frame_np = frame
+        
         # Create image utils if not already created
         if not hasattr(self, 'image_utils'):
             self.image_utils = ImageUtils()
             
         # Use image utils to detect UI elements
-        return self.image_utils.detect_ui_elements(frame) 
+        return self.image_utils.detect_ui_elements(frame_np) 
