@@ -2,7 +2,6 @@ import numpy as np
 import cv2
 from typing import List, Tuple, Dict, Optional, Union, Any
 import logging
-from collections import deque
 
 logger = logging.getLogger(__name__)
 

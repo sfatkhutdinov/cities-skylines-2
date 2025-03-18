@@ -391,8 +391,7 @@ class TemporalAssociationMemory:
         previous_gray = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
         
         # Compute structural similarity
-        from skimage.metrics import structural_similarity
-        score, diff = structural_similarity(previous_gray, current_gray, full=True, data_range=1.0)
+        score, diff = ssim(previous_gray, current_gray, full=True, data_range=1.0)
         
         # Convert diff to numpy array (0-1 range)
         diff_image = (1.0 - diff)

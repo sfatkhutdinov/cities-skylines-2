@@ -12,7 +12,6 @@ from src.config.hardware_config import HardwareConfig
 import cv2
 import os
 import logging
-from skimage.metrics import structural_similarity
 from src.environment.visual_change_analyzer import VisualChangeAnalyzer
 
 logger = logging.getLogger(__name__)

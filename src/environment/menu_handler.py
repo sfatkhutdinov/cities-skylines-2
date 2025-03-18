@@ -3,9 +3,9 @@ import time
 import numpy as np
 from typing import Tuple, List, Dict, Optional, Union
 
-from src.environment.input_simulator import InputSimulator
-from src.environment.screen_capture import ScreenCapture
-from src.environment.visual_metrics import VisualMetrics
+from .input_simulator import InputSimulator
+from .optimized_capture import OptimizedScreenCapture
+from .visual_metrics import VisualMetricsEstimator
 from src.utils.image_utils import ImageUtils
 
 logger = logging.getLogger(__name__)
@@ -24,16 +24,16 @@ class MenuHandler:
     
     def __init__(
         self,
-        screen_capture: ScreenCapture,
+        screen_capture: OptimizedScreenCapture,
         input_simulator: InputSimulator,
-        visual_metrics: Optional[VisualMetrics] = None,
+        visual_metrics: Optional[VisualMetricsEstimator] = None,
     ):
         """Initialize menu handler.
         
         Args:
-            screen_capture: ScreenCapture instance
-            input_simulator: InputSimulator instance
-            visual_metrics: Optional VisualMetrics instance for menu detection
+            screen_capture: Screen capture module
+            input_simulator: Input simulator for keyboard/mouse actions
+            visual_metrics: Optional VisualMetricsEstimator instance for menu detection
         """
         self.screen_capture = screen_capture
         self.input_simulator = input_simulator

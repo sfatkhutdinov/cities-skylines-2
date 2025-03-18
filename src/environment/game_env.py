@@ -10,7 +10,6 @@ import random
 import logging
 from typing import Dict, List, Tuple, Optional, Any
 import os
-from collections import deque
 from .visual_metrics import VisualMetricsEstimator
 from .autonomous_reward_system import AutonomousRewardSystem
 from .optimized_capture import OptimizedScreenCapture
@@ -18,11 +17,9 @@ from src.utils.performance_safeguards import PerformanceSafeguards
 from .input_simulator import InputSimulator
 from src.config.hardware_config import HardwareConfig
 import win32api
-from src.environment.screen_capture import ScreenCapture
-from src.environment.visual_metrics import VisualMetrics
-from src.environment.menu_handler import MenuHandler
+from .menu_handler import MenuHandler
 from src.utils.image_utils import ImageUtils
-from src.config.action_space import get_action_space
+
 
 logger = logging.getLogger(__name__)
 
