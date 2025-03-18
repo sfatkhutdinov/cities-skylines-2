@@ -413,7 +413,10 @@ class CitiesEnvironment:
             logger.warning("Failed to exit menu after multiple attempts - continuing anyway")
         
         # Ensure mouse can move freely after menu handling
-        self._reset_mouse_position()
+        # Move mouse to center of screen
+        width, height = self._get_screen_dimensions()
+        center_x, center_y = width // 2, height // 2
+        self.input_simulator.mouse_move(center_x, center_y)
         
         # Capture again after potential menu exit
         self.current_frame = self.screen_capture.capture_frame()
@@ -780,120 +783,6 @@ class CitiesEnvironment:
             logger.error(f"Error executing action: {e}")
             return False
     
-    def _handle_camera_action(self, action: str):
-        """Execute camera movement actions using default game key bindings."""
-        # Get screen dimensions
-        width, height = self._get_screen_dimensions()
-        # Calculate center and margins
-        center_x, center_y = width // 2, height // 2
-        margin = 100  # Pixels from edge to avoid
-        
-        # Random offsets for more varied camera movements
-        rand_x = random.randint(-100, 100)
-        rand_y = random.randint(-100, 100)
-        
-        # Make center slightly randomized to prevent getting stuck in patterns
-        center_x += rand_x
-        center_y += rand_y
-        
-        # Ensure center stays within safe bounds
-        center_x = max(margin, min(width - margin, center_x))
-        center_y = max(margin, min(height - margin, center_y))
-        
-        # Handle basic movement with keys according to default keybindings
-        if action == "move_up":
-            self.input_simulator.key_press('w', duration=0.1)
-        elif action == "move_down":
-            self.input_simulator.key_press('s', duration=0.1)
-        elif action == "move_left":
-            self.input_simulator.key_press('a', duration=0.1)
-        elif action == "move_right":
-            self.input_simulator.key_press('d', duration=0.1)
-        # Enhanced diagonal movements
-        elif action == "move_up_left":
-            self.input_simulator.press_key('w')
-            self.input_simulator.press_key('a')
-            time.sleep(0.1)
-            self.input_simulator.release_key('w')
-            self.input_simulator.release_key('a')
-        elif action == "move_up_right":
-            self.input_simulator.press_key('w')
-            self.input_simulator.press_key('d')
-            time.sleep(0.1)
-            self.input_simulator.release_key('w')
-            self.input_simulator.release_key('d')
-        elif action == "move_down_left":
-            self.input_simulator.press_key('s')
-            self.input_simulator.press_key('a')
-            time.sleep(0.1)
-            self.input_simulator.release_key('s')
-            self.input_simulator.release_key('a')
-        elif action == "move_down_right":
-            self.input_simulator.press_key('s')
-            self.input_simulator.press_key('d')
-            time.sleep(0.1)
-            self.input_simulator.release_key('s')
-            self.input_simulator.release_key('d')
-        # Fast movements - hold keys longer
-        elif action == "move_up_fast":
-            self.input_simulator.key_press('w', duration=0.3)
-        elif action == "move_down_fast":
-            self.input_simulator.key_press('s', duration=0.3)
-        # Zoom with R/F per default bindings
-        elif action == "zoom_in":
-            self.input_simulator.key_press('r', duration=0.1)
-        elif action == "zoom_out":
-            self.input_simulator.key_press('f', duration=0.1)
-        # Rotation with Q/E per default bindings
-        elif action == "rotate_left":
-            # Mix key press with mouse rotation for more varied movement
-            self.input_simulator.key_press('q', duration=0.1)
-            # Also try mouse-based rotation for variety
-            if random.random() > 0.5:  # 50% chance to use mouse rotation
-                self.input_simulator.rotate_camera(
-                    center_x, center_y, 
-                    center_x - 200, center_y
-                )
-        elif action == "rotate_right":
-            self.input_simulator.key_press('e', duration=0.1)
-            # Also try mouse-based rotation for variety
-            if random.random() > 0.5:  # 50% chance to use mouse rotation
-                self.input_simulator.rotate_camera(
-                    center_x, center_y, 
-                    center_x + 200, center_y
-                )
-        # Orbital camera movements (combined rotation and movement)
-        elif action == "orbit_left":
-            # Press rotate left and move left
-            self.input_simulator.press_key('q')
-            time.sleep(0.05)
-            self.input_simulator.press_key('a')
-            time.sleep(0.1)
-            self.input_simulator.release_key('q')
-            self.input_simulator.release_key('a')
-        elif action == "orbit_right":
-            # Press rotate right and move right
-            self.input_simulator.press_key('e')
-            time.sleep(0.05)
-            self.input_simulator.press_key('d')
-            time.sleep(0.1)
-            self.input_simulator.release_key('e')
-            self.input_simulator.release_key('d')
-        # Tilt with T/G per default bindings
-        elif action == "tilt_up":
-            self.input_simulator.key_press('t', duration=0.1)
-        elif action == "tilt_down":
-            self.input_simulator.key_press('g', duration=0.1)
-        # Pan camera with a combo of rotation and movement
-        elif action == "pan_left":
-            self.input_simulator.key_press('a', duration=0.2)
-        elif action == "pan_right":
-            self.input_simulator.key_press('d', duration=0.2)
-        
-        # Reset mouse position occasionally to prevent getting stuck
-        if random.random() > 0.8:  # 20% chance
-            self._reset_mouse_position()
-    
     def _update_performance_metrics(self):
         """Update performance tracking metrics."""
         current_time = time.time()
@@ -914,19 +803,15 @@ class CitiesEnvironment:
         self.last_optimization_check = time.time()
     
     def close(self):
-        """Clean up resources."""
+        """Clean up resources when environment is closed."""
         try:
-            # Ensure all keys and mouse buttons are released
-            logger.info("Releasing all input devices...")
+            logger.info("Closing environment and releasing resources")
             
-            # Release any pressed keys
-            # Commonly used keys in the game
-            common_keys = ['w', 'a', 's', 'd', 'q', 'e', 'r', 'f', 't', 'g', 
-                          'escape', 'space', '1', '2', '3', '4', '5', '6']
-            
-            for key in common_keys:
+            # Release any held keys
+            if hasattr(self, 'input_simulator'):
                 try:
-                    self.input_simulator.release_key(key)
+                    for key in ['w', 'a', 's', 'd', 'shift', 'ctrl', 'alt']:
+                        self.input_simulator.release_key(key)
                 except:
                     pass
             
@@ -940,7 +825,10 @@ class CitiesEnvironment:
                 
             # Reset mouse to center position
             try:
-                self._reset_mouse_position()
+                # Move mouse to center of screen
+                width, height = self._get_screen_dimensions()
+                center_x, center_y = width // 2, height // 2
+                self.input_simulator.mouse_move(center_x, center_y)
             except:
                 pass
                 
@@ -1042,168 +930,6 @@ class CitiesEnvironment:
                 pass
             return False
 
-    def _handle_ui_action(self, action: str):
-        """Execute UI exploration actions."""
-        # Get client area dimensions for random coordinates
-        if hasattr(self.screen_capture, 'client_position'):
-            client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
-            width = client_right - client_left
-            height = client_bottom - client_top
-        else:
-            # Fallback to system metrics
-            width = win32api.GetSystemMetrics(0)
-            height = win32api.GetSystemMetrics(1)
-            
-        # Handle random UI interactions
-        if action == "click_random":
-            # Click at a random position
-            x = random.randint(0, width - 1)
-            y = random.randint(0, height - 1)
-            logger.info(f"Random UI click at ({x}, {y})")
-            self.input_simulator.mouse_click(x, y)
-            
-        elif action == "right_click_random":
-            # Right-click at a random position
-            x = random.randint(0, width - 1)
-            y = random.randint(0, height - 1)
-            logger.info(f"Random UI right-click at ({x}, {y})")
-            self.input_simulator.mouse_click(x, y, button='right')
-            
-        elif action == "drag_random":
-            # Drag from one random position to another
-            start_x = random.randint(0, width - 1)
-            start_y = random.randint(0, height - 1)
-            end_x = random.randint(0, width - 1)
-            end_y = random.randint(0, height - 1)
-            logger.info(f"Random UI drag from ({start_x}, {start_y}) to ({end_x}, {end_y})")
-            self.input_simulator.mouse_drag((start_x, start_y), (end_x, end_y))
-            
-        elif action == "click_top_menu":
-            # Click in the top menu area (first 50 pixels from top)
-            x = random.randint(0, width - 1)
-            y = random.randint(0, 50)
-            logger.info(f"UI click in top menu at ({x}, {y})")
-            self.input_simulator.mouse_click(x, y)
-            
-        elif action == "hover_random":
-            # Hover the mouse at a random position without clicking
-            x = random.randint(0, width - 1)
-            y = random.randint(0, height - 1)
-            logger.info(f"UI hover at ({x}, {y})")
-            self.input_simulator.mouse_move(x, y)
-            # Wait a moment to allow tooltips to appear
-            time.sleep(0.5)
-            
-        elif action == "double_click_random":
-            # Double click at a random position
-            x = random.randint(0, width - 1)
-            y = random.randint(0, height - 1)
-            logger.info(f"Random UI double-click at ({x}, {y})")
-            self.input_simulator.mouse_click(x, y, double=True)
-            
-        elif action == "scroll_up":
-            # Scroll up at current mouse position
-            logger.info("UI scroll up")
-            self.input_simulator.mouse_scroll(2)
-            
-        elif action == "scroll_down":
-            # Scroll down at current mouse position
-            logger.info("UI scroll down")
-            self.input_simulator.mouse_scroll(-2)
-    
-    def _handle_ui_position_action(self, action: str, position: Tuple[int, int]):
-        """Execute UI action at a specific position."""
-        x, y = position
-        
-        if action == "click":
-            logger.info(f"UI click at position ({x}, {y})")
-            self.input_simulator.mouse_click(x, y)
-        elif action == "right_click":
-            logger.info(f"UI right-click at position ({x}, {y})")
-            self.input_simulator.mouse_click(x, y, button='right')
-        elif action == "double_click":
-            logger.info(f"UI double-click at position ({x}, {y})")
-            self.input_simulator.mouse_click(x, y, double=True)
-        elif action == "drag":
-            start_x, start_y = position.get("start", (0, 0))
-            end_x, end_y = position.get("end", (0, 0))
-            logger.info(f"UI drag from ({start_x}, {start_y}) to ({end_x}, {end_y})")
-            self.input_simulator.mouse_drag((start_x, start_y), (end_x, end_y))
-    
-    def _handle_sequence_action(self, action: str):
-        """Execute multi-step action sequences."""
-        # Get screen resolution
-        if hasattr(self.screen_capture, 'client_position'):
-            client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
-            width = client_right - client_left
-            height = client_bottom - client_top
-            center_x = width // 2
-            center_y = height // 2
-        else:
-            screen_width = win32api.GetSystemMetrics(0)
-            screen_height = win32api.GetSystemMetrics(1)
-            center_x, center_y = screen_width // 2, screen_height // 2
-        
-        if action == "open_menu_click":
-            # Sequence: Click on menu, wait, then click on submenu item
-            # First, click in top menu area
-            top_menu_x = random.randint(0, width - 1)
-            top_menu_y = random.randint(0, 30)
-            logger.info(f"Sequence: Click top menu at ({top_menu_x}, {top_menu_y})")
-            self.input_simulator.mouse_click(top_menu_x, top_menu_y)
-            
-            # Wait for menu to appear
-            time.sleep(0.5)
-            
-            # Then click on a random position below (assuming submenu item)
-            submenu_x = top_menu_x + random.randint(-50, 50)
-            submenu_y = top_menu_y + random.randint(30, 100)
-            
-            # Log if coordinates are outside normal bounds but don't restrict them
-            if submenu_x < 0 or submenu_x >= width or submenu_y < 0 or submenu_y >= height:
-                logger.info(f"Notice: Submenu position ({submenu_x}, {submenu_y}) is outside normal screen bounds")
-            
-            logger.info(f"Sequence: Click submenu at ({submenu_x}, {submenu_y})")
-            self.input_simulator.mouse_click(submenu_x, submenu_y)
-            
-        elif action == "build_and_connect":
-            # Sequence: Place a building then connect it with a road
-            
-            # 1. First place a residential zone
-            self.input_simulator.key_press('1')  # Zoning
-            time.sleep(0.2)
-            self.input_simulator.key_press('r')  # Residential
-            time.sleep(0.2)
-            
-            # Draw a small residential zone
-            zone_start_x, zone_start_y = center_x - 100, center_y - 100
-            zone_end_x, zone_end_y = center_x - 50, center_y - 50
-            self._drag_zone(zone_start_x, zone_start_y, zone_end_x, zone_end_y)
-            time.sleep(0.3)
-            
-            # 2. Then build a road connecting to it
-            self.input_simulator.key_press('2')  # Roads
-            time.sleep(0.2)
-            self.input_simulator.key_press('r')  # Basic road
-            time.sleep(0.2)
-            
-            # Draw a road from center to the zone
-            road_start_x, road_start_y = center_x, center_y
-            road_end_x, road_end_y = zone_end_x, zone_end_y
-            self._drag_zone(road_start_x, road_start_y, road_end_x, road_end_y)
-            time.sleep(0.3)
-            
-            # 3. Finally add a power line
-            self.input_simulator.key_press('3')  # Utilities
-            time.sleep(0.2)
-            self.input_simulator.key_press('p')  # Power
-            time.sleep(0.2)
-            
-            # Draw a power line to connect
-            power_start_x, power_start_y = center_x + 50, center_y
-            power_end_x, power_end_y = zone_start_x, zone_start_y
-            self._drag_zone(power_start_x, power_start_y, power_end_x, power_end_y)
-    
     def _get_screen_dimensions(self) -> Tuple[int, int]:
         """Get the dimensions of the game screen.
         
