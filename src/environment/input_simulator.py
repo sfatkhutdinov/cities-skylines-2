@@ -18,6 +18,9 @@ class InputSimulator:
         self.keyboard = KeyboardController()
         self.mouse = MouseController()
         
+        # Configure pyautogui to allow extreme positions
+        pyautogui.FAILSAFE = False
+        
         # Store current display resolution
         self.screen_width = win32api.GetSystemMetrics(0)
         self.screen_height = win32api.GetSystemMetrics(1)

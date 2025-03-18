@@ -228,21 +228,22 @@ class CitiesEnvironment:
             if i1 == i2 and j1 == j2:
                 continue
                 
-            x1 = int(screen_width * (i1 + 0.5) / grid_size)
-            y1 = int(screen_height * (j1 + 0.5) / grid_size)
-            x2 = int(screen_width * (i2 + 0.5) / grid_size)
-            y2 = int(screen_height * (j2 + 0.5) / grid_size)
+            # Calculate positions
+            start_x = int(screen_width * (i1 + 0.5) / grid_size)
+            start_y = int(screen_height * (j1 + 0.5) / grid_size)
+            end_x = int(screen_width * (i2 + 0.5) / grid_size)
+            end_y = int(screen_height * (j2 + 0.5) / grid_size)
             
             # Calculate duration based on distance
-            distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            distance = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
             duration = min(2.0, max(0.5, distance / 500))  # Scale duration with distance
             
             action_idx = drag_offset + drag_count
             base_actions[action_idx] = {
                 "type": "mouse", 
                 "action": "drag",
-                "start": (x1, y1),
-                "end": (x2, y2),
+                "start": (start_x, start_y),
+                "end": (end_x, end_y),
                 "button": "left",
                 "duration": duration
             }
@@ -250,6 +251,44 @@ class CitiesEnvironment:
             
             if drag_count >= max_drags:
                 break
+        
+        # Add specific edge-exploring actions
+        edge_action_offset = action_offset + 300
+        edge_action_idx = 0
+        
+        # Edge regions to explore (each corner and the middle of each edge)
+        edge_positions = [
+            # Corners
+            (5, 5),                               # Top-left
+            (screen_width - 5, 5),                # Top-right
+            (5, screen_height - 5),               # Bottom-left
+            (screen_width - 5, screen_height - 5), # Bottom-right
+            
+            # Edge midpoints
+            (screen_width // 2, 5),               # Top center
+            (screen_width // 2, screen_height - 5), # Bottom center
+            (5, screen_height // 2),              # Left center
+            (screen_width - 5, screen_height // 2)  # Right center
+        ]
+        
+        # Create move and click actions for each edge position
+        for pos_x, pos_y in edge_positions:
+            # Move action
+            base_actions[edge_action_offset + edge_action_idx] = {
+                "type": "mouse",
+                "action": "move",
+                "position": (pos_x, pos_y)
+            }
+            edge_action_idx += 1
+            
+            # Click action
+            base_actions[edge_action_offset + edge_action_idx] = {
+                "type": "mouse",
+                "action": "click",
+                "position": (pos_x, pos_y),
+                "button": "left"
+            }
+            edge_action_idx += 1
         
         return base_actions
     
@@ -815,8 +854,8 @@ class CitiesEnvironment:
                 
                 # If no x/y coordinates provided, generate random positions rather than using center
                 if x is None or y is None:
-                    # Use random positions within the main game area (avoiding edges)
-                    margin = 100  # pixels from edge
+                    # Use random positions within the entire game area to enable edge scrolling
+                    margin = 0  # Completely removed margin to allow edge scrolling
                     x = random.randint(margin, width - margin)
                     y = random.randint(margin, height - margin)
                     logger.debug(f"Generated random position: ({x}, {y})")
