@@ -217,6 +217,10 @@ class StateDensityEstimator:
         filled_memory = self.state_memory[:self.filled]
         distances = np.linalg.norm(filled_memory - state_np, axis=1)
         
+        # If only one state in memory, just return the distance to that state
+        if self.filled == 1:
+            return min(1.0, distances[0] / 10.0)
+        
         # Use average distance to k nearest neighbors as novelty measure
         k = min(10, self.filled)
         nearest_distances = np.partition(distances, k)[:k]

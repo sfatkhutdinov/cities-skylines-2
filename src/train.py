@@ -6,6 +6,8 @@ import wandb
 import logging
 import sys
 import time
+import signal
+import datetime
 
 # Set up logging
 logging.basicConfig(
@@ -45,6 +47,8 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--checkpoint_freq", type=int, default=100, help="Episodes between checkpoints")
+    parser.add_argument("--time_checkpoint_freq", type=int, default=30, help="Minutes between time-based checkpoints")
+    parser.add_argument("--step_checkpoint_freq", type=int, default=10000, help="Steps between step-based checkpoints")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     parser.add_argument("--mock", action="store_true", help="Use mock environment for training without the actual game")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -52,14 +56,31 @@ def parse_args():
     parser.add_argument("--action_delay", type=float, default=0.5, help="Minimum delay between actions (seconds)")
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     parser.add_argument("--resume_best", action="store_true", help="Resume training from best checkpoint")
+    parser.add_argument("--no_auto_resume", action="store_true", help="Disable automatic checkpoint resumption")
     parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")
     parser.add_argument("--capture_menu", action="store_true", help="Capture a menu screenshot at startup (assumes you're starting from the menu)")
     return parser.parse_args()
 
+# Global variable for graceful interruption
+stop_training = False
+
+# Signal handler for graceful interruption
+def signal_handler(sig, frame):
+    global stop_training
+    logger.info("Received interrupt signal (CTRL+C). Will save checkpoint and exit after current episode.")
+    stop_training = True
+
+# Register the signal handler
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 def collect_trajectory(
     env: CitiesEnvironment,
     agent: PPOAgent,
-    max_steps: int
+    max_steps: int,
+    total_steps: int,
+    checkpoint_dir: Path,
+    step_checkpoint_freq: int
 ) -> Tuple[Dict[str, torch.Tensor], float, int]:
     """Collect a trajectory of experiences.
     
@@ -67,6 +88,9 @@ def collect_trajectory(
         env (CitiesEnvironment): Game environment
         agent (PPOAgent): RL agent
         max_steps (int): Maximum steps to collect
+        total_steps (int): Current total steps completed
+        checkpoint_dir (Path): Directory to save checkpoints
+        step_checkpoint_freq (int): Steps between checkpoints
         
     Returns:
         Tuple[Dict[str, torch.Tensor], float, int]:
@@ -94,7 +118,14 @@ def collect_trajectory(
     previous_action_idx = None
     was_in_menu = False
     
-    for _ in range(max_steps):
+    for step in range(max_steps):
+        # Step-based checkpoint
+        current_total_steps = total_steps + step
+        if step_checkpoint_freq > 0 and current_total_steps > 0 and current_total_steps % step_checkpoint_freq == 0:
+            checkpoint_path = checkpoint_dir / f"step_checkpoint_{current_total_steps}.pt"
+            agent.save(checkpoint_path)
+            logger.info(f"Saved step-based checkpoint at step {current_total_steps}")
+        
         # Convert state to tensor if it's not already
         if not isinstance(state, torch.Tensor):
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
@@ -203,35 +234,63 @@ def collect_trajectory(
         "log_probs": torch.FloatTensor(log_probs),
         "values": torch.FloatTensor(values),
         "dones": torch.BoolTensor(dones),
-        "action_infos": action_infos  # For analysis
+        "action_infos": action_infos,  # For analysis
+        "info": info  # Store final info
     }
     
     return experiences, episode_reward, episode_length
 
 def find_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint file in the given directory."""
-    checkpoint_files = list(checkpoint_dir.glob("checkpoint_*.pt"))
-    if not checkpoint_files:
-        return None
-        
-    # Extract episode numbers and find the highest
-    episodes = []
-    for cp_file in checkpoint_files:
+    # Check both episode and step-based checkpoints
+    episode_checkpoints = list(checkpoint_dir.glob("checkpoint_*.pt"))
+    step_checkpoints = list(checkpoint_dir.glob("step_checkpoint_*.pt"))
+    time_checkpoints = list(checkpoint_dir.glob("time_checkpoint_*.pt"))
+    
+    all_checkpoints = []
+    
+    # Process episode checkpoints
+    for cp_file in episode_checkpoints:
         try:
             episode = int(cp_file.stem.split('_')[1])
-            episodes.append((episode, cp_file))
+            timestamp = cp_file.stat().st_mtime
+            all_checkpoints.append((timestamp, episode, cp_file, "episode"))
         except ValueError:
             continue
-            
-    if not episodes:
+    
+    # Process step checkpoints
+    for cp_file in step_checkpoints:
+        try:
+            step = int(cp_file.stem.split('_')[2])
+            timestamp = cp_file.stat().st_mtime
+            all_checkpoints.append((timestamp, step, cp_file, "step"))
+        except ValueError:
+            continue
+    
+    # Process time checkpoints
+    for cp_file in time_checkpoints:
+        try:
+            timestamp = cp_file.stat().st_mtime
+            all_checkpoints.append((timestamp, 0, cp_file, "time"))
+        except:
+            continue
+    
+    if not all_checkpoints:
         return None
-        
-    # Sort by episode number and return the file with the highest number
-    episodes.sort(key=lambda x: x[0])
-    return episodes[-1]  # Returns (episode_number, file_path)
+    
+    # Sort by timestamp (most recent first)
+    all_checkpoints.sort(reverse=True, key=lambda x: x[0])
+    latest = all_checkpoints[0]
+    
+    if latest[3] == "episode":
+        return (latest[1], latest[2])  # Return (episode_number, file_path)
+    else:
+        # For step or time checkpoints, return episode 0 since we don't know the episode
+        return (0, latest[2])  # Return (0, file_path)
 
 def train():
     """Main training loop."""
+    global stop_training
     logger.info("Starting training...")
     args = parse_args()
     
@@ -295,8 +354,16 @@ def train():
     checkpoint_loaded = False
     best_reward = float("-inf")
     
-    if args.resume or args.resume_best:
-        if args.resume_best and (checkpoint_dir / "best_model.pt").exists():
+    # Auto-resume logic: Automatically load checkpoints unless explicitly disabled
+    should_auto_resume = not args.no_auto_resume and not args.resume and not args.resume_best
+    
+    if args.resume or args.resume_best or should_auto_resume:
+        # Priority order for loading:
+        # 1. If --resume_best is specified, try loading best_model.pt
+        # 2. If --resume is specified, try loading the latest checkpoint
+        # 3. If auto-resume is enabled (default), try best_model.pt first, then latest checkpoint
+        
+        if (args.resume_best or should_auto_resume) and (checkpoint_dir / "best_model.pt").exists():
             # Resume from best model
             try:
                 logger.info("Loading best model checkpoint...")
@@ -305,22 +372,26 @@ def train():
                 logger.info("Successfully loaded best model")
             except Exception as e:
                 logger.error(f"Failed to load best model: {str(e)}")
-        elif args.resume:
+                
+        # If best model loading was not requested or failed, try latest checkpoint
+        if not checkpoint_loaded and (args.resume or should_auto_resume):
             # Find and load the latest checkpoint
             latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
             if latest_checkpoint:
                 episode_num, checkpoint_path = latest_checkpoint
                 try:
-                    logger.info(f"Loading checkpoint from episode {episode_num}...")
+                    logger.info(f"Loading checkpoint from {checkpoint_path}...")
                     agent.load(checkpoint_path)
                     start_episode = episode_num
                     checkpoint_loaded = True
-                    logger.info(f"Successfully loaded checkpoint from episode {episode_num}")
+                    logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
                 except Exception as e:
                     logger.error(f"Failed to load checkpoint: {str(e)}")
         
         if not checkpoint_loaded:
             logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
+        elif should_auto_resume:
+            logger.info("Auto-resume successfully loaded checkpoint.")
     
     # Initialize wandb if available
     use_wandb = False
@@ -343,17 +414,43 @@ def train():
     # Training loop
     best_reward = float('-inf')
     episode_times = []
+    total_steps = 0
+    last_time_checkpoint = time.time()
     
     for episode in range(start_episode, args.num_episodes):
+        if stop_training:
+            logger.info("Training interrupted by user. Saving final checkpoint...")
+            # Save interrupt checkpoint
+            interrupt_path = checkpoint_dir / f"interrupt_checkpoint.pt"
+            agent.save(interrupt_path)
+            logger.info(f"Saved interrupt checkpoint to {interrupt_path}")
+            break
+            
         episode_start_time = time.time()
+        
+        # Check if it's time for a time-based checkpoint
+        current_time = time.time()
+        time_elapsed = (current_time - last_time_checkpoint) / 60  # Convert to minutes
+        if args.time_checkpoint_freq > 0 and time_elapsed >= args.time_checkpoint_freq:
+            time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            checkpoint_path = checkpoint_dir / f"time_checkpoint_{time_str}.pt"
+            agent.save(checkpoint_path)
+            logger.info(f"Saved time-based checkpoint after {time_elapsed:.1f} minutes")
+            last_time_checkpoint = current_time
         
         # Collect experience
         logger.info(f"Starting episode {episode}...")
         experiences, episode_reward, episode_length = collect_trajectory(
             env=env,
             agent=agent,
-            max_steps=args.max_steps
+            max_steps=args.max_steps,
+            total_steps=total_steps,
+            checkpoint_dir=checkpoint_dir,
+            step_checkpoint_freq=args.step_checkpoint_freq
         )
+        
+        # Update total steps
+        total_steps += episode_length
         
         # Calculate average intrinsic reward
         avg_intrinsic_reward = experiences["intrinsic_rewards"].mean().item()
@@ -378,6 +475,7 @@ def train():
             "episode_length": episode_length,
             "time": episode_time,
             "avg_time": avg_time,
+            "total_steps": total_steps,
             **update_metrics
         }
         
@@ -386,7 +484,8 @@ def train():
                     f"intrinsic={avg_intrinsic_reward:.4f}, "
                     f"total={total_episode_reward:.2f}, "
                     f"length={episode_length}, "
-                    f"time={episode_time:.2f}s")
+                    f"time={episode_time:.2f}s, "
+                    f"total_steps={total_steps}")
         
         if use_wandb:
             wandb.log(metrics)
