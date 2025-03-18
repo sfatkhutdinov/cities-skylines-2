@@ -38,6 +38,13 @@ class PPOAgent:
         self.rewards = []
         self.dones = []
         
+        # Add action avoidance for menu toggling
+        self.menu_action_indices = []  # Will be populated with indices of actions that open menus
+        self.menu_action_penalties = {}  # Maps action indices to penalties
+        self.menu_penalty_decay = 0.98  # Slower decay rate (was 0.95)
+        self.last_rewards = []  # Track recent rewards to detect large penalties
+        self.extreme_penalty_threshold = -500.0  # Threshold for detecting extreme penalties
+        
     def select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select an action using the current policy.
         
@@ -54,6 +61,23 @@ class PPOAgent:
         # Get action probabilities and value
         with torch.no_grad():
             action_probs, value = self.network(state)
+            
+            # Apply penalties to menu-opening actions
+            if self.menu_action_indices and hasattr(self, 'menu_action_penalties'):
+                # Create a penalty mask (default 1.0 for all actions)
+                penalty_mask = torch.ones_like(action_probs)
+                
+                # Apply specific penalties to known menu actions
+                for action_idx, penalty in self.menu_action_penalties.items():
+                    if 0 <= action_idx < len(penalty_mask):
+                        # Reduce probability of this action by the penalty factor
+                        penalty_mask[action_idx] = max(0.1, 1.0 - penalty)  # Don't completely eliminate
+                
+                # Apply the mask to reduce probabilities of problematic actions
+                action_probs = action_probs * penalty_mask
+                
+                # Renormalize probabilities
+                action_probs = action_probs / action_probs.sum()
             
         # Sample action from probability distribution
         action = torch.multinomial(action_probs, 1)
@@ -209,4 +233,63 @@ class PPOAgent:
         """
         checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['network_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state']) 
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        
+    def register_menu_action(self, action_idx: int, penalty: float = 0.5):
+        """Register an action that led to a menu state to discourage its selection.
+        
+        Args:
+            action_idx (int): Index of the action that led to a menu
+            penalty (float): Penalty factor (0-1) to apply to this action's probability
+        """
+        if not hasattr(self, 'menu_action_indices'):
+            self.menu_action_indices = []
+            self.menu_action_penalties = {}
+        
+        # Add to the set of menu actions if not already there
+        if action_idx not in self.menu_action_indices:
+            self.menu_action_indices.append(action_idx)
+        
+        # Update penalty value (use max to ensure it only increases)
+        current_penalty = self.menu_action_penalties.get(action_idx, 0.0)
+        self.menu_action_penalties[action_idx] = max(current_penalty, penalty)
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Registered menu action {action_idx} with penalty {self.menu_action_penalties[action_idx]}")
+
+    def decay_menu_penalties(self):
+        """Gradually reduce penalties for menu actions over time."""
+        if hasattr(self, 'menu_action_penalties') and self.menu_action_penalties:
+            for action_idx in list(self.menu_action_penalties.keys()):
+                # Decay the penalty
+                self.menu_action_penalties[action_idx] *= self.menu_penalty_decay
+                
+                # Remove very small penalties
+                if self.menu_action_penalties[action_idx] < 0.05:
+                    del self.menu_action_penalties[action_idx]
+
+    def update_from_reward(self, action_idx: int, reward: float):
+        """Update action penalties based on received rewards.
+        
+        Args:
+            action_idx (int): Index of the action that received the reward
+            reward (float): The reward value
+        """
+        # Track the most recent rewards
+        if not hasattr(self, 'last_rewards'):
+            self.last_rewards = []
+        
+        # Keep only the last 10 rewards
+        self.last_rewards.append(reward)
+        if len(self.last_rewards) > 10:
+            self.last_rewards.pop(0)
+        
+        # Check if we received an extreme negative reward (likely from menu penalty)
+        if reward < self.extreme_penalty_threshold:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Extreme negative reward detected: {reward}, likely menu penalty")
+            
+            # Strongly penalize the action that led to this reward
+            self.register_menu_action(action_idx, penalty=0.9) 

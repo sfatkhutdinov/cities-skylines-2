@@ -8,6 +8,8 @@ from typing import Dict, List, Tuple, Any
 from src.config.hardware_config import HardwareConfig
 from .visual_metrics import VisualMetricsEstimator
 import time
+import logging
+import math
 
 class RewardSystem:
     """Reward system for Cities: Skylines 2 agent."""
@@ -296,13 +298,20 @@ class RewardSystem:
         if not in_menu:
             return 0.0
             
-        # Base penalty for being in a menu
-        base_penalty = -0.5
+        # Base penalty for being in a menu (as per user instruction)
+        base_penalty = -1000.0
         
-        # Increase penalty the longer agent stays in menu
+        # More controlled penalty growth to avoid catastrophic learning
         if consecutive_menu_steps > 0:
-            # Exponential penalty growth: starts small and gets increasingly severe
-            growth_factor = min(consecutive_menu_steps / 5.0, 3.0)  # Cap at 3x penalty
-            return base_penalty * (1.0 + growth_factor)
+            # Use a more limited growth factor to prevent extreme values that would break learning
+            # Square root growth provides diminishing returns
+            growth_factor = min(1.0 + 0.5 * math.sqrt(consecutive_menu_steps), 3.0)
+            penalty = base_penalty * growth_factor
+            
+            # Log the penalty for debugging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Menu penalty: {penalty:.2f} (steps: {consecutive_menu_steps}, factor: {growth_factor:.2f})")
+            
+            return penalty
         
         return base_penalty 

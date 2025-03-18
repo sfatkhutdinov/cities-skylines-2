@@ -281,8 +281,8 @@ class VisualMetricsEstimator:
             hist_match = cv2.compareHist(self.menu_reference_hist, frame_hist, cv2.HISTCMP_CORREL)
             logger.debug(f"Histogram match: {hist_match}")
             
-            # Detect menu based on combined scores
-            is_menu = (ssim_score > 0.5) or (hist_match > 0.85)
+            # Detect menu based on combined scores with more stringent thresholds
+            is_menu = (ssim_score > 0.65) or (hist_match > 0.95)
             
             if is_menu:
                 logger.info(f"Menu detected (SSIM: {ssim_score:.2f}, Hist: {hist_match:.2f})")
@@ -312,8 +312,8 @@ class VisualMetricsEstimator:
         top_region = frame_gray[:int(height * 0.1), :]  # Top 10% - where logo appears
         full_frame = frame_gray.copy()
         
-        # Initialize menu indicators
-        menu_indicators = 0
+        # Initialize menu indicators with confidence scores
+        menu_indicators = []
         
         # 1. Check for horizontal lines typical in menu UI
         # Apply edge detection
@@ -329,8 +329,9 @@ class VisualMetricsEstimator:
                     horizontal_lines += 1
         
         if horizontal_lines >= 3:
-            menu_indicators += 1
-            logger.debug(f"Menu indicator: {horizontal_lines} horizontal lines found")
+            score = min(1.0, horizontal_lines / 10.0)  # Score based on number of lines, max 1.0
+            menu_indicators.append(("horizontal_lines", score))
+            logger.debug(f"Menu indicator: {horizontal_lines} horizontal lines found (score: {score:.2f})")
         
         # 2. Check for menu button text (bright text in left region)
         _, left_thresh = cv2.threshold(left_region, 200, 255, cv2.THRESH_BINARY)
@@ -338,16 +339,18 @@ class VisualMetricsEstimator:
         white_ratio = white_pixels / (left_region.shape[0] * left_region.shape[1])
         
         if white_ratio > 0.01:  # At least 1% bright pixels
-            menu_indicators += 1
-            logger.debug(f"Menu indicator: bright text detected in left region ({white_ratio:.3f})")
+            score = min(1.0, white_ratio * 20)  # Scale ratio to score
+            menu_indicators.append(("bright_text", score))
+            logger.debug(f"Menu indicator: bright text detected (ratio: {white_ratio:.3f}, score: {score:.2f})")
         
         # 3. Check for dark overlay (common in menu screens)
         dark_pixels = np.sum(full_frame < 50)  # Count very dark pixels
         dark_ratio = dark_pixels / (height * width)
         
         if dark_ratio > 0.3:  # More than 30% of the screen is very dark
-            menu_indicators += 1
-            logger.debug(f"Menu indicator: dark overlay detected ({dark_ratio:.3f})")
+            score = min(1.0, dark_ratio)  # Use ratio directly as score
+            menu_indicators.append(("dark_overlay", score))
+            logger.debug(f"Menu indicator: dark overlay detected (ratio: {dark_ratio:.3f}, score: {score:.2f})")
         
         # 4. Check for aligned menu button arrangement
         # Look for clusters of white pixels in the left region at regular vertical intervals
@@ -366,16 +369,47 @@ class VisualMetricsEstimator:
             avg_diff = sum(interval_diffs) / len(interval_diffs)
             
             if avg_diff < 15:  # Fairly regular spacing
-                menu_indicators += 1
-                logger.debug(f"Menu indicator: aligned menu buttons detected ({len(peaks)} buttons)")
+                score = min(1.0, len(peaks) / 10.0)  # Score based on number of peaks
+                menu_indicators.append(("aligned_buttons", score))
+                logger.debug(f"Menu indicator: aligned menu buttons detected ({len(peaks)} buttons, score: {score:.2f})")
         
-        # Determine if menu is present based on indicators
-        is_menu = menu_indicators >= 2  # Need at least 2 indicators to confirm menu
+        # 5. NEW: Check for a bordered rectangle (menu container)
+        # Apply edge detection again with different parameters
+        edges2 = cv2.Canny(full_frame, 30, 200)
+        contours, _ = cv2.findContours(edges2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        if is_menu:
-            logger.info(f"Menu detected with {menu_indicators} indicators (heuristic method)")
+        # Look for large rectangular contours
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > (width * height * 0.1):  # At least 10% of screen
+                x, y, w, h = cv2.boundingRect(contour)
+                aspect_ratio = float(w) / h
+                # If it's a reasonable rectangle shape (not too extreme in aspect ratio)
+                if 0.2 < aspect_ratio < 5.0:
+                    rect_score = min(1.0, area / (width * height * 0.5))  # Score based on area
+                    menu_indicators.append(("menu_container", rect_score))
+                    logger.debug(f"Menu indicator: potential menu container found (area: {area}, score: {rect_score:.2f})")
+                    break
+        
+        # Determine if menu is present based on weighted indicators
+        if len(menu_indicators) >= 2:
+            # Calculate overall confidence score
+            total_score = sum(score for _, score in menu_indicators)
+            avg_score = total_score / len(menu_indicators)
+            confidence = avg_score * (1.0 + (len(menu_indicators) - 2) * 0.2)  # Boost for more indicators
             
-        return is_menu
+            # Consider it a menu if we have strong confidence
+            is_menu = confidence > 0.5
+            
+            if is_menu:
+                logger.info(f"Menu detected with {len(menu_indicators)} indicators, confidence: {confidence:.2f}")
+                # Log all indicators
+                for name, score in menu_indicators:
+                    logger.info(f"  - {name}: {score:.2f}")
+            
+            return is_menu
+        
+        return False  # Not enough indicators
 
     def save_current_frame_as_menu_reference(self, frame: torch.Tensor, save_path: str = "menu_reference.png"):
         """Save the current frame as a menu reference image.

@@ -7,6 +7,7 @@ from typing import Tuple, List, Optional
 from pynput.keyboard import Key, Controller as KeyboardController
 from pynput.mouse import Button, Controller as MouseController
 import ctypes
+import pyautogui
 
 # Import Win32 user32 for more direct mouse control
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -54,13 +55,27 @@ class InputSimulator:
         """Find the Cities: Skylines II window handle."""
         game_hwnd = None
         window_titles = [
-            "Cities: Skylines II"
+            "Cities: Skylines II",
+            "Cities Skylines II",
+            "Cities: Skylines",
+            "Cities Skylines"
         ]
+        
+        print("Searching for Cities: Skylines II window...")
         
         def enum_windows_callback(hwnd, _):
             nonlocal game_hwnd
             if win32gui.IsWindowVisible(hwnd):
                 window_text = win32gui.GetWindowText(hwnd)
+                
+                # Skip any windows that look like text editors/IDEs
+                if ("cities skylines" in window_text.lower() and 
+                    any(editor in window_text.lower() for editor in 
+                    ["cursor", "vscode", "editor", ".py", "code", "notepad"])):
+                    print(f"Skipping editor window: '{window_text}'")
+                    return True
+                
+                print(f"Found window: '{window_text}'")
                 for title in window_titles:
                     if title.lower() in window_text.lower():
                         game_hwnd = hwnd
@@ -68,7 +83,7 @@ class InputSimulator:
                         # Get window details for debugging
                         rect = win32gui.GetWindowRect(hwnd)
                         client_rect = win32gui.GetClientRect(hwnd)
-                        print(f"Found window '{window_text}' - Handle: {hwnd}")
+                        print(f"Found game window '{window_text}' - Handle: {hwnd}")
                         print(f"Window rect: {rect}")
                         print(f"Client rect: {client_rect}")
                         
@@ -98,25 +113,33 @@ class InputSimulator:
                 
             return True
         else:
+            print("Game window not found in first pass. Trying fallback approach...")
             # Try matching partial window titles as fallback
             def fallback_enum_callback(hwnd, _):
                 nonlocal game_hwnd
                 if win32gui.IsWindowVisible(hwnd):
                     window_text = win32gui.GetWindowText(hwnd)
-                    if "skylines" in window_text.lower() or "cities" in window_text.lower():
+                    if ("skylines" in window_text.lower() or 
+                        "cities" in window_text.lower() or
+                        "colossal order" in window_text.lower() or
+                        "paradox" in window_text.lower()):
                         game_hwnd = hwnd
-                        print(f"Found fallback window: '{window_text}'")
+                        print(f"Found fallback game window: '{window_text}' - Handle: {hwnd}")
                         return False
                 return True
                 
             # Try fallback search
-            win32gui.EnumWindows(fallback_enum_callback, None)
+            try:
+                win32gui.EnumWindows(fallback_enum_callback, None)
+            except Exception as e:
+                print(f"Error in fallback window search: {str(e)}")
             
             if game_hwnd:
                 self.game_hwnd = game_hwnd
                 return True
-                
-        return False
+            
+            print("Game window not found. Make sure Cities: Skylines II is running and visible.")
+            return False
         
     def ensure_game_window_focused(self) -> bool:
         """Ensure the Cities: Skylines II window is focused and ready for input.
@@ -129,102 +152,171 @@ class InputSimulator:
         
         # First make sure we have the window handle
         if not hasattr(self, 'game_hwnd') or self.game_hwnd is None:
+            print("No game window handle found. Attempting to find game window...")
             if not self.find_game_window():
+                print("Could not find game window. Make sure Cities: Skylines II is running.")
                 return False
                 
-        # Try to focus and bring window to foreground
+        # Try multiple methods to focus window
+        success = False
+        methods_tried = []
+        
+        # Method 1: Standard SetForegroundWindow
         try:
             # Check if window still exists
             if not win32gui.IsWindow(self.game_hwnd):
-                # Window no longer exists
+                print("Window no longer exists. Attempting to find game window again...")
                 self.game_hwnd = None
-                return False
+                return self.ensure_game_window_focused()  # Try again from the beginning
                 
             # Show window if minimized
             if win32gui.IsIconic(self.game_hwnd):
+                print("Game window is minimized. Restoring...")
                 win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
                 time.sleep(0.5)  # Give time for window to restore
-                
-            # Bring window to foreground
+            
+            # Method 1: Try SetForegroundWindow
+            print("Attempting to focus window with SetForegroundWindow...")
             win32gui.SetForegroundWindow(self.game_hwnd)
+            methods_tried.append("SetForegroundWindow")
             
-            # Activate window
-            win32gui.BringWindowToTop(self.game_hwnd)
-            win32gui.SetActiveWindow(self.game_hwnd)
-            
-            # Give time for window to become active
-            time.sleep(0.5)
-            
-            # Verify window is active
-            foreground_hwnd = win32gui.GetForegroundWindow()
-            if foreground_hwnd == self.game_hwnd:
+            # Verify success
+            time.sleep(0.3)
+            if win32gui.GetForegroundWindow() == self.game_hwnd:
+                print("Successfully focused game window")
                 return True
-            else:
-                # As fallback, try Alt+Tab
-                self.key_combination(['alt', 'tab'])
-                time.sleep(0.5)
-                return True
-                
         except Exception as e:
-            print(f"Error focusing window: {e}")
+            print(f"Error using SetForegroundWindow: {e}")
+        
+        # Method 2: Try BringWindowToTop
+        try:
+            print("Attempting to focus window with BringWindowToTop...")
+            win32gui.BringWindowToTop(self.game_hwnd)
+            methods_tried.append("BringWindowToTop")
             
-        return False
+            # Verify success
+            time.sleep(0.3)
+            if win32gui.GetForegroundWindow() == self.game_hwnd:
+                print("Successfully focused game window")
+                return True
+        except Exception as e:
+            print(f"Error using BringWindowToTop: {e}")
+        
+        # Method 3: Try SetActiveWindow
+        try:
+            print("Attempting to focus window with SetActiveWindow...")
+            win32gui.SetActiveWindow(self.game_hwnd)
+            methods_tried.append("SetActiveWindow")
+            
+            # Verify success
+            time.sleep(0.3)
+            if win32gui.GetForegroundWindow() == self.game_hwnd:
+                print("Successfully focused game window")
+                return True
+        except Exception as e:
+            print(f"Error using SetActiveWindow: {e}")
+        
+        # Method 4: Alt+Tab as a fallback approach
+        print("All standard methods failed. Trying Alt+Tab as fallback...")
+        try:
+            self.key_combination(['alt', 'tab'], allow_focus_keys=True)
+            time.sleep(0.5)
+            methods_tried.append("Alt+Tab")
+            
+            # Verify current foreground window
+            foreground_hwnd = win32gui.GetForegroundWindow()
+            foreground_title = win32gui.GetWindowText(foreground_hwnd)
+            print(f"Current foreground window: '{foreground_title}'")
+            
+            if foreground_hwnd == self.game_hwnd:
+                print("Alt+Tab successfully focused game window")
+                return True
+        except Exception as e:
+            print(f"Error using Alt+Tab fallback: {e}")
+        
+        # Fallback: return True to avoid blocking, but warn user
+        print(f"WARNING: Failed to focus game window after trying methods: {', '.join(methods_tried)}")
+        print("Continuing anyway. User may need to manually focus the game window.")
+        return True  # Return True to allow operation to continue
         
     def mouse_move(self, x: int, y: int, relative: bool = False, use_win32: bool = True):
-        """Move mouse to specified coordinates.
+        """Move the mouse to a position.
         
         Args:
             x (int): X coordinate
             y (int): Y coordinate
             relative (bool): If True, move relative to current position
-            use_win32 (bool): If True, use Win32 API directly
+            use_win32 (bool): If True, use win32api for direct positioning
         """
-        # Print current position for debugging
-        curr_x, curr_y = win32api.GetCursorPos()
+        # First call ensure_game_window_focused() to make sure we interact with the game
+        self.ensure_game_window_focused()
         
-        # Calculate target position
-        if hasattr(self, 'screen_capture') and hasattr(self.screen_capture, 'client_position'):
-            # Get client area of game window
-            client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
-            
-            if not relative:
-                # For absolute positioning within game window (x,y are relative to client area)
-                target_x = client_left + x
-                target_y = client_top + y
-            else:
-                # For relative movement
-                target_x = curr_x + x
-                target_y = curr_y + y
-                
-            # Ensure coordinates stay within client area bounds
-            target_x = max(client_left, min(client_right, target_x))
-            target_y = max(client_top, min(client_bottom, target_y))
-        else:
-            # Without client area info, use screen coordinates directly
-            if not relative:
-                target_x = x
-                target_y = y
-            else:
-                target_x = curr_x + x
-                target_y = curr_y + y
-                
-            # Ensure coordinates stay within screen bounds
-            target_x = max(0, min(self.screen_width - 1, target_x))
-            target_y = max(0, min(self.screen_height - 1, target_y))
+        # Get current mouse position
+        current_x, current_y = win32api.GetCursorPos()
         
-        # Use Win32 API for more direct control
-        if use_win32:
-            # Print movement details for debugging
-            print(f"Moving mouse: {curr_x},{curr_y} -> {target_x},{target_y}")
+        # Print movement
+        if not relative:
+            print(f"Moving mouse: {current_x},{current_y} -> {x},{y}")
+        
+        # Verify the coordinates are within screen bounds
+        try:
+            screen_width = win32api.GetSystemMetrics(0)
+            screen_height = win32api.GetSystemMetrics(1)
             
-            # Use Win32 API to set cursor position
-            user32.SetCursorPos(int(target_x), int(target_y))
-        else:
-            # Use pynput as fallback
-            self.mouse.position = (target_x, target_y)
+            # Adjust to be within screen bounds
+            if not relative:
+                x = max(0, min(x, screen_width - 1))
+                y = max(0, min(y, screen_height - 1))
+        except Exception as e:
+            print(f"Warning: Error getting screen metrics: {e}")
+        
+        # For absolute positioning, use direct win32 API for reliability
+        if use_win32 and not relative:
+            try:
+                win32api.SetCursorPos((x, y))
+                # Verify position after setting
+                for attempt in range(3):  # Try up to 3 times
+                    time.sleep(0.05)
+                    new_x, new_y = win32api.GetCursorPos()
+                    if abs(new_x - x) <= 3 and abs(new_y - y) <= 3:
+                        # Position is close enough
+                        break
+                    # Try again
+                    win32api.SetCursorPos((x, y))
+                return
+            except Exception as e:
+                print(f"Win32 mouse positioning error: {e}")
+                # Fall back to alternative methods
+        
+        try:
+            # Determine position
+            if relative:
+                # Get current position
+                current_x, current_y = win32api.GetCursorPos()
+                target_x = current_x + x
+                target_y = current_y + y
+            else:
+                target_x, target_y = x, y
+                
+            # Move mouse with pyautogui for fallback
+            pyautogui.moveTo(target_x, target_y, duration=0.1)
             
-        # Small delay to let the OS process the mouse movement
-        time.sleep(0.01)
+            # Verify final position
+            final_x, final_y = win32api.GetCursorPos()
+            if abs(final_x - target_x) > 5 or abs(final_y - target_y) > 5:
+                # If position is significantly off, try direct win32 setting as last resort
+                try:
+                    win32api.SetCursorPos((target_x, target_y))
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error moving mouse: {e}")
+            # Try direct win32 as last resort
+            try:
+                win32api.SetCursorPos((x, y))
+            except:
+                pass
         
     def mouse_click(self, x: int, y: int, button: str = 'left', double: bool = False):
         """Perform mouse click at specified coordinates.
@@ -384,10 +476,11 @@ class InputSimulator:
             key (str): Key to press
             duration (float): How long to hold the key
         """
-        # Prevent ESC key from being pressed if it's being blocked
-        if hasattr(self, 'block_escape') and self.block_escape and key.lower() in ['escape', 'esc']:
-            print("WARNING: Blocked ESC key press")
-            return False
+        # Completely prevent ESC key from being pressed unless explicitly allowed
+        if key.lower() in ['escape', 'esc']:
+            if hasattr(self, 'block_escape') and self.block_escape:
+                print("WARNING: Blocked ESC key press - using safe menu handling instead")
+                return self.safe_menu_handling()
         
         try:
             # Get the key from the map
@@ -407,12 +500,117 @@ class InputSimulator:
             print(f"Error pressing key {key}: {str(e)}")
             return False
             
-    def key_combination(self, keys: List[str], duration: float = 0.1):
+    def safe_menu_handling(self):
+        """Safely handle menu toggling without using Escape key.
+        Uses alternative methods like clicking menu buttons.
+        
+        Returns:
+            bool: Success status
+        """
+        # Get screen dimensions
+        screen_width, screen_height = self.get_screen_dimensions()
+        
+        # EXACT coordinates provided by user: 720x513
+        primary_resume_button = (720, 513)  # Exact coordinates for RESUME GAME button
+        
+        # Create a more comprehensive grid of positions around the main button
+        # to increase chances of hitting the right spot
+        grid_positions = []
+        for x_offset in range(-30, 31, 10):  # -30 to +30 in steps of 10
+            for y_offset in range(-30, 31, 10):  # -30 to +30 in steps of 10
+                grid_positions.append((
+                    primary_resume_button[0] + x_offset,
+                    primary_resume_button[1] + y_offset
+                ))
+        
+        # Scale coordinates for different resolutions
+        if screen_width != 1920 or screen_height != 1080:
+            x_scale = screen_width / 1920
+            y_scale = screen_height / 1080
+            scaled_positions = []
+            for x, y in grid_positions:
+                scaled_positions.append((int(x * x_scale), int(y * y_scale)))
+        else:
+            # Use exact positions for 1920x1080
+            scaled_positions = grid_positions
+        
+        # Add additional fallback positions with wider coverage
+        additional_positions = [
+            # Center positions
+            (screen_width // 2, screen_height // 2),
+            # Various relative positions for common button placements
+            (int(screen_width * 0.375), int(screen_height * 0.475)),  # ~720x513 in 1920x1080
+            (int(screen_width * 0.37), int(screen_height * 0.47)),
+            (int(screen_width * 0.38), int(screen_height * 0.48)),
+            # Bottom positions (for OK buttons)
+            (int(screen_width * 0.5), int(screen_height * 0.8)),
+            # Try standard button positions
+            (int(screen_width * 0.25), int(screen_height * 0.8)),
+            (int(screen_width * 0.75), int(screen_height * 0.8)),
+        ]
+        
+        # Prioritize primary position and nearby grid, then add fallbacks
+        click_positions = [primary_resume_button] + scaled_positions[:10] + additional_positions
+        
+        print("Attempting to exit menu by clicking RESUME GAME button")
+        
+        # Try positions in two passes with different patterns
+        for attempt in range(2):
+            # First pass tries fewer positions with longer waits
+            # Second pass tries more positions with shorter waits
+            positions_to_try = click_positions[:5] if attempt == 0 else click_positions
+            wait_time = 1.0 if attempt == 0 else 0.3
+            
+            for i, (x, y) in enumerate(positions_to_try):
+                # Ensure coordinates are within screen bounds
+                x = max(0, min(x, screen_width - 1))
+                y = max(0, min(y, screen_height - 1))
+                
+                print(f"Clicking at position {i+1}/{len(positions_to_try)}: ({x}, {y})")
+                
+                # Move to position and click
+                self.mouse_move(x, y, use_win32=True)
+                time.sleep(0.1)  # Small delay before clicking
+                self.mouse_click(x, y)
+                time.sleep(wait_time)  # Wait for click to register
+            
+            # After each pass, try pressing Enter key as an additional option
+            self.key_press('enter', 0.1)
+            time.sleep(0.5)
+            
+            # Try space bar too
+            self.key_press('space', 0.1)
+            time.sleep(0.5)
+        
+        # Reset mouse to center of screen to allow full movement after menu handling
+        print("Resetting mouse to center position")
+        center_x, center_y = screen_width // 2, screen_height // 2
+        self.mouse_move(center_x, center_y, use_win32=True)
+        
+        # Return mouse control to normal
+        return True
+
+    def get_screen_dimensions(self):
+        """Get the dimensions of the game window or screen.
+        
+        Returns:
+            tuple: (width, height)
+        """
+        if self.client_rect:
+            width = self.client_rect[2] - self.client_rect[0]
+            height = self.client_rect[3] - self.client_rect[1]
+            return width, height
+        else:
+            # Fallback to primary monitor resolution
+            return win32api.GetSystemMetrics(0), win32api.GetSystemMetrics(1)
+            
+    def key_combination(self, keys: List[str], duration: float = 0.1, allow_focus_keys: bool = False):
         """Press a combination of keys simultaneously.
         
         Args:
             keys (List[str]): List of key names from key_map
             duration (float): Duration to hold the keys in seconds
+            allow_focus_keys (bool): If True, allow certain dangerous combinations like Alt+Tab when used for window focusing
         """
         # Safety check: prevent dangerous key combinations
         dangerous_combinations = [
@@ -423,11 +621,15 @@ class InputSimulator:
             ['ctrl', 'alt', 'delete']
         ]
         
-        # Check if requested combination contains a dangerous pattern
-        for dangerous_combo in dangerous_combinations:
-            if all(k.lower() in [key.lower() for key in keys] for k in dangerous_combo):
-                print(f"WARNING: Blocked dangerous key combination: {keys}")
-                return False
+        # If allow_focus_keys is True, we won't block alt+tab specifically
+        if allow_focus_keys and len(keys) == 2 and 'alt' in [k.lower() for k in keys] and 'tab' in [k.lower() for k in keys]:
+            print("Allowing Alt+Tab for window focusing")
+        else:
+            # Check if requested combination contains a dangerous pattern
+            for dangerous_combo in dangerous_combinations:
+                if all(k.lower() in [key.lower() for key in keys] for k in dangerous_combo):
+                    print(f"WARNING: Blocked dangerous key combination: {keys}")
+                    return False
         
         # Press all keys
         pressed_keys = []

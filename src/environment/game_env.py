@@ -4,19 +4,19 @@ Handles game interaction, observation, and reward computation.
 """
 
 import torch
-import numpy as np
-from typing import Tuple, Dict, Any, Optional
 import time
+import numpy as np
+import random
+import logging
+from typing import Dict, List, Tuple, Optional, Any
+import os
 from .visual_metrics import VisualMetricsEstimator
 from .reward_system import RewardSystem
 from .optimized_capture import OptimizedScreenCapture
-from src.config.hardware_config import HardwareConfig
 from src.utils.performance_safeguards import PerformanceSafeguards
 from .input_simulator import InputSimulator
-import logging
+from src.config.hardware_config import HardwareConfig
 import win32api
-import random
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,12 @@ class CitiesEnvironment:
         
         # Counter for how long the agent has been stuck in a menu
         self.menu_stuck_counter = 0
-        self.max_menu_penalty = -2.0  # Maximum penalty for being stuck in menu
+        self.max_menu_penalty = -1000.0  # Set as per user instruction to -1000.0
+        
+        # Add menu action suppression
+        self.suppress_menu_actions = False
+        self.menu_action_suppression_steps = 0
+        self.max_menu_suppression_steps = 15  # How long to suppress menu actions after exiting a menu
         
         # For mock mode, create a dummy frame
         if self.mock_mode:
@@ -312,7 +317,7 @@ class CitiesEnvironment:
         return success
     
     def reset(self) -> torch.Tensor:
-        """Reset the environment to initial state.
+        """Reset the environment and return initial observation.
         
         Returns:
             torch.Tensor: Initial observation
@@ -322,23 +327,34 @@ class CitiesEnvironment:
         
         # Reset step counter
         self.steps_taken = 0
+        self.episode_step = 0
+        self.cumulative_reward = 0.0
+        self.done = False
         
-        # Reset menu counter
+        # Reset menu counter and suppression
         self.menu_stuck_counter = 0
+        self.suppress_menu_actions = False
+        self.menu_action_suppression_steps = 0
         
         # In mock mode, just return the mock frame
         if self.mock_mode:
-            self.current_frame = self.screen_capture.capture_frame()
+            logger.info("Using mock environment for testing/training")
+            self.current_frame = torch.rand((3, 224, 224), device=self.config.get_device())
             return self.current_frame
             
         # For real game mode, try to focus the game window
         logger.info("Focusing Cities: Skylines II window...")
         if not self.input_simulator.find_game_window():
-            raise RuntimeError("Cities: Skylines II window not found. Make sure the game is running.")
-                
+            logger.warning("Cities: Skylines II window not found. Make sure the game is running.")
+            logger.warning("Falling back to mock mode for environment testing...")
+            self.mock_mode = True
+            self.current_frame = torch.rand((3, 224, 224), device=self.config.get_device())
+            return self.current_frame
+        
         if not self.input_simulator.ensure_game_window_focused():
-            raise RuntimeError("Could not focus Cities: Skylines II window. Make sure the game window is visible.")
-            
+            logger.warning("Could not focus Cities: Skylines II window. Continuing anyway.")
+            logger.warning("You may need to manually focus the game window for proper interaction.")
+        
         # Capture initial frame
         initial_frame = self.screen_capture.capture_frame()
         
@@ -374,44 +390,43 @@ class CitiesEnvironment:
             menu_attempts += 1
             logger.info(f"Main menu detected during reset (attempt {menu_attempts}/{max_menu_exit_attempts}) - trying to exit")
             
-            # First try: Press Escape key once (only on first attempt)
-            if menu_attempts == 1:
-                logger.info("Trying single Escape key press to exit menu")
-                self.input_simulator.block_escape = False  # Temporarily allow Escape
-                self.input_simulator.key_press('escape')
-                self.input_simulator.block_escape = True   # Re-block Escape
-                time.sleep(0.7)
-                
-                # Check if we're still in menu
-                initial_frame = self.screen_capture.capture_frame()
-                if not self.visual_estimator.detect_main_menu(initial_frame):
-                    logger.info("Successfully exited menu with Escape key")
-                    break
+            # For Cities Skylines II menu, use the exact coordinates for RESUME GAME button
+            logger.info("Clicking RESUME GAME button with exact coordinates (720, 513)")
             
-            # Second try: Click Resume Game button at different positions
-            logger.info("Trying to click 'RESUME GAME' button")
+            # Get screen dimensions for scaling
             width, height = self._get_screen_dimensions()
             
-            # Try several potential positions for the resume game button
-            resume_positions = [
-                (int(width * 0.45), int(height * 0.387)),   # Exact position from screenshot
-                (int(width * 0.452), int(height * 0.39)),   # Slightly adjusted
-                (450, 387),                                 # Absolute coordinates from screenshot
-                (int(width * 0.288), int(height * 0.27)),   # Previous position from logs
-                (int(width * 0.5), int(height * 0.5))       # Center of screen
-            ]
+            # Exact coordinates from user: (720, 513) for 1920x1080 resolution
+            resume_x, resume_y = (720, 513)
             
-            # Try the position corresponding to the current attempt or cycle through positions
-            position_index = min((menu_attempts - 1) % len(resume_positions), len(resume_positions) - 1)
-            resume_x, resume_y = resume_positions[position_index]
+            # Scale for different resolutions
+            if width != 1920 or height != 1080:
+                x_scale = width / 1920
+                y_scale = height / 1080
+                resume_x = int(resume_x * x_scale)
+                resume_y = int(resume_y * y_scale)
+            
+            # Click the button with precision
+            logger.info(f"Clicking at coordinates: ({resume_x}, {resume_y})")
             self.input_simulator.mouse_click(resume_x, resume_y)
-            time.sleep(0.7)
+            time.sleep(1.0)  # Longer delay for reliable click registration
             
             # Update frame to check if we're still in the menu
             initial_frame = self.screen_capture.capture_frame()
+            
+            # If still in menu, try alternative positions
+            if self.visual_estimator.detect_main_menu(initial_frame) and menu_attempts < max_menu_exit_attempts:
+                # Try the input simulator's safe menu handling method which has additional positions
+                logger.info("Still in menu, using safe menu handling with multiple positions")
+                self.input_simulator.safe_menu_handling()
+                time.sleep(1.0)
+                initial_frame = self.screen_capture.capture_frame()
         
         if menu_attempts >= max_menu_exit_attempts:
             logger.warning("Failed to exit menu after multiple attempts - continuing anyway")
+        
+        # Ensure mouse can move freely after menu handling
+        self._reset_mouse_position()
         
         # Capture again after potential menu exit
         self.current_frame = self.screen_capture.capture_frame()
@@ -428,6 +443,16 @@ class CitiesEnvironment:
             self.test_mouse_freedom()
         
         return self.current_frame
+    
+    def _reset_mouse_position(self):
+        """Reset mouse to a neutral position to ensure free movement."""
+        # Move mouse to center of screen to ensure free movement
+        width, height = self._get_screen_dimensions()
+        center_x, center_y = width // 2, height // 2
+        
+        logger.info(f"Resetting mouse to center position ({center_x}, {center_y})")
+        self.input_simulator.mouse_move(center_x, center_y)
+        time.sleep(0.5)  # Short delay to ensure mouse movement completes
     
     def _ensure_game_running(self):
         """Make sure game is not paused. Press space if it is."""
@@ -536,6 +561,16 @@ class CitiesEnvironment:
         
         action_info = self.actions[action_index]
         
+        # Check if we should suppress menu-opening actions
+        if self.suppress_menu_actions and action_info.get("type") == "time" and action_info.get("action") == "open_pause_menu":
+            logger.info("Suppressing menu-opening action due to recent menu exit")
+            # Replace with a harmless action like waiting
+            harmless_actions = [i for i, a in enumerate(self.actions) if a.get("type") == "time" and a.get("action") == "wait_short"]
+            if harmless_actions:
+                action_index = harmless_actions[0]
+                action_info = self.actions[action_index]
+                logger.info(f"Replaced with action: {action_info}")
+        
         # Now execute the selected action
         self._execute_action(action_info)
         self.last_action_time = time.time()
@@ -600,6 +635,8 @@ class CitiesEnvironment:
         
         # Apply menu penalty if a menu is detected
         menu_detected = self.visual_estimator.detect_main_menu(self.current_frame)
+        menu_penalty = 0.0
+        
         if menu_detected:
             # Increment the counter for consecutive menu steps
             self.menu_stuck_counter += 1
@@ -612,9 +649,55 @@ class CitiesEnvironment:
             
             reward += menu_penalty
             logger.info(f"Applied menu penalty: {menu_penalty} (consecutive menu steps: {self.menu_stuck_counter}, total reward: {reward})")
+            
+            # Try to exit the menu immediately to prevent getting stuck
+            if self.menu_stuck_counter > 1:
+                logger.info("Stuck in menu for multiple steps - attempting to exit")
+                
+                # Click directly on the RESUME GAME button with exact coordinates
+                width, height = self._get_screen_dimensions()
+                
+                # Exact coordinates from user: (720, 513) for 1920x1080 resolution
+                resume_x, resume_y = (720, 513)
+                
+                # Scale for different resolutions
+                if width != 1920 or height != 1080:
+                    x_scale = width / 1920
+                    y_scale = height / 1080
+                    resume_x = int(resume_x * x_scale)
+                    resume_y = int(resume_y * y_scale)
+                    
+                logger.info(f"Clicking RESUME GAME at coordinates: ({resume_x}, {resume_y})")
+                self.input_simulator.mouse_click(resume_x, resume_y)
+                time.sleep(1.0)
+                
+                # If still in menu, try the safe handling method
+                if self.visual_estimator.detect_main_menu(self.screen_capture.capture_frame()):
+                    self.input_simulator.safe_menu_handling()
+                
+                # Reset mouse position after trying to exit menu
+                self._reset_mouse_position()
         else:
+            # If we just exited a menu, handle transition properly
+            if self.menu_stuck_counter > 0:
+                logger.info("Successfully exited menu - restoring normal gameplay")
+                # Reset mouse to allow free movement
+                self._reset_mouse_position()
+                
+                # Enable menu action suppression for a while
+                self.suppress_menu_actions = True
+                self.menu_action_suppression_steps = self.max_menu_suppression_steps
+                logger.info(f"Enabling menu action suppression for {self.max_menu_suppression_steps} steps")
+            
             # Reset the menu counter when not in menu
             self.menu_stuck_counter = 0
+            
+            # Decrement suppression counter if active
+            if self.suppress_menu_actions:
+                self.menu_action_suppression_steps -= 1
+                if self.menu_action_suppression_steps <= 0:
+                    self.suppress_menu_actions = False
+                    logger.info("Menu action suppression ended")
         
         # Check if episode should terminate (using step limit for now)
         done = self.steps_taken >= self.max_steps
@@ -665,6 +748,24 @@ class CitiesEnvironment:
     
     def _handle_camera_action(self, action: str):
         """Execute camera movement actions using default game key bindings."""
+        # Get screen dimensions
+        width, height = self._get_screen_dimensions()
+        # Calculate center and margins
+        center_x, center_y = width // 2, height // 2
+        margin = 100  # Pixels from edge to avoid
+        
+        # Random offsets for more varied camera movements
+        rand_x = random.randint(-100, 100)
+        rand_y = random.randint(-100, 100)
+        
+        # Make center slightly randomized to prevent getting stuck in patterns
+        center_x += rand_x
+        center_y += rand_y
+        
+        # Ensure center stays within safe bounds
+        center_x = max(margin, min(width - margin, center_x))
+        center_y = max(margin, min(height - margin, center_y))
+        
         # Handle basic movement with keys according to default keybindings
         if action == "move_up":
             self.input_simulator.key_press('w', duration=0.1)
@@ -711,9 +812,22 @@ class CitiesEnvironment:
             self.input_simulator.key_press('f', duration=0.1)
         # Rotation with Q/E per default bindings
         elif action == "rotate_left":
+            # Mix key press with mouse rotation for more varied movement
             self.input_simulator.key_press('q', duration=0.1)
+            # Also try mouse-based rotation for variety
+            if random.random() > 0.5:  # 50% chance to use mouse rotation
+                self.input_simulator.rotate_camera(
+                    center_x, center_y, 
+                    center_x - 200, center_y
+                )
         elif action == "rotate_right":
             self.input_simulator.key_press('e', duration=0.1)
+            # Also try mouse-based rotation for variety
+            if random.random() > 0.5:  # 50% chance to use mouse rotation
+                self.input_simulator.rotate_camera(
+                    center_x, center_y, 
+                    center_x + 200, center_y
+                )
         # Orbital camera movements (combined rotation and movement)
         elif action == "orbit_left":
             # Press rotate left and move left
@@ -741,6 +855,10 @@ class CitiesEnvironment:
             self.input_simulator.key_press('a', duration=0.2)
         elif action == "pan_right":
             self.input_simulator.key_press('d', duration=0.2)
+        
+        # Reset mouse position occasionally to prevent getting stuck
+        if random.random() > 0.8:  # 20% chance
+            self._reset_mouse_position()
     
     def _handle_build_action(self, action: str):
         """Execute building actions."""
@@ -907,24 +1025,34 @@ class CitiesEnvironment:
             self._place_building(center_x + 75, center_y - 75)
     
     def _handle_service_action(self, action: str):
-        """Execute service building actions."""
-        # Get screen resolution
-        if hasattr(self.screen_capture, 'client_position'):
-            client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
-            # Calculate window dimensions
-            width = client_right - client_left
-            height = client_bottom - client_top
-            # Calculate center (relative to client area)
-            center_x = width // 2
-            center_y = height // 2
-        else:
+        """Handle service building placement actions.
+        
+        Args:
+            action (str): Service action name
+        """
+        try:
+            screen_width, screen_height = self._get_screen_dimensions()
+            center_x, center_y = screen_width // 2, screen_height // 2
+        except Exception:
             # Fall back to system metrics
             screen_width = win32api.GetSystemMetrics(0)
             screen_height = win32api.GetSystemMetrics(1)
             center_x, center_y = screen_width // 2, screen_height // 2
         
-        # Use Escape to cancel any current actions (default keybinding)
-        self.input_simulator.key_press('escape')
+        # IMPORTANT: Don't directly use ESC which triggers menus
+        # Instead of: self.input_simulator.key_press('escape')
+        # First check if we're in a menu before doing anything
+        frame = self.screen_capture.capture_frame()
+        menu_detected = self.visual_estimator.detect_main_menu(frame)
+        
+        if menu_detected:
+            logger.info("Menu detected, attempting to exit menu using safe method")
+            self.input_simulator.safe_menu_handling()
+            time.sleep(0.5)
+            return
+            
+        # For service actions, we'll use the corresponding keyboard shortcuts
+        # instead of navigating through menus
         time.sleep(0.2)
         
         if action == "police":
@@ -1244,22 +1372,33 @@ class CitiesEnvironment:
             logger.error(f"Error during drag operation: {e}")
     
     def _place_building(self, x: int, y: int):
-        """Place a building at the specified coordinates.
+        """Place a building at the given coordinates."""
+        # Add random variation to prevent getting stuck
+        rand_x = random.randint(-20, 20)
+        rand_y = random.randint(-20, 20)
         
-        Args:
-            x, y: Coordinates for building placement
-        """
-        try:
-            # Move to position
-            self.input_simulator.mouse_move(x, y)
-            time.sleep(0.3)
-            
-            # Click to place
-            self.input_simulator.mouse_click(x, y, button='left')
-            time.sleep(0.3)
-            
-        except Exception as e:
-            logger.error(f"Error during building placement: {e}")
+        # Add variation to coordinates
+        x += rand_x
+        y += rand_y
+        
+        # Get screen dimensions to ensure we stay in bounds
+        width, height = self._get_screen_dimensions()
+        margin = 50  # Pixels from edge to avoid
+        
+        # Ensure coordinates stay within screen bounds
+        x = max(margin, min(width - margin, x))
+        y = max(margin, min(height - margin, y))
+        
+        # Move to position
+        self.input_simulator.mouse_move(x, y)
+        time.sleep(0.2)
+        
+        # Click to place
+        self.input_simulator.mouse_click(x, y)
+        time.sleep(0.2)
+        
+        # Reset mouse position to center after placement
+        self._reset_mouse_position()
     
     def _update_performance_metrics(self):
         """Update performance tracking metrics."""
@@ -1297,37 +1436,83 @@ class CitiesEnvironment:
         return None
 
     def test_mouse_freedom(self):
-        """Test mouse movement across the entire game window.
-        Useful for debugging mouse constraints."""
-        if hasattr(self.screen_capture, 'client_position'):
+        """Test mouse freedom by moving to different positions on the screen.
+        This helps verify the mouse can reach all parts of the game window.
+        """
+        if not hasattr(self.screen_capture, 'client_position'):
+            logger.warning("Client position not available, using system metrics")
+            width = win32api.GetSystemMetrics(0)
+            height = win32api.GetSystemMetrics(1)
+        else:
             client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
             width = client_right - client_left
             height = client_bottom - client_top
+        
+        logger.info(f"Testing mouse freedom across game window ({width}x{height})")
+        
+        # Define a grid of test points
+        test_points = [
+            (0, 0),                    # Top-left
+            (width // 2, 0),           # Top-center
+            (width - 1, 0),            # Top-right
+            (0, height // 2),          # Middle-left
+            (width // 2, height // 2), # Center
+            (width - 1, height // 2),  # Middle-right
+            (0, height - 1),           # Bottom-left
+            (width // 2, height - 1),  # Bottom-center
+            (width - 1, height - 1),   # Bottom-right
+        ]
+        
+        # First ensure we can focus the window
+        success = self.input_simulator.ensure_game_window_focused()
+        if not success:
+            logger.error("Failed to focus game window for mouse freedom test")
+            return False
             
-            print(f"\nTesting mouse freedom across game window ({width}x{height})")
-            
-            # Get 9 points distributed across the window
-            points = [
-                (0, 0),                    # top-left
-                (width//2, 0),             # top-center
-                (width-1, 0),              # top-right
-                (0, height//2),            # mid-left
-                (width//2, height//2),     # center
-                (width-1, height//2),      # mid-right
-                (0, height-1),             # bottom-left
-                (width//2, height-1),      # bottom-center
-                (width-1, height-1)        # bottom-right
-            ]
-            
-            # Move to each point with a delay
-            for i, (x, y) in enumerate(points):
-                print(f"Moving to point {i+1}/9: ({x}, {y})")
-                self.input_simulator.mouse_move(x, y)
-                time.sleep(0.5)
+        # Record current position to return to at the end
+        current_x, current_y = win32api.GetCursorPos()
+        
+        try:
+            # Move to each test point with verification
+            for i, (x, y) in enumerate(test_points):
+                # Ensure coordinates are within bounds
+                x = max(0, min(x, width - 1))
+                y = max(0, min(y, height - 1))
                 
-            # Return to center
-            self.input_simulator.mouse_move(width//2, height//2)
-            print("Mouse freedom test completed\n")
+                print(f"Moving to point {i+1}/{len(test_points)}: ({x}, {y})")
+                
+                # First attempt
+                current_pos = win32api.GetCursorPos()
+                print(f"Moving mouse: {current_pos[0]},{current_pos[1]} -> {x},{y}")
+                
+                # Use Win32 direct positioning for reliability
+                self.input_simulator.mouse_move(x, y, use_win32=True)
+                time.sleep(0.2)  # Wait for movement to complete
+                
+                # Verify position
+                new_pos = win32api.GetCursorPos()
+                if abs(new_pos[0] - x) > 5 or abs(new_pos[1] - y) > 5:
+                    logger.warning(f"Mouse position verification failed: Expected ({x},{y}), got ({new_pos[0]},{new_pos[1]})")
+                    # Try again with direct positioning
+                    win32api.SetCursorPos((x, y))
+                    time.sleep(0.2)
+            
+            # Return to center position
+            center_x, center_y = width // 2, height // 2
+            print(f"Moving mouse: {win32api.GetCursorPos()[0]},{win32api.GetCursorPos()[1]} -> {center_x},{center_y}")
+            self.input_simulator.mouse_move(center_x, center_y, use_win32=True)
+            
+            print("Mouse freedom test completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during mouse freedom test: {str(e)}")
+            # Attempt to restore cursor position
+            try:
+                win32api.SetCursorPos((current_x, current_y))
+            except:
+                pass
+            return False
 
     def _handle_ui_action(self, action: str):
         """Execute UI exploration actions."""

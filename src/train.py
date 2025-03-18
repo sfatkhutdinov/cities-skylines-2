@@ -86,6 +86,10 @@ def collect_trajectory(
     episode_reward = 0
     episode_length = 0
     
+    # Track previous actions and their results for menu detection
+    previous_action_idx = None
+    was_in_menu = False
+    
     for _ in range(max_steps):
         # Convert state to tensor if it's not already
         if not isinstance(state, torch.Tensor):
@@ -100,6 +104,28 @@ def collect_trajectory(
         action_idx = action.item()
         action_info = env.actions[action_idx]
         next_state, reward, done, info = env.step(action_idx)
+        
+        # Update agent's tracking of rewards for this action
+        agent.update_from_reward(action_idx, reward)
+        
+        # Check if we transitioned into a menu and register the action that caused it
+        current_in_menu = info.get('menu_detected', False)
+        
+        if current_in_menu and not was_in_menu and previous_action_idx is not None:
+            # We just entered a menu, and we know the action that did it
+            logger.warning(f"Detected menu transition after action {previous_action_idx} ({env.actions[previous_action_idx]})")
+            
+            # Register the action with the agent to avoid it in the future
+            # Increased penalty from 0.7 to 0.8 for more aggressive avoidance
+            agent.register_menu_action(previous_action_idx, penalty=0.8)
+        
+        # Store current menu state for next iteration
+        was_in_menu = current_in_menu
+        previous_action_idx = action_idx
+        
+        # Decay menu penalties occasionally to allow for exploration
+        if episode_length % 25 == 0:  # More frequent decay (was 50)
+            agent.decay_menu_penalties()
         
         # Store experience
         states.append(state)
@@ -116,6 +142,16 @@ def collect_trajectory(
         # Log interesting actions (UI exploration)
         if action_info["type"] in ["ui", "ui_position"]:
             logger.info(f"UI Action: {action_info}")
+        
+        # If we get an extremely negative reward, log and consider early termination
+        if reward < -500:
+            logger.warning(f"Extremely negative reward: {reward} - possible menu penalty")
+            
+            # If we're stuck in a menu for too long (10+ steps), try to reset
+            if info.get('menu_stuck_counter', 0) > 10:
+                logger.error(f"Stuck in menu for {info.get('menu_stuck_counter')} steps - forcing exit")
+                # Try clicking the resume button more aggressively
+                env.input_simulator.safe_menu_handling()
         
         if done:
             break
@@ -286,6 +322,35 @@ def train():
             env, agent, args.max_steps
         )
         logger.info(f"Collected trajectory - Length: {episode_length}, Reward: {episode_reward:.2f}")
+        
+        # Check if episode ended stuck in a menu
+        if experiences.get('info', {}).get('menu_detected', False):
+            logger.warning("Episode ended while stuck in a menu - taking corrective action")
+            
+            # Try clicking the RESUME GAME button directly with exact coordinates
+            width, height = env._get_screen_dimensions()
+            
+            # Exact coordinates from user: (720, 513) for 1920x1080 resolution
+            resume_x, resume_y = (720, 513)
+            
+            # Scale for different resolutions
+            if width != 1920 or height != 1080:
+                x_scale = width / 1920
+                y_scale = height / 1080
+                resume_x = int(resume_x * x_scale)
+                resume_y = int(resume_y * y_scale)
+            
+            logger.info(f"Clicking RESUME GAME at exact coordinates: ({resume_x}, {resume_y})")
+            
+            # Click multiple times with delays
+            for _ in range(3):
+                env.input_simulator.mouse_click(resume_x, resume_y)
+                time.sleep(1.0)
+            
+            # If still in menu, try the safe handling method
+            if env.visual_estimator.detect_main_menu(env.screen_capture.capture_frame()):
+                logger.info("Still in menu, trying safe menu handling method")
+                env.input_simulator.safe_menu_handling()
         
         # Update agent
         metrics = agent.update()
