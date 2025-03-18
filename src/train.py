@@ -7,17 +7,36 @@ import logging
 import threading
 import argparse
 import traceback
+import datetime
 from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import torch
+import wandb
+from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 
 from pynput import keyboard
 
-from src.env import CitiesEnvironment
-from src.agent import PPOAgent, PPOConfig
-from src.utils import setup_logging, load_config, current_timestamp
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import modules
+from environment.game_env import CitiesEnvironment
+from agent.ppo_agent import PPOAgent
+from config.hardware_config import HardwareConfig
+
+# Define helper functions
+def current_timestamp():
+    """Return a formatted timestamp string for the current time."""
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Add a watchdog timer to force-kill the program if it becomes unresponsive
 class WatchdogTimer:
@@ -131,16 +150,6 @@ if platform.system() == 'Windows':
         logger.info("Windows-specific Ctrl+C handler registered")
     except Exception as e:
         logger.warning(f"Failed to register Windows Ctrl+C handler: {e}")
-
-# Set up logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
 
 logger.debug("Starting script...")
 
@@ -277,7 +286,7 @@ def collect_trajectory(
     max_steps: int,
     device: torch.device,
     args: argparse.Namespace
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, Dict]:
     """Collect a trajectory of experience."""
     # Reset watchdog timer at the start of trajectory collection
     if 'watchdog' in globals():
@@ -292,6 +301,7 @@ def collect_trajectory(
     values = []
     dones = []
     total_reward = 0.0
+    last_info = {}
     
     # Get initial state and create frame history
     state = env.reset()
@@ -311,6 +321,7 @@ def collect_trajectory(
         
         # Execute action in environment
         next_state, reward, done, info = env.step(action.item())
+        last_info = info  # Store the last info dictionary
         total_reward += reward
         
         # Update frame history for next state
@@ -334,7 +345,7 @@ def collect_trajectory(
         if done:
             break
     
-    return states, actions, log_probs, rewards, values, dones, next_states, total_reward
+    return states, actions, log_probs, rewards, values, dones, next_states, total_reward, last_info
 
 def find_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint file in the given directory."""
@@ -458,7 +469,7 @@ def main():
         
         # Configuration log
         logger.info(f"Using device: {config.device}")
-        config.log_gpu_info()  # Log GPU information
+        # GPU information is already logged in the HardwareConfig initialization
         
         # Create environment
         logger.info("Initializing environment...")
@@ -477,7 +488,10 @@ def main():
         
         # Create agent
         logger.info("Initializing agent...")
-        agent = PPOAgent(config, env.num_actions)
+        agent = PPOAgent(config)
+        
+        # Ensure checkpoint directory exists
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
         
         # Try to capture menu screenshot if requested
         if args.capture_menu:
@@ -485,10 +499,10 @@ def main():
             env.capture_menu_reference("menu_reference.png")
             
         # Set up model compilation if PyTorch version supports it (2.0+)
-        if hasattr(torch, 'compile') and hasattr(agent.policy, 'model'):
+        if hasattr(torch, 'compile') and hasattr(agent.network, 'model'):
             logger.info("Applying PyTorch 2.0 model compilation")
             try:
-                agent.policy.model = torch.compile(agent.policy.model)
+                agent.network.model = torch.compile(agent.network.model)
             except Exception as e:
                 logger.warning(f"Module compilation failed: {e}")
         
@@ -572,7 +586,7 @@ def main():
             
             # Collect trajectory
             trajectory_start_time = time.time()
-            states, actions, log_probs, rewards, values, dones, next_states, episode_reward = collect_trajectory(
+            states, actions, log_probs, rewards, values, dones, next_states, episode_reward, last_info = collect_trajectory(
                 env=env,
                 agent=agent,
                 max_steps=args.max_steps,
@@ -633,8 +647,12 @@ def main():
                 logger.info("Exit flag detected, stopping training")
                 break
             
-            # Check if episode ended stuck in a menu
-            if experiences.get('info', {}).get('menu_detected', False):
+            # Check if episode ended stuck in a menu - using last_info from trajectory
+            menu_detected = False
+            if last_info and last_info.get('menu_detected', False):
+                menu_detected = True
+            
+            if menu_detected:
                 logger.warning("Episode ended while stuck in a menu - taking corrective action")
                 
                 # Try clicking the RESUME GAME button directly with exact coordinates
@@ -665,7 +683,9 @@ def main():
             # Save checkpoint if best reward
             if episode_reward > best_reward:
                 best_reward = episode_reward
-                agent.save(checkpoint_dir / "best_model.pt")
+                # Create checkpoint directory if it doesn't exist
+                checkpoint_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+                agent.save(checkpoint_path)
                 logger.info(f"Saved new best model with reward: {best_reward:.2f}")
             
             # Add a delay between episodes to prevent system resource issues
@@ -676,7 +696,7 @@ def main():
                 watchdog.reset()
         
         # Save final model
-        agent.save(checkpoint_dir / "final_model.pt")
+        agent.save(os.path.join(args.checkpoint_dir, "final_model.pt"))
         logger.info("Saved final model")
         env.close()
         logger.info("Training completed")
