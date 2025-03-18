@@ -304,206 +304,127 @@ class StateDensityEstimator:
 class TemporalAssociationMemory:
     """Tracks associations between actions, states, and outcomes over time."""
     
-    def __init__(self, config: HardwareConfig, history_length=100):
+    def __init__(self, feature_dim: int = 512, history_size: int = 1000, device=None):
         """Initialize temporal association memory.
         
         Args:
-            config (HardwareConfig): Hardware configuration
-            history_length (int): Number of recent frames to keep for analysis
+            feature_dim: Dimension of feature embeddings
+            history_size: Maximum number of experiences to store
+            device: Torch device for computations
         """
-        self.config = config
-        self.device = config.get_device()
-        self.dtype = config.get_dtype()
+        self.feature_dim = feature_dim
+        self.history_size = history_size
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Store recent observations, actions, and outcomes
-        self.frame_history = deque(maxlen=history_length)
-        self.action_history = deque(maxlen=history_length)
-        self.visual_change_history = deque(maxlen=history_length)
+        # Memory buffers for experiences
+        self.state_buffer = [] 
+        self.action_buffer = []
+        self.next_state_buffer = []
+        self.reward_buffer = []
         
-        # Initialize the visual change analyzer
-        self.visual_change_analyzer = VisualChangeAnalyzer()
+        # Learned associations
+        self.action_effect_model = nn.Sequential(
+            nn.Linear(feature_dim + 1, 128),  # +1 for action index
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, feature_dim)
+        ).to(self.device)
         
-        # For detecting UI elements 
-        self.color_clusters = {
-            'red': np.array([0, 0, 255], dtype=np.float32),  # BGR format
-            'green': np.array([0, 255, 0], dtype=np.float32),
-            'blue': np.array([255, 0, 0], dtype=np.float32),
-            'yellow': np.array([0, 255, 255], dtype=np.float32),
-            'white': np.array([255, 255, 255], dtype=np.float32)
-        }
+        self.optimizer = torch.optim.Adam(self.action_effect_model.parameters(), lr=0.001)
         
-        # Initialize counters for color associations
-        self.color_outcome_associations = {
-            'red': {'positive': 0, 'negative': 0},
-            'green': {'positive': 0, 'negative': 0},
-            'blue': {'positive': 0, 'negative': 0},
-            'yellow': {'positive': 0, 'negative': 0},
-            'white': {'positive': 0, 'negative': 0}
-        }
-        
-    def update(self, frame: torch.Tensor, action: int, next_frame: torch.Tensor):
-        """Update temporal memory with new observation.
+    def update(self, state_features: torch.Tensor, action_idx: int, next_state_features: torch.Tensor, reward: float = 0.0):
+        """Update memory with new experience.
         
         Args:
-            frame (torch.Tensor): Current frame
-            action (int): Action taken
-            next_frame (torch.Tensor): Next frame
+            state_features: Features of current state
+            action_idx: Action taken
+            next_state_features: Features of next state
+            reward: Observed reward (optional)
         """
-        # Store frame and action
-        frame_np = frame.detach().cpu().numpy()
-        next_frame_np = next_frame.detach().cpu().numpy()
-        
-        self.frame_history.append(frame_np)
-        self.action_history.append(action)
-        
-        # Compute visual change
-        if len(self.frame_history) > 1:
-            visual_change = self._compute_visual_change(frame_np, next_frame_np)
-            self.visual_change_history.append(visual_change)
+        # Ensure tensors are detached from computation graph
+        if state_features is not None:
+            state_features = state_features.detach().cpu()
+        if next_state_features is not None:
+            next_state_features = next_state_features.detach().cpu()
             
-            # Update color associations
-            self._update_color_associations(frame_np, visual_change)
+        # Store experience
+        self.state_buffer.append(state_features)
+        self.action_buffer.append(action_idx)
+        self.next_state_buffer.append(next_state_features)
+        self.reward_buffer.append(reward)
+        
+        # Maintain buffer size limit
+        if len(self.state_buffer) > self.history_size:
+            self.state_buffer.pop(0)
+            self.action_buffer.pop(0)
+            self.next_state_buffer.pop(0)
+            self.reward_buffer.pop(0)
+            
+        # Learn from experiences periodically
+        if len(self.state_buffer) % 50 == 0 and len(self.state_buffer) >= 100:
+            self._learn_associations()
     
-    def _compute_visual_change(self, frame1: np.ndarray, frame2: np.ndarray) -> float:
-        """Compute visual change between frames.
+    def _learn_associations(self):
+        """Learn to predict state transitions based on collected experiences."""
+        if len(self.state_buffer) < 100:
+            return
+            
+        # Sample batch of experiences
+        batch_size = min(64, len(self.state_buffer))
+        indices = np.random.choice(len(self.state_buffer), batch_size, replace=False)
+        
+        # Prepare batch
+        states = torch.stack([self.state_buffer[i] for i in indices]).to(self.device)
+        actions = torch.tensor([self.action_buffer[i] for i in indices], 
+                              dtype=torch.float32).unsqueeze(1).to(self.device)
+        next_states = torch.stack([self.next_state_buffer[i] for i in indices]).to(self.device)
+        
+        # Combine state and action
+        state_action = torch.cat([states, actions], dim=1)
+        
+        # Predict next state
+        predicted_delta = self.action_effect_model(state_action)
+        predicted_next_state = states + predicted_delta
+        
+        # Compute loss
+        loss = F.mse_loss(predicted_next_state, next_states)
+        
+        # Update model
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+    
+    def compute_association(self, state_features: torch.Tensor, action_idx: int, next_state_features: torch.Tensor) -> torch.Tensor:
+        """Compute how expected/consistent a transition is based on learned associations.
         
         Args:
-            frame1 (np.ndarray): First frame
-            frame2 (np.ndarray): Second frame
+            state_features: Features of current state
+            action_idx: Action taken
+            next_state_features: Features of next state
             
         Returns:
-            float: Visual change score (-1 to 1, positive = improvement)
+            torch.Tensor: Association score (higher = more expected/consistent)
         """
-        # Convert tensors to numpy arrays if needed
-        if torch.is_tensor(frame1):
-            frame1 = frame1.cpu().numpy()
-        if torch.is_tensor(frame2):
-            frame2 = frame2.cpu().numpy()
+        with torch.no_grad():
+            # Combine state and action
+            state_action = torch.cat([
+                state_features, 
+                torch.tensor([[float(action_idx)]], device=state_features.device)
+            ], dim=1)
             
-        # Ensure correct channel ordering (from PyTorch's CHW to OpenCV's HWC)
-        if frame1.shape[0] == 3:  # If channels are first
-            frame1 = np.transpose(frame1, (1, 2, 0))
-        if frame2.shape[0] == 3:  # If channels are first
-            frame2 = np.transpose(frame2, (1, 2, 0))
+            # Predict next state
+            predicted_delta = self.action_effect_model(state_action)
+            predicted_next_state = state_features + predicted_delta
             
-        # Convert to grayscale
-        current_gray = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
-        previous_gray = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
-        
-        # Compute structural similarity
-        score, diff = ssim(previous_gray, current_gray, full=True, data_range=1.0)
-        
-        # Convert diff to numpy array (0-1 range)
-        diff_image = (1.0 - diff)
-        
-        # Compute visual change magnitude
-        change_magnitude = np.mean(np.abs(diff_image))
-        
-        # Get predicted outcome based on visual patterns
-        if len(self.frame_history) > 100:  # Only start using the analyzer after some experience
-            # Get the predicted outcome for this visual change
-            predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_image)
+            # Compute prediction error
+            prediction_error = F.mse_loss(predicted_next_state, next_state_features)
             
-            # Blend prediction with base magnitude (initially rely more on magnitude)
-            blend_factor = min(len(self.frame_history) / 10000.0, 0.8)  # Up to 80% from prediction
-            change_score = (1 - blend_factor) * change_magnitude * 5.0 + blend_factor * predicted_outcome
-        else:
-            change_score = change_magnitude * 5.0
-        
-        # Store the visual change for later analysis
-        if len(self.visual_change_history) >= 5:  # Wait for some outcomes to be available
-            # Use the average outcome over next few steps as the "true" outcome
-            past_outcomes = np.mean([o for o in list(self.visual_change_history)[-5:]])
-            # Update the analyzer with this pattern->outcome pair
-            self.visual_change_analyzer.update_association(diff_image, past_outcomes)
-        
-        # Store the current change score to correlate with future outcomes
-        self.visual_change_history.append(change_score)
-        
-        # Return signed change value in range [-1, 1]
-        return np.clip(change_score, -1.0, 1.0)
-    
-    def _update_color_associations(self, frame: np.ndarray, change_score: float):
-        """Update associations between colors and outcomes.
-        
-        Args:
-            frame (np.ndarray): Frame to analyze
-            change_score (float): Change score (positive = good outcome)
-        """
-        # Convert to BGR for color analysis
-        if len(frame.shape) == 3:
-            frame_bgr = frame.transpose(1, 2, 0)
-        else:
-            return  # Can't analyze colors without RGB channels
-        
-        # Count pixels of each color
-        for color_name, color_value in self.color_clusters.items():
-            # Create color mask
-            lower = color_value * 0.8  # Allow some variation
-            upper = color_value * 1.2
-            mask = cv2.inRange(frame_bgr, lower, upper)
-            color_pixels = np.sum(mask > 0)
+            # Convert to association score (inverse of error)
+            # Normalize to 0-1 range with exponential scaling
+            association_score = torch.exp(-5.0 * prediction_error)
             
-            # If significant presence of this color
-            if color_pixels > (frame_bgr.shape[0] * frame_bgr.shape[1] * 0.01):  # At least 1% of pixels
-                # Update association based on outcome
-                if change_score > 0.05:  # Significant positive change
-                    self.color_outcome_associations[color_name]['positive'] += 1
-                elif change_score < -0.05:  # Significant negative change
-                    self.color_outcome_associations[color_name]['negative'] += 1
-    
-    def evaluate_stability(self, current_frame: torch.Tensor, previous_frames: List[torch.Tensor]) -> float:
-        """Evaluate stability of game state over time.
-        
-        Args:
-            current_frame (torch.Tensor): Current frame
-            previous_frames (List[torch.Tensor]): Previous frames
-            
-        Returns:
-            float: Stability score (higher = more stable with positive indicators)
-        """
-        if len(previous_frames) < 5:  # Need sufficient history
-            return 0.0
-            
-        # Extract learned color preferences
-        color_preferences = {}
-        for color_name, counts in self.color_outcome_associations.items():
-            total = counts['positive'] + counts['negative']
-            if total > 0:
-                preference = (counts['positive'] - counts['negative']) / total
-                color_preferences[color_name] = preference
-        
-        # Apply learned preferences to current frame
-        current_np = current_frame.detach().cpu().numpy()
-        if len(current_np.shape) == 3:
-            current_bgr = current_np.transpose(1, 2, 0)
-        else:
-            return 0.0
-            
-        weighted_score = 0.0
-        total_weight = 0.0
-        
-        # For each color we've learned about
-        for color_name, preference in color_preferences.items():
-            color_value = self.color_clusters[color_name]
-            
-            # Create color mask
-            lower = color_value * 0.8
-            upper = color_value * 1.2
-            mask = cv2.inRange(current_bgr, lower, upper)
-            color_pixels = np.sum(mask > 0) / (current_bgr.shape[0] * current_bgr.shape[1])
-            
-            # Weight by preference and prevalence
-            weighted_score += preference * color_pixels
-            total_weight += abs(preference) * color_pixels
-        
-        # Normalize score
-        if total_weight > 0:
-            stability_score = weighted_score / total_weight
-        else:
-            stability_score = 0.0
-            
-        return stability_score
+            return association_score
 
 
 class ActionOutcomeTracker:
@@ -638,53 +559,49 @@ class VisualChangeAnalyzer:
 class AutonomousRewardSystem:
     """Autonomous reward system that learns to provide rewards without explicit game metrics."""
     
-    def __init__(self, config: HardwareConfig):
+    def __init__(self, config: HardwareConfig, history_length: int = 100):
         """Initialize the autonomous reward system.
         
         Args:
-            config (HardwareConfig): Hardware configuration
+            config: Hardware configuration
+            history_length: Length of history to maintain
         """
         self.config = config
         self.device = config.get_device()
         self.dtype = config.get_dtype()
         
-        # World model for prediction and novelty detection
-        self.world_model = WorldModelCNN(config)
+        # Initialize world model for prediction
+        self.world_model = WorldModelCNN(config).to(self.device)
         
-        # State density estimator for novelty detection
-        self.density_estimator = StateDensityEstimator(feature_dim=512)
+        # Initialize temporal memory
+        self.frame_history = deque(maxlen=history_length)
+        self.action_history = deque(maxlen=history_length)
+        self.visual_change_history = deque(maxlen=history_length)
         
-        # Temporal association memory for action-outcome associations
-        self.association_memory = TemporalAssociationMemory(config)
+        # Feature embedding and state density tracking
+        self.feature_extractor = self.world_model.encoder
+        self.density_estimator = StateDensityEstimator(
+            feature_dim=512,  # Output size of feature extractor
+            history_size=2000,
+            device=self.device
+        )
+        
+        # Temporal association memory
+        self.association_memory = TemporalAssociationMemory(
+            feature_dim=512,
+            history_size=1000,
+            device=self.device
+        )
+        
+        # Intrinsic motivation components
+        self.reward_history = []
+        self.reward_scale = 1.0
+        self.reward_shift = 0.0
+        self.max_menu_penalty = -10.0
+        self.max_history_length = history_length
         
         # Visual change analyzer for pattern recognition
         self.visual_change_analyzer = VisualChangeAnalyzer(memory_size=1000)
-        
-        # Track history for predicting outcomes
-        self.frame_history = []
-        self.max_history_length = 5
-        
-        # Feature extractor for state representations
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 9 * 7, 512),  # Assuming input resolution is 320x240
-            nn.ReLU()
-        ).to(self.device, dtype=self.dtype)
-        
-        # Adaptive normalization parameters
-        self.reward_scale = 1.0
-        self.reward_shift = 0.0
-        self.reward_history = []
-        self.history_size = 1000
-        
-        # Default max menu penalty
-        self.max_menu_penalty = -20.0
         
     def compute_reward(self, prev_frame: np.ndarray, action_idx: int, curr_frame: np.ndarray) -> float:
         """Compute reward based on visual changes without using domain knowledge.
@@ -882,7 +799,7 @@ class AutonomousRewardSystem:
                 curr_features = self.world_model.encode_frame(curr_frame)
                 
             # Compute association score
-            score = self.association_memory.evaluate_stability(curr_features, [prev_features])
+            score = self.association_memory.compute_association(prev_features, action_idx, curr_features)
             
             # Update association memory
             self.association_memory.update(prev_features, action_idx, curr_features)
@@ -952,4 +869,108 @@ class AutonomousRewardSystem:
         # Escalate much faster based on consecutive steps
         escalation_factor = min(consecutive_menu_steps * 0.5, 10.0)  # Faster escalation, up to 10x
         
-        return base_penalty * (1.0 + escalation_factor) 
+        return base_penalty * (1.0 + escalation_factor)
+
+    def _compute_visual_change(self, frame1: np.ndarray, frame2: np.ndarray) -> float:
+        """Compute visual change between frames.
+        
+        Args:
+            frame1 (np.ndarray): First frame
+            frame2 (np.ndarray): Second frame
+            
+        Returns:
+            float: Visual change score (-1 to 1, positive = improvement)
+        """
+        # Convert tensors to numpy arrays if needed
+        if torch.is_tensor(frame1):
+            frame1 = frame1.cpu().numpy()
+        if torch.is_tensor(frame2):
+            frame2 = frame2.cpu().numpy()
+            
+        # Ensure correct channel ordering (from PyTorch's CHW to OpenCV's HWC)
+        if frame1.shape[0] == 3:  # If channels are first
+            frame1 = np.transpose(frame1, (1, 2, 0))
+        if frame2.shape[0] == 3:  # If channels are first
+            frame2 = np.transpose(frame2, (1, 2, 0))
+            
+        # Convert to grayscale
+        current_gray = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+        previous_gray = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
+        
+        # Compute structural similarity
+        score, diff = ssim(previous_gray, current_gray, full=True, data_range=1.0)
+        
+        # Convert diff to numpy array (0-1 range)
+        diff_image = (1.0 - diff)
+        
+        # Compute visual change magnitude
+        change_magnitude = np.mean(np.abs(diff_image))
+        
+        # Get predicted outcome based on visual patterns
+        if len(self.frame_history) > 100:  # Only start using the analyzer after some experience
+            # Get the predicted outcome for this visual change
+            predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_image)
+            
+            # Blend prediction with base magnitude (initially rely more on magnitude)
+            blend_factor = min(len(self.frame_history) / 10000.0, 0.8)  # Up to 80% from prediction
+            change_score = (1 - blend_factor) * change_magnitude * 5.0 + blend_factor * predicted_outcome
+        else:
+            change_score = change_magnitude * 5.0
+        
+        # Store the visual change for later analysis
+        if len(self.visual_change_history) >= 5:  # Wait for some outcomes to be available
+            # Use the average outcome over next few steps as the "true" outcome
+            past_outcomes = np.mean([o for o in list(self.visual_change_history)[-5:]])
+            # Update the analyzer with this pattern->outcome pair
+            self.visual_change_analyzer.update_association(diff_image, past_outcomes)
+        
+        # Store the current change score to correlate with future outcomes
+        self.visual_change_history.append(change_score)
+        
+        # Return signed change value in range [-1, 1]
+        return np.clip(change_score, -1.0, 1.0)
+    
+    def evaluate_stability(self, current_frame: torch.Tensor, previous_frames: List[torch.Tensor]) -> float:
+        """Evaluate stability and novelty of game state using unsupervised learning.
+        
+        This method uses learned feature representations to evaluate state novelty and stability.
+        
+        Args:
+            current_frame: Current frame
+            previous_frames: Previous frames
+            
+        Returns:
+            float: Stability/novelty score
+        """
+        if not previous_frames:
+            return 0.0
+            
+        try:
+            # Extract features from current and previous frames
+            with torch.no_grad():
+                current_features = self.world_model.encode_frame(current_frame)
+                prev_features = [self.world_model.encode_frame(f) for f in previous_frames[-5:]]
+            
+            # Compute novelty (distance from previous states)
+            novelty_scores = []
+            for prev_feat in prev_features:
+                dist = F.mse_loss(current_features, prev_feat)
+                novelty_scores.append(dist.item())
+            
+            # Average novelty (higher = more different from previous states)
+            avg_novelty = sum(novelty_scores) / len(novelty_scores) if novelty_scores else 0
+            
+            # Scale to reasonable reward range (-0.5 to 0.5)
+            # Some novelty is good (exploration), too much is bad (random/unstable)
+            if avg_novelty < 0.01:  # Too similar = stuck
+                score = -0.2  # Slight negative
+            elif avg_novelty < 0.1:  # Good range of novelty
+                score = 0.3  # Positive reward
+            else:  # Too much change = unstable
+                score = -0.4  # More negative
+                
+            return score
+            
+        except Exception as e:
+            logger.error(f"Error computing stability: {e}")
+            return 0.0 
