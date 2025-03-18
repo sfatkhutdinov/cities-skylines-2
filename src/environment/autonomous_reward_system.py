@@ -150,6 +150,22 @@ class WorldModelCNN(nn.Module):
         encoded = self.encoder(prev)
         predicted = self.frame_predictor(encoded)
         
+        # Ensure tensors have the same shape before computing loss
+        # Get the shapes of both tensors
+        pred_shape = predicted.shape
+        curr_shape = curr.shape
+        
+        # If shapes don't match, resize the predicted frame to match the current frame
+        # This is consistent with how _compute_prediction_error handles it
+        if pred_shape != curr_shape:
+            print(f"Resizing predicted tensor to match current frame: {pred_shape} -> {curr_shape}")
+            predicted = F.interpolate(
+                predicted, 
+                size=(curr_shape[2], curr_shape[3]),
+                mode='bilinear',
+                align_corners=False
+            )
+        
         # Compute loss (MSE between predicted and actual)
         loss = F.mse_loss(predicted, curr)
         
