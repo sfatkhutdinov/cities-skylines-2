@@ -804,11 +804,27 @@ class CitiesEnvironment:
             width, height = self._get_screen_dimensions()
             center_x, center_y = width // 2, height // 2
             
-            # Get coordinates from action_info or use center of screen
-            x = action_info.get("x", center_x)
-            y = action_info.get("y", center_y)
-            
-            if action == "click":
+            # Get position from action_info - try both "position" tuple and separate "x"/"y" coordinates
+            position = action_info.get("position", None)
+            if position:
+                x, y = position
+            else:
+                # If no position tuple, try to get separate x and y coordinates
+                x = action_info.get("x", None)
+                y = action_info.get("y", None)
+                
+                # If no x/y coordinates provided, generate random positions rather than using center
+                if x is None or y is None:
+                    # Use random positions within the main game area (avoiding edges)
+                    margin = 100  # pixels from edge
+                    x = random.randint(margin, width - margin)
+                    y = random.randint(margin, height - margin)
+                    logger.debug(f"Generated random position: ({x}, {y})")
+                    
+            if action == "move":
+                self.input_simulator.mouse_move(x, y)
+                logger.debug(f"Mouse moved to ({x}, {y})")
+            elif action == "click":
                 self.input_simulator.mouse_click(x, y, button=button)
                 logger.debug(f"Mouse {button} click at ({x}, {y})")
             elif action == "double_click":
@@ -816,8 +832,16 @@ class CitiesEnvironment:
                 logger.debug(f"Mouse {button} double click at ({x}, {y})")
             elif action == "scroll":
                 direction = action_info.get("direction", 0)
+                # Move mouse to position first, then scroll
+                self.input_simulator.mouse_move(x, y)
                 self.input_simulator.mouse_scroll(direction)
-                logger.debug(f"Mouse scroll: {direction}")
+                logger.debug(f"Mouse scroll: {direction} at ({x}, {y})")
+            elif action == "drag":
+                # For drag, we need start and end positions
+                end_x = action_info.get("end_x", x + random.randint(-100, 100))
+                end_y = action_info.get("end_y", y + random.randint(-100, 100))
+                self.input_simulator.mouse_drag(x, y, end_x, end_y)
+                logger.debug(f"Mouse drag from ({x}, {y}) to ({end_x}, {end_y})")
             return
             
         # For other action types, extract the action
