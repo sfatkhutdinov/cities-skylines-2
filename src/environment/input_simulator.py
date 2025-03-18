@@ -497,31 +497,58 @@ class InputSimulator:
         
         Args:
             key (str): Key to press
-            duration (float): Duration to hold the key in seconds. If None, uses speed-based duration.
+            duration (float): Duration to press key in seconds. If None, use default duration.
         """
-        try:
-            # Convert key to virtual key code
-            if key in self.key_map:
-                key = self.key_map[key]
+        # Safety check for dangerous keys
+        dangerous_keys = ['escape', 'esc']
+        if self.block_escape and key.lower() in dangerous_keys:
+            print(f"WARNING: Blocking dangerous escape key press")
+            return False
             
-            # Use speed-based duration if none specified
-            if duration is None:
-                duration = self.key_press_duration
+        # Block function keys that could invoke browser features or other system actions
+        if key.lower() in ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12']:
+            print(f"WARNING: Blocking function key: {key}")
+            return False
+            
+        # Check if ctrl is currently pressed
+        ctrl_pressed = False
+        try:
+            if hasattr(self.keyboard, '_pressed'):
+                ctrl_pressed = any(k in self.keyboard._pressed for k in [Key.ctrl, Key.ctrl_l, Key.ctrl_r])
+        except:
+            pass
+            
+        # Prevent Ctrl+C, Ctrl+Z, and other potential termination combinations
+        if ctrl_pressed and key.lower() in ['c', 'z', 'q', 'w']:
+            print(f"WARNING: Blocking potential termination key combo Ctrl+{key}")
+            # Release Ctrl keys to be safe
+            try:
+                self.keyboard.release(Key.ctrl)
+                self.keyboard.release(Key.ctrl_l)
+                self.keyboard.release(Key.ctrl_r)
+            except:
+                pass
+            return False
+            
+        # Use the default duration if none specified
+        if duration is None:
+            duration = self.key_press_duration
+            
+        try:
+            mapped_key = self.key_map.get(key.lower(), key)
             
             # Press key
-            self.keyboard.press(key)
-            
-            # Wait for specified duration
+            self.keyboard.press(mapped_key)
             time.sleep(duration)
+            self.keyboard.release(mapped_key)
             
-            # Release key
-            self.keyboard.release(key)
-            
-            # Add small delay after key press - use speed-based verification delay
+            # Add verification delay to ensure key is registered
             time.sleep(self.verification_delay)
             
+            return True
         except Exception as e:
-            print(f"Error in key_press: {e}")
+            print(f"Error pressing key {key}: {e}")
+            return False
             
     def safe_menu_handling(self):
         """Safely handle menu toggling without using Escape key.
@@ -640,19 +667,32 @@ class InputSimulator:
             ['alt', 'tab'],
             ['alt', 'f4'],
             ['ctrl', 'w'],
+            ['ctrl', 'c'],  # Block Ctrl+C explicitly
+            ['ctrl', 'z'],  # Block Ctrl+Z (undo) which could cancel actions
+            ['ctrl', 'q'],  # Block Ctrl+Q (quit in many applications)
             ['alt', 'escape'],
-            ['ctrl', 'alt', 'delete']
+            ['ctrl', 'alt', 'delete'],
+            ['windows'],    # Block Windows key
+            ['meta'],       # Block Meta/Windows key
         ]
         
+        # Convert all keys to lowercase for case-insensitive comparison
+        lower_keys = [k.lower() for k in keys]
+        
         # If allow_focus_keys is True, we won't block alt+tab specifically
-        if allow_focus_keys and len(keys) == 2 and 'alt' in [k.lower() for k in keys] and 'tab' in [k.lower() for k in keys]:
+        if allow_focus_keys and len(keys) == 2 and 'alt' in lower_keys and 'tab' in lower_keys:
             print("Allowing Alt+Tab for window focusing")
         else:
             # Check if requested combination contains a dangerous pattern
             for dangerous_combo in dangerous_combinations:
-                if all(k.lower() in [key.lower() for key in keys] for k in dangerous_combo):
+                if all(k.lower() in lower_keys for k in dangerous_combo):
                     print(f"WARNING: Blocked dangerous key combination: {keys}")
                     return False
+                    
+            # Also check for modifier+key combinations that could be dangerous
+            if 'ctrl' in lower_keys and any(k in lower_keys for k in ['c', 'z', 'q', 'w']):
+                print(f"WARNING: Blocked potentially dangerous ctrl combination: {keys}")
+                return False
         
         # Press all keys
         pressed_keys = []
