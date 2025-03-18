@@ -20,7 +20,7 @@ class OptimizedScreenCapture:
         self.dtype = config.get_dtype()
         
         # Get resolution from config if available
-        height, width = getattr(config, 'resolution', (240, 320))
+        width, height = getattr(config, 'resolution', (1920, 1080))
         
         # Pre-allocate tensors for frame processing
         # Use the configured resolution for processing
