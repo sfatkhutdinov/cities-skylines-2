@@ -19,6 +19,7 @@ from src.config.hardware_config import HardwareConfig
 import win32api
 from .menu_handler import MenuHandler
 from src.utils.image_utils import ImageUtils
+import cv2
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class CitiesEnvironment:
         """
         self.config = config or HardwareConfig()
         self.mock_mode = mock_mode
+        self.device = self.config.get_device()
         
         # Initialize components
         self.screen_capture = OptimizedScreenCapture(self.config)
@@ -323,7 +325,7 @@ class CitiesEnvironment:
         if self.mock_mode:
             logger.info("Using mock environment")
             # Create mock observation with correct channel/dimension order [C, H, W]
-            self.current_frame = torch.rand(3, 180, 320, device=self.config.get_device())
+            self.current_frame = torch.rand(3, 180, 320, device=self.device)
             return self.current_frame
             
         # For real game mode, try to focus the game window
@@ -332,7 +334,7 @@ class CitiesEnvironment:
             logger.warning("Cities: Skylines II window not found. Make sure the game is running.")
             logger.warning("Falling back to mock mode for environment testing...")
             self.mock_mode = True
-            self.current_frame = torch.rand((3, 224, 224), device=self.config.get_device())
+            self.current_frame = torch.rand((3, 224, 224), device=self.device)
             return self.current_frame
         
         if not self.input_simulator.ensure_game_window_focused():
@@ -512,7 +514,7 @@ class CitiesEnvironment:
             if frame is None:
                 logger.error("Frame capture failed again, returning zeros")
                 # Return a black frame with appropriate dimensions
-                return torch.zeros((3, 180, 320), device=self.config.get_device())
+                return torch.zeros((3, 180, 320), device=self.device)
         
         return frame
     
@@ -531,6 +533,27 @@ class CitiesEnvironment:
         # Track for menu detection later
         self.last_action_idx = action_idx
         
+        # Mock mode implementation
+        if self.mock_mode:
+            # Generate a random new state (just noise)
+            next_state = torch.rand(3, 180, 320, device=self.device)
+            self.current_frame = next_state
+            
+            # Random reward between -0.1 and 0.5
+            reward = (torch.rand(1, device=self.device).item() * 0.6) - 0.1
+            
+            # Small chance of episode termination (1%)
+            done = torch.rand(1, device=self.device).item() < 0.01
+            
+            # Generate mock info
+            info = {
+                "menu_detected": False,
+                "action_success": True,
+                "mock": True
+            }
+            
+            return next_state, reward, done, info
+        
         # Get action details from action space
         if action_idx < 0 or action_idx >= len(self.actions):
             logger.warning(f"Invalid action index: {action_idx}, using random action")
@@ -539,7 +562,7 @@ class CitiesEnvironment:
         action_info = self.actions[action_idx]
         
         # Check if we are in a menu and need to avoid certain actions
-        if not self.mock_mode and self.steps_taken % self.detect_menu_every_n_steps == 0:
+        if self.steps_taken % self.detect_menu_every_n_steps == 0:
             menu_detected = self.check_menu_state()
             
             if menu_detected:
@@ -983,3 +1006,36 @@ class CitiesEnvironment:
             reward = 0.01 if success else -0.01
             
         return reward
+
+    def _process_frame(self, frame: np.ndarray) -> torch.Tensor:
+        """Process a frame for the agent.
+        
+        Args:
+            frame (np.ndarray): Raw BGR frame
+            
+        Returns:
+            torch.Tensor: Processed frame tensor
+        """
+        if frame is None:
+            # Return zeros if frame capture failed
+            return torch.zeros((3, 180, 320), device=self.device)
+            
+        # Convert BGR to RGB if needed
+        if frame.shape[2] == 3:  # If it has 3 channels, assume BGR (OpenCV default)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+        # Resize frame (if not already at target resolution)
+        if frame.shape[0] != 180 or frame.shape[1] != 320:
+            frame = cv2.resize(frame, (320, 180))
+            
+        # Normalize pixel values to [0,1]
+        frame = frame.astype(np.float32) / 255.0
+        
+        # Convert to PyTorch tensor
+        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1)  # HWC to CHW
+        
+        # Move to device
+        if frame_tensor.device != self.device:
+            frame_tensor = frame_tensor.to(self.device)
+            
+        return frame_tensor

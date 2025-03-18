@@ -7,6 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ConvBlock(nn.Module):
     """Optimized convolutional block with batch normalization."""
@@ -34,7 +37,7 @@ class OptimizedNetwork(nn.Module):
         super(OptimizedNetwork, self).__init__()
         
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)
+        logger.info(f"Initializing network on device: {self.device}")
         
         # Handle different types of input shapes
         if isinstance(input_shape, tuple) and len(input_shape) >= 3:
@@ -64,15 +67,22 @@ class OptimizedNetwork(nn.Module):
                 nn.ReLU()
             )
             
-            # Calculate the size of the flattened features after convolution
-            conv_output_size = self._calculate_conv_output_size(in_channels, height, width)
-            
+            # Create a dummy input tensor to calculate output size
+            with torch.no_grad():
+                dummy_input = torch.zeros(1, in_channels, height, width)
+                dummy_output = self.conv_layers(dummy_input)
+                conv_output_size = int(np.prod(dummy_output.shape))
+                logger.info(f"Conv output size: {conv_output_size}")
+                
             # Shared feature layers
             self.shared_layers = nn.Sequential(
                 nn.Linear(conv_output_size, 512),
                 nn.ReLU()
             )
         else:
+            # For vector inputs, we won't use conv layers
+            self.conv_layers = nn.Identity()
+            
             # Fully connected network for vector inputs
             self.shared_layers = nn.Sequential(
                 nn.Linear(width, 256),
@@ -95,16 +105,19 @@ class OptimizedNetwork(nn.Module):
             nn.Linear(256, 1)
         )
         
-        # Initialize weights
+        # Initialize weights before moving to device
         self.apply(self._init_weights)
         
-    def _calculate_conv_output_size(self, in_channels, height, width):
-        """Calculate the size of the flattened features after convolution."""
-        # Use a dummy tensor to calculate the output size
-        dummy_input = torch.zeros(1, in_channels, height, width)
-        dummy_output = self.conv_layers(dummy_input)
-        return int(np.prod(dummy_output.shape))
+        # Move all components to the specified device after creating all layers
+        self.to(self.device)
+        logger.info(f"Network moved to device: {self.device}")
         
+        # Verify that all components are on the correct device
+        for name, module in self.named_children():
+            for param_name, param in module.named_parameters():
+                if param.device != self.device:
+                    logger.warning(f"Parameter {name}.{param_name} is on {param.device}, not {self.device}")
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through the network.
         
@@ -114,26 +127,26 @@ class OptimizedNetwork(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (action_probs, value)
         """
-        # Ensure input is on the correct device
-        x = x.to(self.device)
-        
-        # Get batch size and reshape if necessary
-        if len(x.shape) == 3 and self.is_visual_input:  # For images: [C, H, W]
-            x = x.unsqueeze(0)  # Add batch dimension
-        elif len(x.shape) == 1 and not self.is_visual_input:  # For vectors: [D]
-            x = x.unsqueeze(0)  # Add batch dimension
+        # Ensure input is on the correct device 
+        if x.device != self.device:
+            x = x.to(self.device)
             
-        # Process based on input type
+        # Handle batch dimension for visual inputs
         if self.is_visual_input:
+            # Check if batch dimension is missing
+            if len(x.shape) == 3:  # [C, H, W]
+                x = x.unsqueeze(0)  # Add batch dimension -> [1, C, H, W]
+                
             # Pass through convolutional layers
             x = self.conv_layers(x)
             
-            # Flatten
-            x = x.view(x.size(0), -1)
+            # Flatten the features but keep batch dimension
+            x = x.reshape(x.size(0), -1)
         else:
-            # For vector inputs, no convolutional processing needed
-            pass
-            
+            # For vector inputs
+            if len(x.shape) == 1:  # [D]
+                x = x.unsqueeze(0)  # Add batch dimension -> [1, D]
+                
         # Pass through shared layers
         features = self.shared_layers(x)
         
@@ -144,7 +157,10 @@ class OptimizedNetwork(nn.Module):
         # Apply softmax to get probabilities
         action_probs = torch.softmax(action_logits, dim=1)
         
-        return action_probs, value.squeeze(-1)
+        # Squeeze value if needed
+        value = value.squeeze(-1)
+        
+        return action_probs, value
         
     def get_action_probs(self, x: torch.Tensor) -> torch.Tensor:
         """Get action probabilities for a state.

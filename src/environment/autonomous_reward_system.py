@@ -16,6 +16,7 @@ import cv2
 from skimage.metrics import structural_similarity as ssim
 from scipy.spatial import KDTree
 import os
+from src.environment.visual_change_analyzer import VisualChangeAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,8 @@ class DensityEstimator:
         self.history_size = history_size
         self.device = device
         self.state_memory = []
+        # Alias state_memory as memory for compatibility
+        self.memory = self.state_memory
         self.mean_vector = None
         self.std_vector = None
         
@@ -300,6 +303,9 @@ class DensityEstimator:
         if len(self.state_memory) > self.history_size:
             self.state_memory.pop(0)
             
+        # Update the memory alias
+        self.memory = self.state_memory
+            
         # Update statistics periodically
         if len(self.state_memory) % 50 == 0:
             self._update_statistics()
@@ -344,14 +350,15 @@ class DensityEstimator:
             self.history_size = state_dict['history_size']
             
             # Load state memory and move to device if needed
-            self.state_memory = []
-            for state in state_dict['state_memory']:
-                if self.device is not None:
-                    self.state_memory.append(state.to(self.device))
-                else:
-                    self.state_memory.append(state)
-                    
-            # Load statistics if they exist
+            if self.device is not None:
+                self.state_memory = [state.to(self.device) for state in state_dict['state_memory']]
+            else:
+                self.state_memory = state_dict['state_memory']
+                
+            # Update the memory alias
+            self.memory = self.state_memory
+                
+            # Load other components
             if state_dict['mean_vector'] is not None:
                 self.mean_vector = state_dict['mean_vector']
                 if self.device is not None:
@@ -364,9 +371,10 @@ class DensityEstimator:
                     
             logger.info(f"Loaded density estimator state with {len(self.state_memory)} memory entries")
         except Exception as e:
-            logger.error(f"Failed to load density estimator state: {str(e)}")
-            # Initialize fresh if loading fails
+            logger.error(f"Error loading density estimator state: {e}")
+            # Initialize with empty memory
             self.state_memory = []
+            self.memory = self.state_memory
             self.mean_vector = None
             self.std_vector = None
 
@@ -390,6 +398,10 @@ class TemporalAssociationMemory:
         self.feature_memory = []
         self.outcome_memory = []
         
+        # Aliases for compatibility with visual change analyzer interface
+        self.pattern_memory = self.feature_memory
+        self.outcomes_memory = self.outcome_memory
+        
         # For optimized retrieval
         self.kdtree = None
         self.last_update_size = 0
@@ -408,10 +420,18 @@ class TemporalAssociationMemory:
         self.feature_memory.append(feature_cpu)
         self.outcome_memory.append(outcome)
         
+        # Update aliases
+        self.pattern_memory = self.feature_memory
+        self.outcomes_memory = self.outcome_memory
+        
         # Keep memory within size limit
         if len(self.feature_memory) > self.history_size:
             self.feature_memory.pop(0)
             self.outcome_memory.pop(0)
+            
+            # Update aliases again after removal
+            self.pattern_memory = self.feature_memory
+            self.outcomes_memory = self.outcome_memory
             
         # Flag that we need to rebuild kd-tree for efficient retrieval
         self.kdtree = None
@@ -534,6 +554,10 @@ class TemporalAssociationMemory:
             self.feature_memory = state_dict['feature_memory']
             self.outcome_memory = state_dict['outcome_memory']
             
+            # Update aliases
+            self.pattern_memory = self.feature_memory
+            self.outcomes_memory = self.outcome_memory
+            
             # Reset KD-tree to be rebuilt on next query
             self.kdtree = None
             self.last_update_size = 0
@@ -544,6 +568,11 @@ class TemporalAssociationMemory:
             # Initialize fresh if loading fails
             self.feature_memory = []
             self.outcome_memory = []
+            
+            # Update aliases
+            self.pattern_memory = self.feature_memory
+            self.outcomes_memory = self.outcome_memory
+            
             self.kdtree = None
             self.last_update_size = 0
 
@@ -594,89 +623,6 @@ class ActionOutcomeTracker:
         return self.action_outcomes[action]
 
 
-class VisualChangeAnalyzer:
-    """Analyzes visual changes and learns to associate them with outcomes."""
-    
-    def __init__(self, memory_size=1000):
-        """Initialize visual change analyzer.
-        
-        Args:
-            memory_size (int): Number of patterns to store
-        """
-        self.pattern_memory = []
-        self.outcome_memory = []
-        self.memory_size = memory_size
-        
-    def update_association(self, pattern: np.ndarray, outcome: float):
-        """Update association between pattern and outcome.
-        
-        Args:
-            pattern (np.ndarray): Visual change pattern
-            outcome (float): Observed outcome
-        """
-        # Downsample pattern for memory efficiency
-        h, w = pattern.shape
-        downsampled = cv2.resize(pattern, (w//4, h//4))
-        flattened = downsampled.flatten()
-        
-        # Store pattern and outcome
-        self.pattern_memory.append(flattened)
-        self.outcome_memory.append(outcome)
-        
-        # Limit memory size
-        if len(self.pattern_memory) > self.memory_size:
-            self.pattern_memory.pop(0)
-            self.outcome_memory.pop(0)
-    
-    def predict_outcome(self, pattern: np.ndarray) -> float:
-        """Predict outcome for pattern.
-        
-        Args:
-            pattern (np.ndarray): Visual change pattern
-            
-        Returns:
-            float: Predicted outcome
-        """
-        if not self.pattern_memory:
-            return 0.0
-            
-        # Downsample pattern
-        h, w = pattern.shape
-        downsampled = cv2.resize(pattern, (w//4, h//4))
-        flattened = downsampled.flatten()
-        
-        # Find k nearest neighbors
-        k = min(5, len(self.pattern_memory))
-        distances = []
-        
-        for stored_pattern in self.pattern_memory:
-            # Ensure dimensions match
-            if len(stored_pattern) != len(flattened):
-                continue
-                
-            # Compute distance
-            distance = np.linalg.norm(stored_pattern - flattened)
-            distances.append(distance)
-            
-        if not distances:
-            return 0.0
-            
-        # Find k smallest distances
-        indices = np.argsort(distances)[:k]
-        
-        # Weight by inverse distance
-        weights = [1.0 / (distances[i] + 1e-6) for i in indices]
-        total_weight = sum(weights)
-        
-        if total_weight == 0:
-            return 0.0
-            
-        # Weighted average of outcomes
-        prediction = sum(weights[i] * self.outcome_memory[indices[i]] for i in range(k)) / total_weight
-        
-        return prediction
-
-
 class AutonomousRewardSystem:
     """Autonomous reward system that learns to provide rewards without explicit game metrics."""
     
@@ -724,96 +670,63 @@ class AutonomousRewardSystem:
         # Visual change analyzer for pattern recognition
         self.visual_change_analyzer = VisualChangeAnalyzer(memory_size=1000)
     
-    def save_state(self, checkpoint_dir: str) -> bool:
-        """Save the entire reward system state to disk.
+    def save_state(self, path_prefix: str):
+        """Save the state of the reward system for later resumption.
         
         Args:
-            checkpoint_dir: Directory to save state files to
-            
-        Returns:
-            bool: True if successful, False if any component failed to save
+            path_prefix (str): Prefix path to save the state files
         """
         try:
-            # Create checkpoint directory if it doesn't exist
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            
-            # Save reward system metadata
-            metadata = {
-                'reward_scale': self.reward_scale,
-                'reward_shift': self.reward_shift,
-                'reward_history': self.reward_history,
-                'max_menu_penalty': self.max_menu_penalty,
-                'max_history_length': self.max_history_length
-            }
-            torch.save(metadata, os.path.join(checkpoint_dir, 'reward_system_metadata.pt'))
-            
-            # Save neural network components
-            torch.save(self.world_model.state_dict(), os.path.join(checkpoint_dir, 'world_model.pt'))
-            
-            # Save memory components
-            self.density_estimator.save_state(os.path.join(checkpoint_dir, 'density_estimator.pt'))
-            self.association_memory.save_state(os.path.join(checkpoint_dir, 'association_memory.pt'))
-            self.visual_change_analyzer.save_state(os.path.join(checkpoint_dir, 'visual_change_analyzer.pkl'))
-            
-            logger.info(f"Successfully saved reward system state to {checkpoint_dir}")
-            return True
+            # Save density estimator state if available
+            if hasattr(self, 'density_estimator') and self.density_estimator is not None:
+                density_path = f"{path_prefix}_density.pkl"
+                self.density_estimator.save_state(density_path)
+                logger.info(f"Saved density estimator state with {len(self.density_estimator.state_memory)} memory entries")
+                
+            # Save temporal association memory if available
+            if hasattr(self, 'association_memory') and self.association_memory is not None:
+                temp_assoc_path = f"{path_prefix}_temp_assoc.pkl"
+                self.association_memory.save_state(temp_assoc_path)
+                logger.info(f"Saved temporal association memory with {len(self.association_memory.feature_memory)} entries")
+                
+            # Save visual change analyzer if available
+            if hasattr(self, 'visual_change_analyzer') and self.visual_change_analyzer is not None:
+                visual_change_path = f"{path_prefix}_visual_change.pkl"
+                self.visual_change_analyzer.save_state(visual_change_path)
+                logger.info(f"Saved visual change analyzer state with {len(self.visual_change_analyzer.pattern_memory)} patterns")
+                
         except Exception as e:
             logger.error(f"Failed to save reward system state: {str(e)}")
-            return False
-    
-    def load_state(self, checkpoint_dir: str) -> bool:
-        """Load the entire reward system state from disk.
+        
+    def load_state(self, path_prefix: str):
+        """Load the state of the reward system from saved files.
         
         Args:
-            checkpoint_dir: Directory to load state files from
-            
-        Returns:
-            bool: True if successful, False if any component failed to load
+            path_prefix (str): Prefix path where state files are saved
         """
         try:
-            # Check if checkpoint directory exists
-            if not os.path.exists(checkpoint_dir):
-                logger.warning(f"Checkpoint directory does not exist: {checkpoint_dir}")
-                return False
-            
-            # Load reward system metadata
-            metadata_path = os.path.join(checkpoint_dir, 'reward_system_metadata.pt')
-            if os.path.exists(metadata_path):
-                metadata = torch.load(metadata_path, map_location='cpu')
-                self.reward_scale = metadata['reward_scale']
-                self.reward_shift = metadata['reward_shift']
-                self.reward_history = metadata['reward_history']
-                self.max_menu_penalty = metadata['max_menu_penalty']
-                self.max_history_length = metadata['max_history_length']
-                logger.info(f"Loaded reward system metadata with {len(self.reward_history)} historical rewards")
-            
-            # Load neural network components
-            world_model_path = os.path.join(checkpoint_dir, 'world_model.pt')
-            if os.path.exists(world_model_path):
-                self.world_model.load_state_dict(torch.load(world_model_path, map_location=self.device))
-                logger.info("Loaded world model weights")
-            
-            # Load memory components
-            density_path = os.path.join(checkpoint_dir, 'density_estimator.pt')
-            if os.path.exists(density_path):
+            # Load density estimator state if available
+            density_path = f"{path_prefix}_density.pkl"
+            if os.path.exists(density_path) and hasattr(self, 'density_estimator') and self.density_estimator is not None:
                 self.density_estimator.load_state(density_path)
-            
-            association_path = os.path.join(checkpoint_dir, 'association_memory.pt')
-            if os.path.exists(association_path):
-                self.association_memory.load_state(association_path)
-            
-            analyzer_path = os.path.join(checkpoint_dir, 'visual_change_analyzer.pkl')
-            if os.path.exists(analyzer_path):
-                self.visual_change_analyzer.load_state(analyzer_path)
-            
-            # Re-initialize the feature extractor reference (in case model was reloaded)
-            self.feature_extractor = self.world_model.encoder
-            
-            logger.info(f"Successfully loaded reward system state from {checkpoint_dir}")
-            return True
+                logger.info(f"Loaded density estimator state with {len(self.density_estimator.state_memory)} memory entries")
+                
+            # Load temporal association memory if available
+            temp_assoc_path = f"{path_prefix}_temp_assoc.pkl"
+            if os.path.exists(temp_assoc_path) and hasattr(self, 'association_memory') and self.association_memory is not None:
+                self.association_memory.load_state(temp_assoc_path)
+                logger.info(f"Loaded temporal association memory with {len(self.association_memory.feature_memory)} entries")
+                
+            # Load visual change analyzer if available
+            visual_change_path = f"{path_prefix}_visual_change.pkl"
+            if os.path.exists(visual_change_path) and hasattr(self, 'visual_change_analyzer') and self.visual_change_analyzer is not None:
+                self.visual_change_analyzer.load_state(visual_change_path)
+                logger.info(f"Loaded visual change analyzer state with {len(self.visual_change_analyzer.pattern_memory)} patterns")
+                
         except Exception as e:
             logger.error(f"Failed to load reward system state: {str(e)}")
-            return False
+            # Initialize with default values if loading fails
+            self._initialize_default_values()
     
     def compute_reward(self, prev_frame: np.ndarray, action_idx: int, curr_frame: np.ndarray) -> float:
         """Compute reward based on visual changes without using domain knowledge.
@@ -1185,4 +1098,24 @@ class AutonomousRewardSystem:
             
         except Exception as e:
             logger.error(f"Error computing stability: {e}")
-            return 0.0 
+            return 0.0
+
+    def _initialize_default_values(self):
+        """Initialize default values if state loading fails."""
+        # Initialize memory components with default values
+        if hasattr(self, 'density_estimator'):
+            self.density_estimator.state_memory = []
+            self.density_estimator.distances = []
+            
+        if hasattr(self, 'association_memory'):
+            self.association_memory.feature_memory = []
+            self.association_memory.outcomes_memory = []
+            
+        if hasattr(self, 'visual_change_analyzer'):
+            self.visual_change_analyzer.pattern_memory = []
+            self.visual_change_analyzer.outcomes_memory = []
+            
+        # Reset history
+        self.reward_history = deque(maxlen=self.max_history_length)
+        
+        logger.info("Initialized reward system with default values") 

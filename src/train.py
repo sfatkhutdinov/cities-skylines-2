@@ -466,11 +466,6 @@ def train():
         use_fp16=args.fp16
     )
     
-    # Update RL-specific parameters
-    config.gamma = args.gamma
-    config.gae_lambda = args.gae_lambda
-    config.clip_range = args.clip_param
-    
     # Create environment and agent
     env = CitiesEnvironment(
         config=config,
@@ -492,16 +487,18 @@ def train():
     
     logger.info(f"State shape: {state_shape}, Action dim: {action_dim}")
     
+    # Create a config object with RL parameters if needed
+    config.gamma = args.gamma
+    config.gae_lambda = args.gae_lambda
+    config.clip_param = args.clip_param
+    config.value_coef = 0.5
+    config.entropy_coef = 0.01
+    
+    # Initialize the agent with the config
     agent = PPOAgent(
         state_dim=state_shape,
         action_dim=action_dim,
-        device=config.get_device(),
-        learning_rate=args.learning_rate,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_param=args.clip_param,
-        value_coef=0.5,
-        entropy_coef=0.01
+        config=config
     )
     
     # Connect environment and agent for better coordination
