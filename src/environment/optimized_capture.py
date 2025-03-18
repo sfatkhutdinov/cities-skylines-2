@@ -146,14 +146,34 @@ class OptimizedScreenCapture:
                                                  (self.process_resolution[0], self.process_resolution[1]),
                                                  interpolation=cv2.INTER_AREA)
                     else:
-                        # Raise exception instead of falling back
-                        raise RuntimeError("PrintWindow failed - could not capture game window")
+                        # Fallback to full screen capture instead of raising exception
+                        print("PrintWindow failed - falling back to full screen capture")
+                        screen = ImageGrab.grab()
+                        frame = np.array(screen)
+                        frame_resized = cv2.resize(frame, 
+                                                 (self.process_resolution[0], self.process_resolution[1]),
+                                                 interpolation=cv2.INTER_AREA)
                 else:
-                    # Raise exception instead of falling back
-                    raise RuntimeError("Could not find Cities: Skylines II window")
+                    # Fallback to full screen capture
+                    print("Could not find game window - falling back to full screen capture")
+                    screen = ImageGrab.grab()
+                    frame = np.array(screen)
+                    frame_resized = cv2.resize(frame, 
+                                             (self.process_resolution[0], self.process_resolution[1]),
+                                             interpolation=cv2.INTER_AREA)
             except Exception as e:
-                # Raise the exception instead of falling back to full screen capture
-                raise RuntimeError(f"Failed to capture game window: {str(e)}")
+                # Fallback to full screen capture or mock if all else fails
+                try:
+                    print(f"Game window capture failed: {str(e)} - falling back to full screen capture")
+                    screen = ImageGrab.grab()
+                    frame = np.array(screen)
+                    frame_resized = cv2.resize(frame, 
+                                             (self.process_resolution[0], self.process_resolution[1]),
+                                             interpolation=cv2.INTER_AREA)
+                except Exception as e2:
+                    print(f"All capture methods failed: {str(e2)} - using mock frame")
+                    self.use_mock = True
+                    return self.capture_frame()
             
             # Convert from BGR to RGB if needed
             if len(frame_resized.shape) == 3 and frame_resized.shape[2] == 3:
@@ -171,14 +191,28 @@ class OptimizedScreenCapture:
                 
             return frame_tensor
         except Exception as e:
-            # Raise the exception instead of falling back to mock mode
-            raise RuntimeError(f"Screen capture failed: {str(e)}")
+            # Fallback to mock mode instead of raising an exception
+            print(f"Screen capture completely failed: {str(e)}. Falling back to mock mode.")
+            self.use_mock = True
+            return self.capture_frame()
             
     def _update_frame_history(self, frame: torch.Tensor):
         """Update frame history for temporal processing."""
         self.frame_history.append(frame.clone())
         if len(self.frame_history) > self.max_history_length:
-            self.frame_history.pop(0)
+            # Explicitly delete the oldest frame to help garbage collection
+            oldest = self.frame_history.pop(0)
+            del oldest
+            
+        # Periodically force garbage collection to prevent memory leaks
+        if hasattr(self, '_frame_count'):
+            self._frame_count += 1
+        else:
+            self._frame_count = 1
+            
+        if self._frame_count % 100 == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     def get_frame_stack(self) -> torch.Tensor:
         """Get stacked frames for temporal processing."""

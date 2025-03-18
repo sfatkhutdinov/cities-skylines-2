@@ -53,8 +53,16 @@ class InputSimulator:
         self.game_rect = None
         self.client_rect = None
         
-        # Block escape key by default to prevent accidental menu toggling
-        self.block_escape = True
+        # Store client position for mouse coordinate conversion
+        self.client_position = None
+        
+        # Set escape key blocking to false by default to allow proper menu navigation
+        self.block_escape = False
+        
+        # Add a counter to detect excessive escape key presses
+        self.escape_press_counter = 0
+        self.escape_press_threshold = 5  # Max allowed escape presses in sequence
+        self.escape_cooldown = 0  # Cooldown timer for escape key
         
     def find_game_window(self) -> bool:
         """Find the Cities: Skylines II window handle."""

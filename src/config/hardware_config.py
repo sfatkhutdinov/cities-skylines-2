@@ -14,7 +14,7 @@ class HardwareConfig:
         learning_rate: float = 3e-4,
         batch_size: int = 32,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        resolution: Tuple[int, int] = (1080, 1920),
+        resolution: Tuple[int, int] = (1920, 1080),
         ppo_epochs: int = 4,
         clip_range: float = 0.2,
         value_loss_coef: float = 0.5,

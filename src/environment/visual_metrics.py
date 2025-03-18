@@ -68,102 +68,154 @@ class VisualMetricsEstimator:
         logger.warning("No valid menu reference image available")
         return False
     
-    def detect_main_menu(self, frame: torch.Tensor) -> bool:
-        """Detect if the current frame shows a main menu or popup.
+    def setup_fallback_menu_detection(self):
+        """Set up fallback menu detection based on color patterns and UI layout analysis.
+        This method is used when no menu reference image is available.
+        """
+        logger.info("Setting up fallback menu detection system")
+        
+        # Common menu UI characteristics
+        self.menu_color_ranges = [
+            # Dark semi-transparent overlays (common in menus)
+            ((0, 0, 0), (50, 50, 50)),
+            # Blue UI elements (common in Cities Skylines UI)
+            ((100, 50, 0), (255, 150, 50)),
+            # White text
+            ((200, 200, 200), (255, 255, 255))
+        ]
+        
+        # Initialize UI pattern detection
+        self.ui_pattern_threshold = 0.4  # Threshold for UI element detection
+        self.menu_detection_initialized = True
+        logger.info("Fallback menu detection initialized")
+        
+    def detect_menu_fallback(self, frame: torch.Tensor) -> bool:
+        """Detect if current frame shows a menu using fallback method.
         
         Args:
-            frame (torch.Tensor): Current frame
+            frame (torch.Tensor): Current frame observation
             
         Returns:
-            bool: True if menu detected
+            bool: True if menu is detected, False otherwise
         """
-        # Check if frame is None or empty
-        if frame is None:
-            return False
-            
-        # Convert to numpy for OpenCV processing
-        if isinstance(frame, torch.Tensor):
-            frame_np = frame.detach().cpu().numpy()
-            if len(frame_np.shape) == 3:  # CHW format
-                frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+        # Convert tensor to numpy for OpenCV processing
+        if frame.device != torch.device('cpu'):
+            frame_np = frame.cpu().numpy()
         else:
-            frame_np = frame
+            frame_np = frame.numpy()
             
-        # Check if frame is empty
-        if frame_np is None or frame_np.size == 0 or np.all(frame_np == 0):
-            return False
+        # Convert from CHW to HWC format and scale to 0-255 range
+        if frame_np.shape[0] == 3:  # CHW format
+            frame_np = np.transpose(frame_np, (1, 2, 0))
+        frame_np = (frame_np * 255).astype(np.uint8)
+        
+        # Convert to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        
+        # Detect UI elements using color thresholding
+        ui_mask = np.zeros((frame_bgr.shape[0], frame_bgr.shape[1]), dtype=np.uint8)
+        
+        for lower, upper in self.menu_color_ranges:
+            lower = np.array(lower)
+            upper = np.array(upper)
+            mask = cv2.inRange(frame_bgr, lower, upper)
+            ui_mask = cv2.bitwise_or(ui_mask, mask)
+        
+        # Calculate percentage of UI elements
+        ui_percentage = np.sum(ui_mask > 0) / (ui_mask.shape[0] * ui_mask.shape[1])
+        
+        # Check for UI layout patterns (horizontal lines, grids, etc.)
+        edges = cv2.Canny(frame_bgr, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=100, maxLineGap=10)
+        
+        horizontal_lines = 0
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                if angle < 10 or angle > 170:  # Almost horizontal lines
+                    horizontal_lines += 1
+        
+        # Decision based on combined factors
+        is_menu = (ui_percentage > self.ui_pattern_threshold) or (horizontal_lines > 5)
+        
+        return is_menu
+        
+    def detect_main_menu(self, frame: torch.Tensor) -> bool:
+        """Detect if current frame shows the main menu.
+        
+        Args:
+            frame (torch.Tensor): Current frame observation
             
-        # Convert to grayscale for feature matching
-        if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
-            frame_gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
-        else:
-            # If already grayscale, ensure it's the correct type
-            if len(frame_np.shape) == 2:
-                frame_gray = frame_np
-            else:
-                # Unexpected format, return false
-                return False
-                
-        # Ensure frame is 8-bit unsigned integer (CV_8U)
-        if frame_gray.dtype != np.uint8:
-            frame_gray = frame_gray.astype(np.uint8)
-            
-        # If we have a reference image, use feature matching
-        if self.menu_reference is not None and hasattr(self, 'menu_kp') and hasattr(self, 'menu_desc'):
+        Returns:
+            bool: True if main menu is detected, False otherwise
+        """
+        # First try standard detection if reference image is available
+        if self.menu_reference is not None:
             try:
-                # Extract features from current frame
-                kp, desc = self.menu_matcher.detectAndCompute(frame_gray, None)
-                
-                # Not enough features for matching
-                if desc is None or len(kp) < 10:
+                # Use existing feature matching method
+                # Check if frame is None or empty
+                if frame is None:
                     return False
                     
-                # Match features
-                matches = self.menu_flann.knnMatch(self.menu_desc, desc, k=2)
-                
-                # Apply ratio test
-                good_matches = []
-                for m, n in matches:
-                    if m.distance < 0.7 * n.distance:
-                        good_matches.append(m)
+                # Convert to numpy for OpenCV processing
+                if isinstance(frame, torch.Tensor):
+                    frame_np = frame.detach().cpu().numpy()
+                    if len(frame_np.shape) == 3:  # CHW format
+                        frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+                else:
+                    frame_np = frame
+                    
+                # Check if frame is empty
+                if frame_np is None or frame_np.size == 0 or np.all(frame_np == 0):
+                    return False
+                    
+                # Convert to grayscale for feature matching
+                if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
+                    frame_gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+                else:
+                    # If already grayscale, ensure it's the correct type
+                    if len(frame_np.shape) == 2:
+                        frame_gray = frame_np
+                    else:
+                        # Unexpected format, return false
+                        return False
                         
-                # If enough matches, consider it a menu
-                match_threshold = 10  # Minimum number of matches to consider it a menu
-                return len(good_matches) >= match_threshold
-            except cv2.error:
-                # If OpenCV processing fails, assume no menu
-                return False
-        
-        # Fallback: Use generic menu detection based on UI patterns
-        # This is a simple heuristic based on common menu characteristics
-        
-        # 1. Look for large solid-colored rectangles (common in menus)
-        edges = cv2.Canny(frame_gray, 100, 200)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        large_rectangles = 0
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = float(w) / h if h > 0 else 0
-            
-            # Look for rectangle-like contours with reasonable aspect ratios
-            if 0.2 < aspect_ratio < 5 and w*h > (frame_gray.shape[0] * frame_gray.shape[1] * 0.05):
-                large_rectangles += 1
-        
-        # 2. Check for text-like structures (menus often have text)
-        # Simplified text detection using horizontal projection profiles
-        # (real implementation would use OCR or text detection)
-        horizontal_profile = np.sum(edges, axis=1)
-        text_like_rows = np.sum(horizontal_profile > frame_gray.shape[1] * 0.1)
-        
-        # 3. Reduced edge density in the game area
-        # (menus often dim or blur the game background)
-        edge_density = np.sum(edges > 0) / (frame_gray.shape[0] * frame_gray.shape[1])
-        
-        # Combine heuristics
-        menu_score = (large_rectangles >= 3) + (text_like_rows >= 5) + (edge_density < 0.05)
-        
-        return menu_score >= 2  # At least 2 of 3 heuristics suggest a menu
+                # Ensure frame is 8-bit unsigned integer (CV_8U)
+                if frame_gray.dtype != np.uint8:
+                    frame_gray = frame_gray.astype(np.uint8)
+                    
+                # If we have a reference image, use feature matching
+                if self.menu_reference is not None and hasattr(self, 'menu_kp') and hasattr(self, 'menu_desc'):
+                    try:
+                        # Extract features from current frame
+                        kp, desc = self.menu_matcher.detectAndCompute(frame_gray, None)
+                        
+                        # Not enough features for matching
+                        if desc is None or len(kp) < 10:
+                            return False
+                            
+                        # Match features
+                        matches = self.menu_flann.knnMatch(self.menu_desc, desc, k=2)
+                        
+                        # Apply ratio test
+                        good_matches = []
+                        for m, n in matches:
+                            if m.distance < 0.7 * n.distance:
+                                good_matches.append(m)
+                                
+                        # If enough matches, consider it a menu
+                        match_threshold = 10  # Minimum number of matches to consider it a menu
+                        return len(good_matches) >= match_threshold
+                    except cv2.error:
+                        # If OpenCV processing fails, assume no menu
+                        return False
+            except Exception as e:
+                logger.warning(f"Standard menu detection failed: {e}, falling back to pattern-based detection")
+                return self.detect_menu_fallback(frame)
+        else:
+            # Use fallback method
+            return self.detect_menu_fallback(frame)
     
     def save_current_frame_as_menu_reference(self, frame: torch.Tensor, save_path: str) -> bool:
         """Save current frame as a menu reference.

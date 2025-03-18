@@ -42,9 +42,20 @@ class WorldModelCNN(nn.Module):
         ).to(self.device, dtype=self.dtype)
         
         # Feature representation (for novelty detection)
+        # Calculate the output size from encoder dynamically
+        with torch.no_grad():
+            # Get resolution from config
+            width, height = getattr(config, 'resolution', (1920, 1080))
+            # Scale down to match the expected input resolution for the model
+            model_width, model_height = 320, 240  # Typical processing resolution
+            # Create a dummy input to compute output shape
+            dummy_input = torch.zeros(1, 3, model_height, model_width, device=self.device)
+            encoder_output = self.encoder(dummy_input)
+            flattened_size = encoder_output.numel() // encoder_output.size(0)
+            
         self.feature_layer = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(59904, 512),  # Updated from 64 * 9 * 9 to match actual flattened dimension
+            nn.Linear(flattened_size, 512),  # Dynamically sized input
             nn.ReLU()
         ).to(self.device, dtype=self.dtype)
         

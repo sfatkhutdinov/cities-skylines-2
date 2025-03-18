@@ -77,6 +77,13 @@ class CitiesEnvironment:
             except Exception as e:
                 logger.error(f"Failed to initialize menu detection: {e}")
                 self.has_menu_reference = False
+                # Implement fallback menu detection
+                logger.info("Setting up fallback menu detection based on color patterns")
+                self.visual_estimator.setup_fallback_menu_detection()
+        else:
+            # No menu reference image, set up fallback menu detection
+            logger.info("No menu reference image available, setting up fallback menu detection")
+            self.visual_estimator.setup_fallback_menu_detection()
         
         # Use autonomous reward system
         self.reward_system = AutonomousRewardSystem(self.config)
