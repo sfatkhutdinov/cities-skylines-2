@@ -8,6 +8,7 @@ import torch.optim as optim
 import numpy as np
 from typing import Tuple, Dict, Any
 from model.optimized_network import OptimizedNetwork
+from agent.curiosity_module import IntrinsicCuriosityModule
 
 class PPOAgent:
     """Proximal Policy Optimization agent."""
@@ -24,18 +25,30 @@ class PPOAgent:
         # Initialize network
         self.network = OptimizedNetwork(config)
         
-        # Setup optimizer
+        # Initialize intrinsic curiosity module
+        self.use_curiosity = True  # Flag to enable/disable curiosity
+        self.curiosity_weight = 0.01  # Weight for intrinsic rewards
+        self.icm = IntrinsicCuriosityModule(config)
+        
+        # Setup optimizers
         self.optimizer = optim.Adam(
             self.network.parameters(),
             lr=config.learning_rate
         )
         
+        self.curiosity_optimizer = optim.Adam(
+            self.icm.parameters(),
+            lr=config.learning_rate * 0.5  # Slightly lower learning rate for stability
+        )
+        
         # Initialize memory buffers
         self.states = []
+        self.next_states = []  # Add buffer for next states (needed for curiosity)
         self.actions = []
         self.action_probs = []
         self.values = []
         self.rewards = []
+        self.intrinsic_rewards = []  # Add buffer for intrinsic rewards
         self.dones = []
         
         # Add action avoidance for menu toggling
@@ -96,6 +109,34 @@ class PPOAgent:
         
         return action, log_prob, value
         
+    def compute_intrinsic_reward(self, state, next_state, action):
+        """Compute intrinsic reward using the curiosity module.
+        
+        Args:
+            state (torch.Tensor): Current state
+            next_state (torch.Tensor): Next state
+            action (int or torch.Tensor): Action taken
+            
+        Returns:
+            float: Intrinsic reward
+        """
+        if not self.use_curiosity:
+            return 0.0
+            
+        # Ensure tensors are on the correct device
+        if isinstance(state, np.ndarray):
+            state = torch.FloatTensor(state).to(self.device)
+        if isinstance(next_state, np.ndarray):
+            next_state = torch.FloatTensor(next_state).to(self.device)
+        if isinstance(action, int):
+            action = torch.tensor([action], device=self.device)
+            
+        # Compute curiosity reward
+        with torch.no_grad():
+            intrinsic_reward = self.icm.compute_curiosity_reward(state, next_state, action)
+            
+        return intrinsic_reward.item() * self.curiosity_weight
+        
     def update(self) -> Dict[str, float]:
         """Update the agent using collected experience.
         
@@ -103,17 +144,18 @@ class PPOAgent:
             dict: Training metrics
         """
         # Check if we have any experience to learn from
-        if not self.states or not self.actions:
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+        if not self.states or not self.actions or not self.next_states:
+            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'icm_loss': 0.0}
             
         # Convert lists to tensors
         states = torch.cat(self.states)
+        next_states = torch.cat(self.next_states)  # Use stored next states
         actions = torch.cat(self.actions)
         
         # Check if we have action probabilities
         if not self.action_probs:
             self._clear_memory()
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'icm_loss': 0.0}
             
         old_action_probs = torch.cat(self.action_probs)
         values = torch.cat(self.values)
@@ -124,12 +166,22 @@ class PPOAgent:
         # Check if returns is empty
         if returns.numel() == 0:
             self._clear_memory()
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'icm_loss': 0.0}
             
         advantages = returns - values
         
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Update curiosity module
+        icm_loss = 0.0
+        if self.use_curiosity:
+            intrinsic_rewards, icm_loss = self.icm(states, next_states, actions)
+            
+            # Update ICM
+            self.curiosity_optimizer.zero_grad()
+            icm_loss.backward()
+            self.curiosity_optimizer.step()
         
         # PPO update
         for _ in range(self.config.ppo_epochs):
@@ -170,7 +222,8 @@ class PPOAgent:
         return {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'entropy': entropy.item()
+            'entropy': entropy.item(),
+            'icm_loss': icm_loss.item() if isinstance(icm_loss, torch.Tensor) else icm_loss
         }
         
     def _compute_returns(self) -> torch.Tensor:
@@ -208,10 +261,12 @@ class PPOAgent:
     def _clear_memory(self):
         """Clear experience memory buffers."""
         self.states = []
+        self.next_states = []  # Clear next_states buffer
         self.actions = []
         self.action_probs = []
         self.values = []
         self.rewards = []
+        self.intrinsic_rewards = []  # Clear intrinsic rewards
         self.dones = []
         
     def save(self, path: str):
@@ -222,7 +277,9 @@ class PPOAgent:
         """
         torch.save({
             'network_state': self.network.state_dict(),
-            'optimizer_state': self.optimizer.state_dict()
+            'optimizer_state': self.optimizer.state_dict(),
+            'icm_state': self.icm.state_dict(),  # Save ICM state
+            'curiosity_optimizer_state': self.curiosity_optimizer.state_dict()
         }, path)
         
     def load(self, path: str):
@@ -234,6 +291,11 @@ class PPOAgent:
         checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['network_state'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        
+        # Load ICM state if it exists
+        if 'icm_state' in checkpoint:
+            self.icm.load_state_dict(checkpoint['icm_state'])
+            self.curiosity_optimizer.load_state_dict(checkpoint['curiosity_optimizer_state'])
         
     def register_menu_action(self, action_idx: int, penalty: float = 0.5):
         """Register an action that led to a menu state to discourage its selection.
@@ -269,27 +331,41 @@ class PPOAgent:
                 if self.menu_action_penalties[action_idx] < 0.05:
                     del self.menu_action_penalties[action_idx]
 
-    def update_from_reward(self, action_idx: int, reward: float):
-        """Update action penalties based on received rewards.
+    def update_from_reward(self, action_idx, reward):
+        """Update agent's tracking of rewards for an action.
         
         Args:
-            action_idx (int): Index of the action that received the reward
-            reward (float): The reward value
+            action_idx (int): Index of action taken
+            reward (float): Reward received
         """
-        # Track the most recent rewards
-        if not hasattr(self, 'last_rewards'):
-            self.last_rewards = []
-        
-        # Keep only the last 10 rewards
+        # Store reward for tracking large penalties
         self.last_rewards.append(reward)
         if len(self.last_rewards) > 10:
             self.last_rewards.pop(0)
-        
-        # Check if we received an extreme negative reward (likely from menu penalty)
-        if reward < self.extreme_penalty_threshold:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Extreme negative reward detected: {reward}, likely menu penalty")
             
-            # Strongly penalize the action that led to this reward
-            self.register_menu_action(action_idx, penalty=0.9) 
+        # If we got an extremely negative reward, this might be a menu penalty
+        if reward < self.extreme_penalty_threshold:
+            logger.warning(f"Detected extreme penalty ({reward}) for action {action_idx}")
+            self.register_menu_action(action_idx, penalty=0.9)  # Higher penalty for extreme cases
+            
+    def store_next_state(self, next_state):
+        """Store the next state for use with the intrinsic curiosity module.
+        
+        Args:
+            next_state (torch.Tensor): Next state observation
+        """
+        if next_state is not None:
+            # Convert to tensor if needed
+            if not isinstance(next_state, torch.Tensor):
+                next_state = torch.FloatTensor(next_state)
+                
+            # Ensure correct device
+            if next_state.device != self.device:
+                next_state = next_state.to(self.device)
+                
+            # Handle batch dimension
+            if next_state.dim() == 3:
+                next_state = next_state.unsqueeze(0)
+                
+            # Store in buffer
+            self.next_states.append(next_state) 

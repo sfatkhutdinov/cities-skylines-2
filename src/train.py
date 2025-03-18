@@ -75,8 +75,11 @@ def collect_trajectory(
             - episode_length: Length of episode
     """
     states = []
+    next_states = []
     actions = []
     rewards = []
+    intrinsic_rewards = []
+    total_rewards = []  # Combined extrinsic and intrinsic rewards
     log_probs = []
     values = []
     dones = []
@@ -84,6 +87,7 @@ def collect_trajectory(
     
     state = env.reset()
     episode_reward = 0
+    episode_intrinsic_reward = 0
     episode_length = 0
     
     # Track previous actions and their results for menu detection
@@ -104,6 +108,15 @@ def collect_trajectory(
         action_idx = action.item()
         action_info = env.actions[action_idx]
         next_state, reward, done, info = env.step(action_idx)
+        
+        # Store next state in agent for curiosity module
+        agent.store_next_state(next_state)
+        
+        # Compute intrinsic curiosity reward
+        intrinsic_reward = agent.compute_intrinsic_reward(state, next_state, action_idx)
+        
+        # Combine extrinsic and intrinsic rewards
+        total_reward = reward + intrinsic_reward
         
         # Update agent's tracking of rewards for this action
         agent.update_from_reward(action_idx, reward)
@@ -129,19 +142,27 @@ def collect_trajectory(
         
         # Store experience
         states.append(state)
+        next_states.append(next_state)
         actions.append(action_idx)
         rewards.append(reward)
+        intrinsic_rewards.append(intrinsic_reward)
+        total_rewards.append(total_reward)
         log_probs.append(log_prob.item())
         values.append(value.item())
         dones.append(done)
         action_infos.append(action_info)
         
         episode_reward += reward
+        episode_intrinsic_reward += intrinsic_reward
         episode_length += 1
         
         # Log interesting actions (UI exploration)
         if action_info["type"] in ["ui", "ui_position"]:
             logger.info(f"UI Action: {action_info}")
+        
+        # Log high curiosity reward actions
+        if intrinsic_reward > 0.1:
+            logger.info(f"High curiosity reward ({intrinsic_reward:.4f}) for action: {action_info}")
         
         # If we get an extremely negative reward, log and consider early termination
         if reward < -500:
@@ -158,24 +179,27 @@ def collect_trajectory(
             
         state = next_state
     
+    # Log summary of intrinsic rewards
+    logger.info(f"Episode intrinsic reward: {episode_intrinsic_reward:.4f}")
+    
     # Convert lists to tensors
     if isinstance(states[0], torch.Tensor):
         states_tensor = torch.stack(states)
     else:
         states_tensor = torch.FloatTensor(np.array(states))
-        
-    # Create next_states by shifting the states list and repeating the last state
-    next_states_list = states[1:] + [states[-1]]
-    if isinstance(next_states_list[0], torch.Tensor):
-        next_states = torch.stack(next_states_list)
-    else:
-        next_states = torch.FloatTensor(np.array(next_states_list))
     
+    if isinstance(next_states[0], torch.Tensor):
+        next_states_tensor = torch.stack(next_states)
+    else:
+        next_states_tensor = torch.FloatTensor(np.array(next_states))
+        
     experiences = {
         "states": states_tensor,
-        "next_states": next_states,
+        "next_states": next_states_tensor,
         "actions": torch.LongTensor(actions),
         "rewards": torch.FloatTensor(rewards),
+        "intrinsic_rewards": torch.FloatTensor(intrinsic_rewards),
+        "total_rewards": torch.FloatTensor(total_rewards),
         "log_probs": torch.FloatTensor(log_probs),
         "values": torch.FloatTensor(values),
         "dones": torch.BoolTensor(dones),
@@ -298,30 +322,74 @@ def train():
         if not checkpoint_loaded:
             logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
     
-    # Initialize wandb (comment out to skip)
-    # logger.info("Initializing wandb...")
-    # wandb.init(
-    #     project="cities-skylines-2-rl",
-    #     config=vars(args)
-    # )
-    # logger.info("wandb initialized")
+    # Initialize wandb if available
+    use_wandb = False
+    try:
+        wandb.init(project="cs2-agent", config={
+            "num_episodes": args.num_episodes,
+            "max_steps": args.max_steps,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "resolution": args.resolution,
+            "device": args.device,
+            "mock_mode": args.mock,
+            "use_curiosity": True  # Flag that we're using curiosity-driven exploration
+        })
+        use_wandb = True
+        logger.info("Initialized wandb for experiment tracking")
+    except Exception as e:
+        logger.warning(f"Failed to initialize wandb: {str(e)}")
     
     # Training loop
-    if checkpoint_loaded:
-        # Try to find the current best reward if we're resuming
-        if (checkpoint_dir / "best_model.pt").exists():
-            # Just a heuristic: assume the best model has a better reward than starting fresh
-            best_reward = 0  # This will be updated on the first better reward
+    best_reward = float('-inf')
+    episode_times = []
     
-    logger.info("Starting training loop...")
     for episode in range(start_episode, args.num_episodes):
-        logger.info(f"Starting episode {episode+1}/{args.num_episodes}")
+        episode_start_time = time.time()
         
-        # Collect trajectory
+        # Collect experience
+        logger.info(f"Starting episode {episode}...")
         experiences, episode_reward, episode_length = collect_trajectory(
-            env, agent, args.max_steps
+            env=env,
+            agent=agent,
+            max_steps=args.max_steps
         )
-        logger.info(f"Collected trajectory - Length: {episode_length}, Reward: {episode_reward:.2f}")
+        
+        # Calculate average intrinsic reward
+        avg_intrinsic_reward = experiences["intrinsic_rewards"].mean().item()
+        
+        # Get total combined reward
+        total_episode_reward = episode_reward + experiences["intrinsic_rewards"].sum().item()
+        
+        # Update the agent
+        update_metrics = agent.update()
+        
+        # Calculate episode time
+        episode_time = time.time() - episode_start_time
+        episode_times.append(episode_time)
+        avg_time = sum(episode_times[-10:]) / min(len(episode_times), 10)
+        
+        # Log metrics
+        metrics = {
+            "episode": episode,
+            "reward": episode_reward,
+            "intrinsic_reward": avg_intrinsic_reward,
+            "total_reward": total_episode_reward,
+            "episode_length": episode_length,
+            "time": episode_time,
+            "avg_time": avg_time,
+            **update_metrics
+        }
+        
+        logger.info(f"Episode {episode}: " 
+                    f"reward={episode_reward:.2f}, "
+                    f"intrinsic={avg_intrinsic_reward:.4f}, "
+                    f"total={total_episode_reward:.2f}, "
+                    f"length={episode_length}, "
+                    f"time={episode_time:.2f}s")
+        
+        if use_wandb:
+            wandb.log(metrics)
         
         # Check if episode ended stuck in a menu
         if experiences.get('info', {}).get('menu_detected', False):
@@ -351,18 +419,6 @@ def train():
             if env.visual_estimator.detect_main_menu(env.screen_capture.capture_frame()):
                 logger.info("Still in menu, trying safe menu handling method")
                 env.input_simulator.safe_menu_handling()
-        
-        # Update agent
-        metrics = agent.update()
-        logger.info(f"Updated agent - Metrics: {metrics}")
-        
-        # Log episode results
-        # wandb.log({
-        #     "episode": episode,
-        #     "episode_reward": episode_reward,
-        #     "episode_length": episode_length,
-        #     **metrics
-        # })
         
         # Save checkpoint if best reward
         if episode_reward > best_reward:
