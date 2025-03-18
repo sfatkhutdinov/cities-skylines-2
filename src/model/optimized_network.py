@@ -33,6 +33,9 @@ class OptimizedNetwork(nn.Module):
         
         self.config = config
         
+        # Store expected dimensions as class attributes
+        self.expected_height, self.expected_width = getattr(config, 'resolution', (240, 320))
+        
         # Input dimensions will be 3-channel (RGB) image with config resolution
         in_channels = 3
         # Check if frame_stack exists and is greater than 1
@@ -54,12 +57,11 @@ class OptimizedNetwork(nn.Module):
             nn.ReLU(),
         )
         
-        # Calculate the size of the flattened features
-        # Default to 320x240 if not specified
-        height, width = getattr(config, 'resolution', (240, 320))
+        # Define the size of the flattened features
+        # Use the stored expected dimensions
         
         # Calculate the output size of the conv layers
-        conv_output_size = self._calculate_conv_output_size(in_channels, height, width)
+        conv_output_size = self._calculate_conv_output_size(in_channels, self.expected_height, self.expected_width)
         
         # Define fully connected layers
         self.fc_layers = nn.Sequential(
@@ -114,6 +116,10 @@ class OptimizedNetwork(nn.Module):
         if len(x.shape) == 3:
             x = x.unsqueeze(0)  # Add batch dimension
             
+        # Handle incorrect input shape
+        if x.shape[2] != self.expected_height or x.shape[3] != self.expected_width:
+            x = F.interpolate(x, size=(self.expected_height, self.expected_width), mode='bilinear', align_corners=False)
+            
         # Pass through convolutional layers
         x = self.conv_layers(x)
         
@@ -154,8 +160,8 @@ class OptimizedNetwork(nn.Module):
             x = x.unsqueeze(0)
             
         # Handle incorrect input shape
-        if x.shape[2] != 100 or x.shape[3] != 100:
-            x = F.interpolate(x, size=(100, 100), mode='bilinear', align_corners=False)
+        if x.shape[2] != self.expected_height or x.shape[3] != self.expected_width:
+            x = F.interpolate(x, size=(self.expected_height, self.expected_width), mode='bilinear', align_corners=False)
             
         features = self.conv_layers(x)
         features = features.reshape(x.size(0), -1)
@@ -180,8 +186,8 @@ class OptimizedNetwork(nn.Module):
             x = x.unsqueeze(0)
             
         # Handle incorrect input shape
-        if x.shape[2] != 100 or x.shape[3] != 100:
-            x = F.interpolate(x, size=(100, 100), mode='bilinear', align_corners=False)
+        if x.shape[2] != self.expected_height or x.shape[3] != self.expected_width:
+            x = F.interpolate(x, size=(self.expected_height, self.expected_width), mode='bilinear', align_corners=False)
             
         features = self.conv_layers(x)
         features = features.reshape(x.size(0), -1)
