@@ -286,6 +286,9 @@ class TemporalAssociationMemory:
         self.action_history = deque(maxlen=history_length)
         self.visual_change_history = deque(maxlen=history_length)
         
+        # Initialize the visual change analyzer
+        self.visual_change_analyzer = VisualChangeAnalyzer()
+        
         # For detecting UI elements 
         self.color_clusters = {
             'red': np.array([0, 0, 255], dtype=np.float32),  # BGR format

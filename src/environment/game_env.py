@@ -799,12 +799,21 @@ class CitiesEnvironment:
         if action_type == "mouse":
             action = action_info.get("action", "")
             button = action_info.get("button", "left")
+            
+            # Get the client area center coordinates for the mouse action
+            width, height = self._get_screen_dimensions()
+            center_x, center_y = width // 2, height // 2
+            
+            # Get coordinates from action_info or use center of screen
+            x = action_info.get("x", center_x)
+            y = action_info.get("y", center_y)
+            
             if action == "click":
-                self.input_simulator.mouse_click(button=button)
-                logger.debug(f"Mouse {button} click")
+                self.input_simulator.mouse_click(x, y, button=button)
+                logger.debug(f"Mouse {button} click at ({x}, {y})")
             elif action == "double_click":
-                self.input_simulator.mouse_click(button=button, double=True)
-                logger.debug(f"Mouse {button} double click")
+                self.input_simulator.mouse_click(x, y, button=button, double=True)
+                logger.debug(f"Mouse {button} double click at ({x}, {y})")
             elif action == "scroll":
                 direction = action_info.get("direction", 0)
                 self.input_simulator.mouse_scroll(direction)
