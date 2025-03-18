@@ -25,7 +25,10 @@ class OptimizedScreenCapture:
         # Pre-allocate tensors for frame processing
         # Use the configured resolution for processing
         self.capture_resolution = (1920, 1080)  # Full HD game window
-        self.process_resolution = (width, height)  # Use configuration resolution
+        
+        # Use higher resolution for processing (480x270 instead of 320x240)
+        # This provides better detail while still being efficient
+        self.process_resolution = (480, 270)  # Increased from typical 320x240
         
         # Initialize buffers on appropriate device
         self.frame_buffer = torch.zeros((1, 3, self.process_resolution[1], self.process_resolution[0]), 

@@ -118,6 +118,15 @@ class CitiesEnvironment:
         self.menu_action_suppression_steps = 0
         self.max_menu_suppression_steps = 15  # How long to suppress menu actions after exiting a menu
         
+        # Add adaptive frame skip
+        self.adaptive_frame_skip = True
+        self.min_frame_skip = 1
+        self.max_frame_skip = 6
+        self.current_frame_skip = getattr(self.config, 'frame_skip', 2)
+        self.activity_level = 0.0  # 0.0 = passive, 1.0 = very active
+        self.activity_history = []
+        self.activity_history_max_len = 30
+        
         # For mock mode, create a dummy frame
         if self.mock_mode:
             # Create a simple 3-channel frame (320x240 RGB)
@@ -466,23 +475,47 @@ class CitiesEnvironment:
             done: Whether the episode is done
             info: Additional information
         """
+        # Store previous state for activity calculation
+        if hasattr(self, 'last_observation') and self.last_observation is not None:
+            prev_state = self.last_observation
+            
         # Check if we need to delay before taking another action
         elapsed = time.time() - self.last_action_time
         if elapsed < self.min_action_delay:
             time.sleep(self.min_action_delay - elapsed)
             
-        # In mock mode, just increment counter and return mock frame
+        # In mock mode, just increment counter and return mock
         if self.mock_mode:
-            self.steps_taken += 1
-            self.current_frame = self.screen_capture.capture_frame()
-            return self.current_frame, 0.0, False, {}
+            # Simulate a short delay
+            time.sleep(0.01)
             
-        # Ensure Cities: Skylines II window is focused
-        if not self.input_simulator.ensure_game_window_focused():
-            logger.warning("Could not focus Cities: Skylines II window during step - trying to recover")
-            if not self.input_simulator.find_game_window():
-                raise RuntimeError("Cities: Skylines II window not found during step")
-                
+            # Update counters
+            self.steps_taken += 1
+            self.episode_step += 1
+            self.last_action_time = time.time()
+            
+            # Return mock observation and reward
+            reward = np.random.normal(0.0, 0.1)  # Random small reward
+            done = self.steps_taken >= self.max_steps
+            self.current_frame = torch.randn((3, 240, 320), device=self.config.get_device())
+            return self.current_frame, reward, done, {"mock": True}
+            
+        # Focus game window if needed
+        self.input_simulator.ensure_game_window_focused()
+        
+        # Determine frame skip based on activity level
+        if self.adaptive_frame_skip:
+            # Calculate appropriate frame skip - lower when active, higher when passive
+            target_skip = int(self.min_frame_skip + (self.max_frame_skip - self.min_frame_skip) * (1.0 - self.activity_level))
+            self.current_frame_skip = max(self.min_frame_skip, min(target_skip, self.max_frame_skip))
+        else:
+            self.current_frame_skip = getattr(self.config, 'frame_skip', 2)
+            
+        # Log frame skip if it changed
+        if hasattr(self, 'last_frame_skip') and self.current_frame_skip != self.last_frame_skip:
+            logger.debug(f"Frame skip adjusted to {self.current_frame_skip} (activity: {self.activity_level:.2f})")
+        self.last_frame_skip = self.current_frame_skip
+        
         # First check if we're in a menu before executing action
         pre_action_frame = self.screen_capture.capture_frame()
         if self.visual_estimator.detect_main_menu(pre_action_frame):
@@ -528,7 +561,7 @@ class CitiesEnvironment:
         action_info = self.actions[action_index]
         
         # Check if we should suppress menu-opening actions
-        if self.suppress_menu_actions and action_info.get("type") == "time" and action_info.get("action") == "open_pause_menu":
+        if self.suppress_menu_actions and action_info.get("type") == "menu" and action_info.get("action") == "open_pause_menu":
             logger.info("Suppressing menu-opening action due to recent menu exit")
             # Replace with a harmless action like waiting
             harmless_actions = [i for i, a in enumerate(self.actions) if a.get("type") == "time" and a.get("action") == "wait_short"]
@@ -537,9 +570,17 @@ class CitiesEnvironment:
                 action_info = self.actions[action_index]
                 logger.info(f"Replaced with action: {action_info}")
         
-        # Now execute the selected action
+        # Execute the action
         self._execute_action(action_info)
         self.last_action_time = time.time()
+        
+        # Apply frame skip based on the adaptive calculation
+        for _ in range(self.current_frame_skip - 1):
+            time.sleep(0.01)  # Small sleep to let game process any changes
+        
+        # Get new state
+        next_state = self.get_observation()
+        self.last_observation = next_state
         
         # Increment step counter
         self.steps_taken += 1
@@ -668,6 +709,32 @@ class CitiesEnvironment:
         # Check if episode should terminate (using step limit for now)
         done = self.steps_taken >= self.max_steps
         
+        # Calculate activity level based on pixel differences
+        if hasattr(self, 'last_observation') and self.last_observation is not None and 'prev_state' in locals():
+            with torch.no_grad():
+                prev_frame = prev_state
+                curr_frame = self.current_frame
+                
+                # Calculate frame difference and convert to activity measure
+                if prev_frame.device != torch.device('cpu'):
+                    prev_frame = prev_frame.cpu()
+                if curr_frame.device != torch.device('cpu'):
+                    curr_frame = curr_frame.cpu()
+                    
+                # Calculate difference and normalize
+                diff = torch.abs(curr_frame - prev_frame).mean().item()
+                
+                # Higher threshold for meaningful activity
+                activity = min(1.0, diff * 20.0)  # Scale for detection sensitivity
+                
+                # Update activity history
+                self.activity_history.append(activity)
+                if len(self.activity_history) > self.activity_history_max_len:
+                    self.activity_history.pop(0)
+                    
+                # Calculate smoothed activity level
+                self.activity_level = sum(self.activity_history) / len(self.activity_history)
+                
         # Prepare info dict
         info = {
             'steps': self.steps_taken,
@@ -675,7 +742,8 @@ class CitiesEnvironment:
             'action': action_info["action"],
             'menu_detected': self.visual_estimator.detect_main_menu(self.current_frame),
             'menu_penalty': menu_penalty if menu_detected else 0.0,
-            'menu_stuck_counter': self.menu_stuck_counter
+            'menu_stuck_counter': self.menu_stuck_counter,
+            'activity_level': self.activity_level
         }
         
         return self.current_frame, reward, done, info

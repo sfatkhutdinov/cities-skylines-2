@@ -42,8 +42,8 @@ from typing import Dict, List, Tuple
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Cities: Skylines 2 RL agent")
     parser.add_argument("--num_episodes", type=int, default=10000, help="Number of episodes to train")
-    parser.add_argument("--max_steps", type=int, default=100, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for updates")
+    parser.add_argument("--max_steps", type=int, default=3000, help="Maximum steps per episode")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for updates")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--checkpoint_freq", type=int, default=100, help="Episodes between checkpoints")

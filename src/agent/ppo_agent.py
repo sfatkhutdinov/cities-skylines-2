@@ -27,7 +27,14 @@ class PPOAgent:
         
         # Initialize intrinsic curiosity module
         self.use_curiosity = True  # Flag to enable/disable curiosity
-        self.curiosity_weight = 0.01  # Weight for intrinsic rewards
+        
+        # Adaptive curiosity weight that decreases over time
+        self.initial_curiosity_weight = 0.1  # Higher starting value for better exploration
+        self.min_curiosity_weight = 0.001   # Minimum curiosity weight
+        self.curiosity_weight = self.initial_curiosity_weight
+        self.curiosity_decay_factor = 0.9999  # Decay per episode
+        self.training_episodes = 0          # Episode counter for adaptive decay
+        
         self.icm = IntrinsicCuriosityModule(config)
         
         # Setup optimizers
@@ -54,7 +61,13 @@ class PPOAgent:
         # Add action avoidance for menu toggling
         self.menu_action_indices = []  # Will be populated with indices of actions that open menus
         self.menu_action_penalties = {}  # Maps action indices to penalties
-        self.menu_penalty_decay = 0.98  # Slower decay rate (was 0.95)
+        
+        # Dynamic menu penalty decay based on training progress
+        self.initial_menu_penalty_decay = 0.98
+        self.min_menu_penalty_decay = 0.95  # Faster decay in later stages
+        self.menu_penalty_decay = self.initial_menu_penalty_decay
+        self.menu_penalty_decay_rate = 0.99999  # Very slow adjustment rate
+        
         self.last_rewards = []  # Track recent rewards to detect large penalties
         self.extreme_penalty_threshold = -500.0  # Threshold for detecting extreme penalties
         
@@ -158,9 +171,25 @@ class PPOAgent:
         Returns:
             dict: Training metrics
         """
+        # Increment episode counter for adaptive curiosity decay
+        self.training_episodes += 1
+        
+        # Decay curiosity weight
+        self.curiosity_weight = max(
+            self.min_curiosity_weight,
+            self.curiosity_weight * self.curiosity_decay_factor
+        )
+        
+        # Update menu penalty decay rate - gradually speed up decay as training progresses
+        self.menu_penalty_decay = max(
+            self.min_menu_penalty_decay,
+            self.menu_penalty_decay * self.menu_penalty_decay_rate
+        )
+        
         # Check if we have any experience to learn from
         if not self.states or not self.actions or not self.next_states:
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0, 'icm_loss': 0.0}
+            logger.warning("No experience to learn from")
+            return {"policy_loss": 0, "value_loss": 0, "entropy": 0, "total_loss": 0, "advantage": 0}
             
         # Convert lists to tensors
         states = torch.cat(self.states)

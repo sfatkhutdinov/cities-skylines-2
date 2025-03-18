@@ -35,8 +35,10 @@ class OptimizedNetwork(nn.Module):
         
         # Store expected dimensions as class attributes - Fixed order to width, height
         width, height = getattr(config, 'resolution', (1920, 1080))
-        self.expected_width = width
-        self.expected_height = height
+        
+        # Override with our optimized processing resolution
+        self.expected_width = 480  # Increased from 320
+        self.expected_height = 270  # Increased from 240
         
         # Input dimensions will be 3-channel (RGB) image with config resolution
         in_channels = 3
