@@ -374,49 +374,69 @@ class VisualMetricsEstimator:
                 return False
                 
     def _detect_menu_by_color(self, frame_np: np.ndarray) -> bool:
-        """Detect menu based on color distribution heuristics.
+        """Detect potential menu screens by analyzing general UI patterns.
+        
+        Instead of using specific color values from CS2, this method looks for general
+        UI patterns that might indicate a menu:
+        - Large areas of uniform color (menu backgrounds)
+        - High contrast text regions
+        - Regular grid/alignment patterns
         
         Args:
-            frame_np (np.ndarray): Current frame as numpy array
+            frame_np (np.ndarray): Input frame as numpy array in HWC format
             
         Returns:
-            bool: True if menu detected, False otherwise
+            bool: True if menu-like UI detected, False otherwise
         """
-        # Convert to HSV color space for better color segmentation
-        hsv = cv2.cvtColor(frame_np, cv2.COLOR_BGR2HSV)
-        
-        # Look for dark overlay (common in game menus)
-        lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, 80])
-        dark_mask = cv2.inRange(hsv, lower_black, upper_black)
-        dark_ratio = np.count_nonzero(dark_mask) / dark_mask.size
-        
-        # Look for UI blue (common in Cities Skylines menus)
-        lower_blue = np.array([100, 50, 50])
-        upper_blue = np.array([130, 255, 255])
-        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-        blue_ratio = np.count_nonzero(blue_mask) / blue_mask.size
-        
-        # Look for white text (common in menus)
-        lower_white = np.array([0, 0, 200])
-        upper_white = np.array([180, 30, 255])
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
-        white_ratio = np.count_nonzero(white_mask) / white_mask.size
-        
-        # Decision heuristics
-        # 1. Dark overlay covering significant portion of screen
-        if dark_ratio > 0.4:
-            return True
+        try:
+            # Ensure frame is in BGR format for OpenCV
+            frame_bgr = frame_np.astype(np.uint8)
+            if frame_bgr.shape[2] != 3:
+                return False
+                
+            # Convert to grayscale for analysis
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             
-        # 2. Combination of blue UI elements and white text
-        if blue_ratio > 0.05 and white_ratio > 0.03:
-            return True
+            # 1. Check for large areas of uniform color (common in menus)
+            # Apply slight blur to remove noise
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             
-        # 3. High contrast between dark and light areas
-        if dark_ratio > 0.2 and white_ratio > 0.05:
-            return True
+            # Calculate standard deviation in regions - low std dev = uniform areas
+            regions_y, regions_x = 4, 4
+            height, width = gray.shape
+            region_h, region_w = height // regions_y, width // regions_x
             
-        return False
+            uniform_regions = 0
+            for y in range(regions_y):
+                for x in range(regions_x):
+                    region = blurred[y*region_h:(y+1)*region_h, x*region_w:(x+1)*region_w]
+                    std_dev = np.std(region)
+                    if std_dev < 20:  # Low standard deviation = uniform color
+                        uniform_regions += 1
+            
+            # 2. Look for text-like high contrast regions
+            # Apply edge detection
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (height * width)
+            
+            # 3. Check for aligned elements (common in menus)
+            # Detect horizontal and vertical lines
+            horizontal_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=width//5, maxLineGap=20)
+            vertical_lines = cv2.HoughLinesP(edges, 1, np.pi/2, 50, minLineLength=height//5, maxLineGap=20)
+            
+            has_aligned_elements = (horizontal_lines is not None and len(horizontal_lines) > 2) or \
+                                  (vertical_lines is not None and len(vertical_lines) > 2)
+            
+            # Combine features to detect menu-like patterns
+            uniform_ratio = uniform_regions / (regions_x * regions_y)
+            is_menu_like = (uniform_ratio > 0.3 and edge_density > 0.05) or \
+                          (uniform_ratio > 0.2 and has_aligned_elements)
+            
+            return is_menu_like
+            
+        except Exception as e:
+            logger.error(f"Error in menu color detection: {e}")
+            return False
         
     def _detect_menu_by_edges(self, frame_np: np.ndarray) -> bool:
         """Detect menu based on edge patterns typical of UI elements.
@@ -565,13 +585,19 @@ class VisualMetricsEstimator:
         return 0.01 
 
     def detect_menu_by_colors(self, frame_np: np.ndarray) -> bool:
-        """Detect menu by checking for specific menu colors.
+        """Detect potential menu screens by analyzing general UI patterns.
+        
+        Instead of using specific color values from CS2, this method looks for general
+        UI patterns that might indicate a menu:
+        - Large areas of uniform color (menu backgrounds)
+        - High contrast text regions
+        - Regular grid/alignment patterns
         
         Args:
             frame_np (np.ndarray): Input frame as numpy array in HWC format
             
         Returns:
-            bool: True if menu detected, False otherwise
+            bool: True if menu-like UI detected, False otherwise
         """
         try:
             # Ensure frame is in BGR format for OpenCV
@@ -579,44 +605,48 @@ class VisualMetricsEstimator:
             if frame_bgr.shape[2] != 3:
                 return False
                 
-            # Define exact menu colors from user-provided hex values
-            # These are the colors found in the Cities Skylines 2 menu
-            dark_green_rgb = (38, 42, 29)  # #262A1D - Dark green background
-            gray_rgb = (124, 129, 119)     # #7C8177 - Medium gray with green tint
+            # Convert to grayscale for analysis
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             
-            # Convert RGB to BGR for OpenCV
-            dark_green_bgr = (dark_green_rgb[2], dark_green_rgb[1], dark_green_rgb[0])
-            gray_bgr = (gray_rgb[2], gray_rgb[1], gray_rgb[0])
+            # 1. Check for large areas of uniform color (common in menus)
+            # Apply slight blur to remove noise
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             
-            # Define color ranges with tolerance
-            tolerance = 15
+            # Calculate standard deviation in regions - low std dev = uniform areas
+            regions_y, regions_x = 4, 4
+            height, width = gray.shape
+            region_h, region_w = height // regions_y, width // regions_x
             
-            # Create lower and upper bounds for dark green
-            dark_green_lower = np.array([max(0, dark_green_bgr[i] - tolerance) for i in range(3)])
-            dark_green_upper = np.array([min(255, dark_green_bgr[i] + tolerance) for i in range(3)])
+            uniform_regions = 0
+            for y in range(regions_y):
+                for x in range(regions_x):
+                    region = blurred[y*region_h:(y+1)*region_h, x*region_w:(x+1)*region_w]
+                    std_dev = np.std(region)
+                    if std_dev < 20:  # Low standard deviation = uniform color
+                        uniform_regions += 1
             
-            # Create lower and upper bounds for gray
-            gray_lower = np.array([max(0, gray_bgr[i] - tolerance) for i in range(3)])
-            gray_upper = np.array([min(255, gray_bgr[i] + tolerance) for i in range(3)])
+            # 2. Look for text-like high contrast regions
+            # Apply edge detection
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (height * width)
             
-            # Create color masks
-            dark_green_mask = cv2.inRange(frame_bgr, dark_green_lower, dark_green_upper)
-            gray_mask = cv2.inRange(frame_bgr, gray_lower, gray_upper)
+            # 3. Check for aligned elements (common in menus)
+            # Detect horizontal and vertical lines
+            horizontal_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=width//5, maxLineGap=20)
+            vertical_lines = cv2.HoughLinesP(edges, 1, np.pi/2, 50, minLineLength=height//5, maxLineGap=20)
             
-            # Calculate percentage of pixels matching each color
-            dark_green_percentage = np.sum(dark_green_mask > 0) / dark_green_mask.size
-            gray_percentage = np.sum(gray_mask > 0) / gray_mask.size
+            has_aligned_elements = (horizontal_lines is not None and len(horizontal_lines) > 2) or \
+                                  (vertical_lines is not None and len(vertical_lines) > 2)
             
-            # Log the percentages
-            logger.debug(f"Menu color detection: Dark green={dark_green_percentage:.4f}, Gray={gray_percentage:.4f}")
+            # Combine features to detect menu-like patterns
+            uniform_ratio = uniform_regions / (regions_x * regions_y)
+            is_menu_like = (uniform_ratio > 0.3 and edge_density > 0.05) or \
+                          (uniform_ratio > 0.2 and has_aligned_elements)
             
-            # Check if the percentages exceed thresholds
-            # Menu typically has a significant amount of these colors
-            # Using a lower threshold since we're looking for very specific colors
-            return (dark_green_percentage > 1.00) or (gray_percentage > 1.00)
+            return is_menu_like
             
         except Exception as e:
-            logger.error(f"Error in color-based menu detection: {e}")
+            logger.error(f"Error in menu color detection: {e}")
             return False
 
     def find_resume_game_button(self, frame_np: np.ndarray) -> Tuple[bool, Tuple[int, int]]:

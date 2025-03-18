@@ -223,21 +223,23 @@ class WorldModelCNN(nn.Module):
         return loss.item()
 
 
-class StateDensityEstimator:
+class DensityEstimator:
     """Tracks density of visited states in feature space for novelty detection."""
     
-    def __init__(self, feature_dim=512, memory_size=10000):
+    def __init__(self, feature_dim=512, history_size=2000, device=None):
         """Initialize state density estimator.
         
         Args:
             feature_dim (int): Dimension of feature vectors
-            memory_size (int): Maximum number of states to keep in memory
+            history_size (int): Maximum number of states to keep in memory
+            device: Device for computations
         """
         self.feature_dim = feature_dim
-        self.memory_size = memory_size
-        self.state_memory = np.zeros((memory_size, feature_dim), dtype=np.float32)
-        self.memory_index = 0
-        self.filled = 0
+        self.history_size = history_size
+        self.device = device
+        self.state_memory = []
+        self.mean_vector = None
+        self.std_vector = None
         
     def compute_novelty(self, state_embedding: torch.Tensor) -> float:
         """Compute novelty score based on distance to nearest neighbors.
@@ -248,57 +250,69 @@ class StateDensityEstimator:
         Returns:
             float: Novelty score (higher = more novel)
         """
-        if self.filled == 0:
+        if not self.state_memory:
             # First state is always novel
             return 1.0
         
-        # Convert to numpy array
-        state_np = state_embedding.detach().cpu().numpy()
+        # Convert to device if needed
+        if self.device is not None:
+            state_embedding = state_embedding.to(self.device)
         
+        # Normalize embedding if we have statistics
+        if self.mean_vector is not None:
+            state_embedding = (state_embedding - self.mean_vector) / (self.std_vector + 1e-8)
+            
         # Compute distances to all states in memory
-        if len(state_np.shape) > 1:
-            state_np = state_np.squeeze()
+        distances = []
+        for stored_state in self.state_memory:
+            # Using dot product as a similarity measure (higher = more similar)
+            # Convert to distance where higher = more different
+            similarity = torch.nn.functional.cosine_similarity(state_embedding, stored_state, dim=0)
+            distance = 1.0 - similarity.item()
+            distances.append(distance)
             
-        # Use only filled portion of memory
-        filled_memory = self.state_memory[:self.filled]
-        distances = np.linalg.norm(filled_memory - state_np, axis=1)
-        
-        # If only one state in memory, just return the distance to that state
-        if self.filled == 1:
-            return min(1.0, distances[0] / 10.0)
-        
         # Use average distance to k nearest neighbors as novelty measure
-        k = min(10, self.filled)  # Ensure k is not larger than number of states
-        if k <= 2:  # If we have 2 or fewer states in memory
-            return min(1.0, np.mean(distances) / 10.0)
-            
-        # Get k nearest neighbors - ensure k is at least 3 to avoid np.partition errors
-        k = max(3, k)
-        if k >= len(distances):
-            return min(1.0, np.mean(distances) / 10.0)
-            
-        nearest_distances = np.partition(distances, k)[:k]
-        novelty_score = np.mean(nearest_distances)
+        k = min(5, len(distances))
+        distances.sort()  # Sort in ascending order
+        novelty = sum(distances[:k]) / k
         
-        # Normalize novelty score (0 to 1)
-        return min(1.0, novelty_score / 10.0)  # Adjust scaling factor as needed
-    
-    def update(self, state_embedding: torch.Tensor):
-        """Add state to memory.
+        # Normalize to 0-1 range
+        novelty = min(1.0, max(0.0, novelty))
+        
+        return novelty
+        
+    def update(self, state_embedding: torch.Tensor) -> None:
+        """Update memory with new state embedding.
         
         Args:
             state_embedding (torch.Tensor): Feature embedding of current state
         """
-        state_np = state_embedding.detach().cpu().numpy()
-        if len(state_np.shape) > 1:
-            state_np = state_np.squeeze()
+        # Convert to device if needed
+        if self.device is not None:
+            state_embedding = state_embedding.to(self.device)
             
-        # Store state in memory
-        self.state_memory[self.memory_index] = state_np
+        # Add to memory
+        self.state_memory.append(state_embedding.detach())
         
-        # Update index and filled count
-        self.memory_index = (self.memory_index + 1) % self.memory_size
-        self.filled = min(self.filled + 1, self.memory_size)
+        # Keep memory size within limit
+        if len(self.state_memory) > self.history_size:
+            self.state_memory.pop(0)
+            
+        # Update statistics periodically
+        if len(self.state_memory) % 50 == 0:
+            self._update_statistics()
+            
+    def _update_statistics(self) -> None:
+        """Update mean and standard deviation of stored embeddings."""
+        if not self.state_memory:
+            return
+            
+        # Stack all embeddings
+        all_embeddings = torch.stack(self.state_memory)
+        
+        # Compute mean and std along batch dimension
+        self.mean_vector = torch.mean(all_embeddings, dim=0)
+        self.std_vector = torch.std(all_embeddings, dim=0)
 
 
 class TemporalAssociationMemory:
@@ -580,7 +594,7 @@ class AutonomousRewardSystem:
         
         # Feature embedding and state density tracking
         self.feature_extractor = self.world_model.encoder
-        self.density_estimator = StateDensityEstimator(
+        self.density_estimator = DensityEstimator(
             feature_dim=512,  # Output size of feature extractor
             history_size=2000,
             device=self.device
