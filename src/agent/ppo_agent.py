@@ -79,6 +79,55 @@ class PPOAgent:
         self.update_lock = threading.Lock()
         self.is_updating = False
         
+    def act(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select an action based on the current state.
+        
+        Args:
+            state (torch.Tensor): Current environment state
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (action, log_prob, value)
+        """
+        # Ensure state is on the correct device
+        if state.device != self.device:
+            state = state.to(self.device)
+            
+        # Ensure state has batch dimension
+        if state.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+            state = state.unsqueeze(0)
+            
+        # Get action probabilities and value from the network
+        with torch.no_grad():
+            action_probs, value = self.network(state)
+            
+            # Apply penalties to menu-opening actions if needed
+            if self.menu_action_indices and hasattr(self, 'menu_action_penalties'):
+                # Create a penalty mask (default 1.0 for all actions)
+                penalty_mask = torch.ones_like(action_probs)
+                
+                # Apply specific penalties to known menu actions
+                for action_idx, penalty in self.menu_action_penalties.items():
+                    if 0 <= action_idx < len(penalty_mask):
+                        # Reduce probability of this action by the penalty factor
+                        penalty_mask[action_idx] = max(0.1, 1.0 - penalty)
+                        
+                # Apply the mask to reduce probabilities of problematic actions
+                action_probs = action_probs * penalty_mask
+                
+                # Renormalize probabilities
+                action_probs = action_probs / action_probs.sum()
+        
+        # Sample action from probability distribution
+        action = torch.multinomial(action_probs, 1)
+        
+        # Get log probability of selected action
+        if action_probs.dim() == 1:
+            log_prob = torch.log(action_probs[action[0]]).unsqueeze(0)
+        else:
+            log_prob = torch.log(action_probs[0, action[0]]).unsqueeze(0)
+            
+        return action, log_prob, value
+    
     def select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select an action using the current policy.
         

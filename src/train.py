@@ -287,65 +287,195 @@ def collect_trajectory(
     device: torch.device,
     args: argparse.Namespace
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, Dict]:
-    """Collect a trajectory of experience."""
-    # Reset watchdog timer at the start of trajectory collection
-    if 'watchdog' in globals():
-        watchdog.reset()
+    """Collect a trajectory of experience to train the agent.
     
-    # Initialize storage
-    states = []
-    next_states = []
-    actions = []
-    log_probs = []
-    rewards = []
-    values = []
-    dones = []
-    total_reward = 0.0
-    last_info = {}
+    Args:
+        env: The environment to collect the trajectory from
+        agent: The agent to use for action selection
+        max_steps: The maximum number of steps to collect
+        device: The device to use for tensor operations
+        args: The command line arguments
     
-    # Get initial state and create frame history
-    state = env.reset()
-    frame_history = [state.clone() for _ in range(4)]  # Always use 4 frames for stacking
+    Returns:
+        A tuple containing:
+        - states: Tensor of state observations
+        - actions: Tensor of actions
+        - log_probs: Tensor of log probabilities
+        - values: Tensor of value estimates
+        - rewards: Tensor of rewards
+        - dones: Tensor of done flags
+        - next_states: Tensor of next state observations
+        - total_reward: The total reward for the trajectory
+        - stats: Dictionary of trajectory statistics
+    """
+    # Reset environment and prepare for collection
+    obs = env.reset()
     
-    # Create stacked initial state
-    stacked_state = torch.cat(frame_history, dim=0)
+    # Set default movement speed (can be adjusted during training)
+    # Setting it to a moderate value (0.6) which is faster than default but not too fast
+    env.input_simulator.set_movement_speed(0.6)
     
-    # Loop through steps
+    # Track speed adjustment
+    speed_adjustment_counter = 0
+    adjust_speed_every = 100  # Adjust speed every 100 steps
+
+    # Track performance and reward for adaptive speed
+    recent_rewards = []
+    recent_fps = []
+    
+    # Initialize stats tracking
+    episode_reward = 0
+    total_reward = 0
+    total_intrinsic_reward = 0
+    total_extrinsic_reward = 0
+    step_count = 0
+    episode_count = 0
+    stats = {
+        'fps': 0,
+        'steps_per_second': 0,
+        'avg_reward': 0,
+        'intrinsic_reward': 0,
+        'extrinsic_reward': 0,
+        'episodes': 0,
+        'steps': 0,
+        'avg_episode_length': 0,
+        'intrinsic_reward_ratio': 0
+    }
+    
+    # Time tracking
+    start_time = time.time()
+    last_time = start_time
+    
+    # Clear agent memory buffers
+    agent.states = []
+    agent.actions = []
+    agent.action_probs = []
+    agent.values = []
+    agent.rewards = []
+    agent.dones = []
+    agent.next_states = []
+    
+    # Collect the trajectory
     for step in range(max_steps):
-        # Make sure to reset the watchdog every iteration to prevent false triggers
-        if 'watchdog' in globals():
-            watchdog.reset()
+        # Reset the watchdog timer for each step
+        watchdog.reset()
         
-        # Select action using current policy
-        action, log_prob, value = agent.select_action(stacked_state.unsqueeze(0))
+        # Get agent to select an action
+        with torch.no_grad():
+            action, log_prob, value = agent.act(obs)
         
-        # Execute action in environment
-        next_state, reward, done, info = env.step(action.item())
-        last_info = info  # Store the last info dictionary
+        # Execute the action in the environment and get next observation, reward, done flag
+        next_obs, reward, done, info = env.step(action.item())
+        
+        # Store step information
+        agent.states.append(obs)
+        agent.actions.append(action)
+        agent.action_probs.append(log_prob)
+        agent.values.append(value)
+        agent.rewards.append(torch.tensor([reward], device=device))
+        agent.dones.append(torch.tensor([done], device=device))
+        agent.next_states.append(next_obs)
+        
+        # Update observation
+        obs = next_obs
+        
+        # Update episode statistics
+        episode_reward += reward
         total_reward += reward
+        step_count += 1
         
-        # Update frame history for next state
-        frame_history.pop(0)
-        frame_history.append(next_state.clone())
-        stacked_next_state = torch.cat(frame_history, dim=0)
+        # Track rewards for adaptive speed adjustment
+        recent_rewards.append(reward)
+        if len(recent_rewards) > 50:  # Keep last 50 rewards
+            recent_rewards.pop(0)
         
-        # Store transition
-        states.append(stacked_state)
-        actions.append(action)
-        log_probs.append(log_prob)
-        values.append(value)
-        rewards.append(reward)
-        dones.append(done)
-        next_states.append(stacked_next_state)
+        # Calculate current FPS
+        current_time = time.time()
+        frame_time = current_time - last_time
+        current_fps = 1.0 / max(frame_time, 1e-6)  # Avoid division by zero
+        last_time = current_time
         
-        # Update current state
-        stacked_state = stacked_next_state
+        # Track FPS for adaptive speed
+        recent_fps.append(current_fps)
+        if len(recent_fps) > 20:  # Keep last 20 FPS readings
+            recent_fps.pop(0)
         
-        # End episode if done
+        # Adaptively adjust mouse and keyboard speed
+        speed_adjustment_counter += 1
+        if speed_adjustment_counter >= adjust_speed_every:
+            speed_adjustment_counter = 0
+            
+            # Calculate average recent reward and FPS
+            avg_recent_reward = sum(recent_rewards) / max(len(recent_rewards), 1)
+            avg_recent_fps = sum(recent_fps) / max(len(recent_fps), 1)
+            
+            # Base speed on performance:
+            # 1. If rewards are positive and FPS is good, increase speed
+            # 2. If rewards are negative or FPS is low, decrease speed
+            current_speed = env.input_simulator.mouse_speed
+            
+            # Speed adjustment logic
+            if avg_recent_fps < 20:  # FPS is low
+                # Reduce speed to improve performance
+                new_speed = max(0.3, current_speed - 0.1)
+                logger.info(f"FPS low ({avg_recent_fps:.1f}), reducing speed to {new_speed:.1f}")
+            elif avg_recent_reward > 0 and avg_recent_fps > 30:
+                # Performing well, increase speed
+                new_speed = min(0.9, current_speed + 0.05)
+                logger.info(f"Performance good (reward: {avg_recent_reward:.1f}, FPS: {avg_recent_fps:.1f}), increasing speed to {new_speed:.1f}")
+            elif avg_recent_reward < -5:
+                # Performing poorly, reduce speed
+                new_speed = max(0.3, current_speed - 0.05)
+                logger.info(f"Performance poor (reward: {avg_recent_reward:.1f}), reducing speed to {new_speed:.1f}")
+            else:
+                # Maintain current speed
+                new_speed = current_speed
+            
+            # Apply the speed adjustment if it changed
+            if new_speed != current_speed:
+                env.input_simulator.set_movement_speed(new_speed)
+        
+        # Check if episode is done
         if done:
-            break
+            # Reset environment for the next episode
+            obs = env.reset()
+            episode_count += 1
+            
+            # Log episode statistics
+            logger.info(f"Episode {episode_count} completed with reward {episode_reward:.2f} after {step_count} steps")
+            episode_reward = 0
+            
+            # Store intrinsic/extrinsic reward information if available in info
+            if 'intrinsic_reward' in info:
+                total_intrinsic_reward += info['intrinsic_reward']
+            if 'extrinsic_reward' in info:
+                total_extrinsic_reward += info['extrinsic_reward']
     
-    return states, actions, log_probs, rewards, values, dones, next_states, total_reward, last_info
+    # Calculate final statistics
+    elapsed_time = time.time() - start_time
+    stats['fps'] = step_count / elapsed_time if elapsed_time > 0 else 0
+    stats['steps_per_second'] = step_count / elapsed_time if elapsed_time > 0 else 0
+    stats['avg_reward'] = total_reward / max(step_count, 1)
+    stats['intrinsic_reward'] = total_intrinsic_reward
+    stats['extrinsic_reward'] = total_extrinsic_reward
+    stats['episodes'] = episode_count
+    stats['steps'] = step_count
+    stats['avg_episode_length'] = step_count / max(episode_count, 1)
+    
+    total_ir_er = total_intrinsic_reward + total_extrinsic_reward
+    if total_ir_er != 0:
+        stats['intrinsic_reward_ratio'] = total_intrinsic_reward / total_ir_er
+    
+    # Convert agent memory to tensors for training
+    states = torch.cat(agent.states).detach()
+    actions = torch.cat(agent.actions).detach()
+    log_probs = torch.cat(agent.action_probs).detach()
+    values = torch.cat(agent.values).detach()
+    rewards = torch.cat(agent.rewards).detach()
+    dones = torch.cat(agent.dones).detach()
+    next_states = torch.cat(agent.next_states).detach()
+    
+    return states, actions, log_probs, values, rewards, dones, next_states, total_reward, stats
 
 def find_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint file in the given directory."""
@@ -586,7 +716,7 @@ def main():
             
             # Collect trajectory
             trajectory_start_time = time.time()
-            states, actions, log_probs, rewards, values, dones, next_states, episode_reward, last_info = collect_trajectory(
+            states, actions, log_probs, values, rewards, dones, next_states, episode_reward, stats = collect_trajectory(
                 env=env,
                 agent=agent,
                 max_steps=args.max_steps,
@@ -649,7 +779,7 @@ def main():
             
             # Check if episode ended stuck in a menu - using last_info from trajectory
             menu_detected = False
-            if last_info and last_info.get('menu_detected', False):
+            if stats and stats.get('menu_detected', False):
                 menu_detected = True
             
             if menu_detected:
