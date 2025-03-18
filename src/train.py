@@ -462,15 +462,20 @@ def train():
     config = HardwareConfig(
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        force_cpu=args.force_cpu,
+        device="cpu" if args.force_cpu else "auto",
         use_fp16=args.fp16
     )
+    
+    # Update RL-specific parameters
+    config.gamma = args.gamma
+    config.gae_lambda = args.gae_lambda
+    config.clip_range = args.clip_param
     
     # Create environment and agent
     env = CitiesEnvironment(
         config=config,
         mock_mode=args.mock_env,
-        enable_menu_detection=not args.disable_menu_detection
+        menu_screenshot_path=None  # Use default menu detection
     )
     
     agent = PPOAgent(

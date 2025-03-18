@@ -4,7 +4,7 @@ env/
 .env/
 .venv/
 ENV/
-*.pyc
+
 # Cursor IDE
 .cursor/
 
@@ -18,7 +18,7 @@ logs/
 tb_logs/
 wandb/
 
-# Python
+# Python bytecode
 __pycache__/
 *.py[cod]
 *$py.class
@@ -39,11 +39,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-*.pyc
+
 # Jupyter
 .ipynb_checkpoints
 *.ipynb
-*.pyc
 
 # IDE
 .idea/
