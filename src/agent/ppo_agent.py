@@ -313,6 +313,16 @@ class PPOAgent:
         Returns:
             dict: Training metrics
         """
+        # Reset watchdog if available
+        try:
+            import sys
+            if 'watchdog' in sys.modules or 'watchdog' in globals():
+                watchdog = sys.modules.get('watchdog') or globals().get('watchdog')
+                if hasattr(watchdog, 'reset'):
+                    watchdog.reset()
+        except:
+            pass
+            
         # Increment episode counter for adaptive curiosity decay
         self.training_episodes += 1
         
@@ -349,6 +359,16 @@ class PPOAgent:
         # Compute returns and advantages
         returns = self._compute_returns()
         
+        # Reset watchdog after potentially expensive return computation
+        try:
+            import sys
+            if 'watchdog' in sys.modules or 'watchdog' in globals():
+                watchdog = sys.modules.get('watchdog') or globals().get('watchdog')
+                if hasattr(watchdog, 'reset'):
+                    watchdog.reset()
+        except:
+            pass
+        
         # Check if returns is empty
         if returns.numel() == 0:
             self._clear_memory()
@@ -368,9 +388,19 @@ class PPOAgent:
             self.curiosity_optimizer.zero_grad()
             icm_loss.backward()
             self.curiosity_optimizer.step()
+            
+            # Reset watchdog after ICM update
+            try:
+                import sys
+                if 'watchdog' in sys.modules or 'watchdog' in globals():
+                    watchdog = sys.modules.get('watchdog') or globals().get('watchdog')
+                    if hasattr(watchdog, 'reset'):
+                        watchdog.reset()
+            except:
+                pass
         
         # PPO update
-        for _ in range(self.config.ppo_epochs):
+        for epoch in range(self.config.ppo_epochs):
             # Get current action probabilities and values
             action_probs, value_preds = self.network(states)
             
@@ -400,6 +430,17 @@ class PPOAgent:
             loss.backward()
             nn.utils.clip_grad_norm_(self.network.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
+            
+            # Reset watchdog after each PPO epoch
+            if epoch % 2 == 0:  # Reset every other epoch to avoid too frequent resets
+                try:
+                    import sys
+                    if 'watchdog' in sys.modules or 'watchdog' in globals():
+                        watchdog = sys.modules.get('watchdog') or globals().get('watchdog')
+                        if hasattr(watchdog, 'reset'):
+                            watchdog.reset()
+                except:
+                    pass
             
         # Clear memory
         self._clear_memory()

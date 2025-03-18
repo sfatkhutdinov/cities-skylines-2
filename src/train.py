@@ -41,11 +41,13 @@ def current_timestamp():
 # Add a watchdog timer to force-kill the program if it becomes unresponsive
 class WatchdogTimer:
     """Watchdog timer that forcibly kills the program if it becomes unresponsive"""
-    def __init__(self, timeout=5):
+    def __init__(self, timeout=60):  # Increased from 5 to 60 seconds
         self.timeout = timeout
         self.active = False
         self.reset_event = threading.Event()
         self.thread = None
+        self.warning_triggered = False
+        self.warning_time = None
         
     def start(self):
         """Start the watchdog timer"""
@@ -63,16 +65,34 @@ class WatchdogTimer:
         """Main watchdog loop"""
         while self.active:
             # Wait for the reset event or timeout
-            triggered = not self.reset_event.wait(self.timeout)
+            triggered = not self.reset_event.wait(self.timeout / 2 if self.warning_triggered else self.timeout)
+            
             if triggered and self.active:
-                # Timeout occurred and watchdog is still active
-                logger.critical("WATCHDOG TIMEOUT - Program appears frozen. Forcibly terminating!")
-                os._exit(2)  # Force terminate with error code
+                # First trigger a warning
+                if not self.warning_triggered:
+                    self.warning_triggered = True
+                    self.warning_time = time.time()
+                    logger.warning(f"WATCHDOG WARNING - Program may be unresponsive. Will terminate in {self.timeout / 2} seconds if no reset.")
+                else:
+                    # Only terminate if the warning period has also elapsed
+                    if time.time() - self.warning_time >= self.timeout / 2:
+                        # Timeout occurred twice and watchdog is still active
+                        logger.critical("WATCHDOG TIMEOUT - Program appears frozen. Forcibly terminating!")
+                        os._exit(2)  # Force terminate with error code
+                    
+            else:
+                # Reset was received, clear warning state
+                self.warning_triggered = False
+                
             self.reset_event.clear()
     
     def reset(self):
         """Reset the watchdog timer - must be called regularly to prevent termination"""
-        self.reset_event.set()
+        if self.active:
+            self.reset_event.set()
+            if self.warning_triggered:
+                logger.info("Watchdog timer reset after warning - continuing execution")
+                self.warning_triggered = False
         
     def stop(self):
         """Stop the watchdog timer"""
@@ -82,7 +102,7 @@ class WatchdogTimer:
             self.thread.join(1.0)  # Wait for thread to exit, with timeout
 
 # Start a global watchdog timer that will be reset in the main loop
-watchdog = WatchdogTimer(timeout=15)  # 15-second timeout
+watchdog = WatchdogTimer(timeout=60)  # Increased from 15 to 60 seconds
 
 # Add key listener for emergency shutdown
 def setup_emergency_key_listener():
@@ -191,6 +211,7 @@ def parse_args():
     parser.add_argument("--no_auto_resume", action="store_true", help="Disable automatic checkpoint resumption")
     parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")
     parser.add_argument("--capture_menu", action="store_true", help="Capture a menu screenshot at startup (assumes you're starting from the menu)")
+    parser.add_argument("--watchdog_timeout", type=int, default=60, help="Watchdog timeout in seconds (set to 0 to disable)")
     return parser.parse_args()
 
 # Global variable for graceful interruption
@@ -577,9 +598,14 @@ def main():
     if sys.platform.startswith('win'):
         setup_windows_exit_handler()
     
-    # Start the watchdog timer at the beginning of main
+    # Configure and start watchdog timer based on command line args
     if 'watchdog' in globals():
-        watchdog.start()
+        if args.watchdog_timeout > 0:
+            watchdog.timeout = args.watchdog_timeout
+            logger.info(f"Watchdog timer configured with {args.watchdog_timeout}s timeout")
+            watchdog.start()
+        else:
+            logger.info("Watchdog timer disabled by command line argument")
     
     try:
         # Create hardware config with specific device & dtype
@@ -604,6 +630,10 @@ def main():
         # Create environment
         logger.info("Initializing environment...")
         
+        # Reset watchdog before potentially long environment initialization
+        if 'watchdog' in globals():
+            watchdog.reset()
+        
         # Default resolution
         if args.resolution:
             width, height = map(int, args.resolution.split('x'))
@@ -616,9 +646,17 @@ def main():
             menu_screenshot_path=args.menu_screenshot
         )
         
+        # Reset watchdog after environment initialization
+        if 'watchdog' in globals():
+            watchdog.reset()
+        
         # Create agent
         logger.info("Initializing agent...")
         agent = PPOAgent(config)
+        
+        # Reset watchdog after agent initialization
+        if 'watchdog' in globals():
+            watchdog.reset()
         
         # Ensure checkpoint directory exists
         os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -635,6 +673,10 @@ def main():
                 agent.network.model = torch.compile(agent.network.model)
             except Exception as e:
                 logger.warning(f"Module compilation failed: {e}")
+                
+        # Reset watchdog after model compilation
+        if 'watchdog' in globals():
+            watchdog.reset()
         
         # Resume from checkpoints if available and not explicitly disabled
         load_checkpoint = not args.no_auto_resume
@@ -642,7 +684,10 @@ def main():
         if load_checkpoint:
             logger.info(f"Looking for checkpoints to resume training (use_best={use_best})...")
             agent.load_checkpoint(use_best=use_best)
-        
+            # Reset watchdog after potentially long checkpoint loading
+            if 'watchdog' in globals():
+                watchdog.reset()
+                
         # Initialize episode counter and best reward tracking
         start_episode = 0
         best_reward = float('-inf')
@@ -711,8 +756,15 @@ def main():
             # Wait for previous async update to complete if active
             if hasattr(agent, 'is_updating') and agent.is_updating:
                 logger.info("Waiting for previous async update to complete...")
+                wait_start = time.time()
                 while agent.is_updating:
                     time.sleep(0.1)  # Small sleep to prevent CPU spin
+                    
+                    # Reset watchdog during long waits
+                    if time.time() - wait_start > 10:
+                        if 'watchdog' in globals():
+                            watchdog.reset()
+                        wait_start = time.time()
             
             # Collect trajectory
             trajectory_start_time = time.time()
@@ -724,6 +776,10 @@ def main():
                 args=args
             )
             trajectory_time = time.time() - trajectory_start_time
+            
+            # Reset watchdog after trajectory collection
+            if 'watchdog' in globals():
+                watchdog.reset()
             
             # Convert lists to tensors for the agent
             if states and isinstance(states[0], torch.Tensor):
@@ -747,9 +803,34 @@ def main():
                     dones[i], 
                     next_states[i] if i < len(next_states) else None
                 )
+                
+                # Reset watchdog periodically during memory storage
+                if i > 0 and i % 1000 == 0 and 'watchdog' in globals():
+                    watchdog.reset()
             
             # Start asynchronous update
             logger.info(f"Starting async update for episode {episode+1}")
+            
+            # Add a callback to reset watchdog during async update
+            original_update_thread = agent._update_thread
+            
+            def watchdog_update_thread():
+                update_start_time = time.time()
+                update_thread = threading.Thread(target=original_update_thread)
+                update_thread.daemon = True
+                update_thread.start()
+                
+                # Reset watchdog periodically while update is running
+                while update_thread.is_alive():
+                    if 'watchdog' in globals():
+                        watchdog.reset()
+                    time.sleep(10)  # Check every 10 seconds
+                    
+            # Replace the update thread with our watchdog-enabled version
+            if hasattr(agent, '_update_thread'):
+                agent._original_update_thread = agent._update_thread
+                agent._update_thread = watchdog_update_thread
+                
             agent.update_async()
             
             # While update is happening asynchronously, we can do other work
@@ -760,6 +841,9 @@ def main():
                 checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_{episode+1}.pt")
                 agent.save(checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
+                # Reset watchdog after saving checkpoint
+                if 'watchdog' in globals():
+                    watchdog.reset()
             
             # Occasionally save time-based checkpoint
             current_time = time.time()
@@ -768,6 +852,9 @@ def main():
                 agent.save(time_checkpoint_path)
                 logger.info(f"Saved time-based checkpoint to {time_checkpoint_path}")
                 last_time_checkpoint = current_time
+                # Reset watchdog after saving checkpoint
+                if 'watchdog' in globals():
+                    watchdog.reset()
             
             # Log metrics
             logger.info(f"Episode {episode+1}: Reward={episode_reward:.2f}, Steps={len(states)}")
