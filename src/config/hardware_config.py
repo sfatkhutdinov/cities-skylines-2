@@ -69,7 +69,7 @@ class HardwareConfig:
         self.gae_lambda = gae_lambda
         
         # Hardware settings
-        self.use_cuda = 'cuda' in device
+        self.use_cuda = 'cuda' in device and torch.cuda.is_available() and torch.cuda.device_count() > 0
         self.mixed_precision = mixed_precision and self.use_cuda
         self.tensor_cores = tensor_cores and self.use_cuda
         self.cudnn_benchmark = cudnn_benchmark and self.use_cuda
@@ -92,44 +92,55 @@ class HardwareConfig:
         # Configure CUDA if available
         if self.use_cuda:
             try:
-                # Get and print detailed GPU information
-                print(f"GPU: {torch.cuda.get_device_name(0)}")
-                print(f"CUDA Version: {torch.version.cuda}")
-                print(f"CUDA Capability: {torch.cuda.get_device_capability(0)}")
-                print(f"Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-                print(f"Memory Allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
-                
-                # Set thread configuration for optimal performance
-                torch.set_num_threads(16)  # Adjust based on CPU core count
-                if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
-                    torch.cuda.set_per_process_memory_fraction(0.9)  # Reserve 90% of GPU memory
-                
-                # Check GPU compute capability
-                capability = torch.cuda.get_device_capability(0)
-                if capability[0] < 7:
-                    print("Warning: GPU compute capability < 7.0. Some optimizations will be disabled.")
-                    self.tensor_cores = False
+                # Check CUDA device count
+                cuda_device_count = torch.cuda.device_count()
+                if cuda_device_count == 0:
+                    print("Warning: CUDA is available but no CUDA devices found.")
+                    self.use_cuda = False
+                    self.device = "cpu"
                     self.mixed_precision = False
+                    self.tensor_cores = False
+                    self.pin_memory = False
+                    self.num_parallel_envs = 1
                 else:
-                    print(f"GPU Compute Capability {capability[0]}.{capability[1]} supports tensor cores and mixed precision")
-                
-                # Configure PyTorch CUDA optimizations
-                torch.backends.cudnn.benchmark = self.cudnn_benchmark
-                torch.backends.cudnn.deterministic = False  # Better performance, less reproducibility
-                torch.backends.cuda.matmul.allow_tf32 = self.tensor_cores
-                torch.backends.cudnn.allow_tf32 = self.tensor_cores
-                
-                # Setup Automatic Mixed Precision if enabled
-                if self.mixed_precision:
-                    self.scaler = torch.amp.GradScaler()
-                    print("Automatic Mixed Precision (AMP) enabled")
-                
-                # Optimize memory allocation strategy
-                if hasattr(torch.cuda, 'memory_stats'):
-                    print("CUDA memory allocation strategy: caching allocator enabled")
-                
-                # Empty cache to start fresh
-                torch.cuda.empty_cache()
+                    # Get and print detailed GPU information
+                    print(f"GPU: {torch.cuda.get_device_name(0)}")
+                    print(f"CUDA Version: {torch.version.cuda}")
+                    print(f"CUDA Capability: {torch.cuda.get_device_capability(0)}")
+                    print(f"Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+                    print(f"Memory Allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+                    
+                    # Set thread configuration for optimal performance
+                    torch.set_num_threads(16)  # Adjust based on CPU core count
+                    if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+                        torch.cuda.set_per_process_memory_fraction(0.9)  # Reserve 90% of GPU memory
+                    
+                    # Check GPU compute capability
+                    capability = torch.cuda.get_device_capability(0)
+                    if capability[0] < 7:
+                        print("Warning: GPU compute capability < 7.0. Some optimizations will be disabled.")
+                        self.tensor_cores = False
+                        self.mixed_precision = False
+                    else:
+                        print(f"GPU Compute Capability {capability[0]}.{capability[1]} supports tensor cores and mixed precision")
+                    
+                    # Configure PyTorch CUDA optimizations
+                    torch.backends.cudnn.benchmark = self.cudnn_benchmark
+                    torch.backends.cudnn.deterministic = False  # Better performance, less reproducibility
+                    torch.backends.cuda.matmul.allow_tf32 = self.tensor_cores
+                    torch.backends.cudnn.allow_tf32 = self.tensor_cores
+                    
+                    # Setup Automatic Mixed Precision if enabled
+                    if self.mixed_precision:
+                        self.scaler = torch.amp.GradScaler()
+                        print("Automatic Mixed Precision (AMP) enabled")
+                    
+                    # Optimize memory allocation strategy
+                    if hasattr(torch.cuda, 'memory_stats'):
+                        print("CUDA memory allocation strategy: caching allocator enabled")
+                    
+                    # Empty cache to start fresh
+                    torch.cuda.empty_cache()
                 
             except Exception as e:
                 print(f"Warning: CUDA initialization failed: {e}")

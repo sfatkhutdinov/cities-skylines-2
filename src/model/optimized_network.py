@@ -153,13 +153,18 @@ class OptimizedNetwork(nn.Module):
         if x.dim() == 3:
             x = x.unsqueeze(0)
             
+        # Get expected dimensions from config
+        height, width = getattr(self.config, 'resolution', (240, 320))
+        
         # Handle incorrect input shape
-        if x.shape[2] != 100 or x.shape[3] != 100:
-            x = F.interpolate(x, size=(100, 100), mode='bilinear', align_corners=False)
+        if x.shape[2] != height or x.shape[3] != width:
+            x = F.interpolate(x, size=(height, width), mode='bilinear', align_corners=False)
             
         features = self.conv_layers(x)
         features = features.reshape(x.size(0), -1)
-        return self.policy_head(features)
+        fc_features = self.fc_layers(features)
+        logits = self.policy_head(fc_features)
+        return torch.softmax(logits, dim=1)
         
     def get_value(self, x: torch.Tensor) -> torch.Tensor:
         """Get value prediction only.
@@ -179,10 +184,14 @@ class OptimizedNetwork(nn.Module):
         if x.dim() == 3:
             x = x.unsqueeze(0)
             
+        # Get expected dimensions from config
+        height, width = getattr(self.config, 'resolution', (240, 320))
+        
         # Handle incorrect input shape
-        if x.shape[2] != 100 or x.shape[3] != 100:
-            x = F.interpolate(x, size=(100, 100), mode='bilinear', align_corners=False)
+        if x.shape[2] != height or x.shape[3] != width:
+            x = F.interpolate(x, size=(height, width), mode='bilinear', align_corners=False)
             
         features = self.conv_layers(x)
         features = features.reshape(x.size(0), -1)
-        return self.value_head(features) 
+        fc_features = self.fc_layers(features)
+        return self.value_head(fc_features) 

@@ -13,9 +13,9 @@ import os
 from .visual_metrics import VisualMetricsEstimator
 from .reward_system import RewardSystem
 from .optimized_capture import OptimizedScreenCapture
-from src.utils.performance_safeguards import PerformanceSafeguards
+from ..utils.performance_safeguards import PerformanceSafeguards
 from .input_simulator import InputSimulator
-from src.config.hardware_config import HardwareConfig
+from ..config.hardware_config import HardwareConfig
 import win32api
 
 logger = logging.getLogger(__name__)

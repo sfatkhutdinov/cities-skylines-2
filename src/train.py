@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument("--resume_best", action="store_true", help="Resume training from best checkpoint")
     parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")
     parser.add_argument("--capture_menu", action="store_true", help="Capture a menu screenshot at startup (assumes you're starting from the menu)")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     return parser.parse_args()
 
 def collect_trajectory(
@@ -186,6 +187,10 @@ def collect_trajectory(
 
 def find_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint file in the given directory."""
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
+        return None
+        
     checkpoint_files = list(checkpoint_dir.glob("checkpoint_*.pt"))
     if not checkpoint_files:
         return None
@@ -272,15 +277,19 @@ def train():
     best_reward = float("-inf")
     
     if args.resume or args.resume_best:
-        if args.resume_best and (checkpoint_dir / "best_model.pt").exists():
-            # Resume from best model
-            try:
-                logger.info("Loading best model checkpoint...")
-                agent.load(checkpoint_dir / "best_model.pt")
-                checkpoint_loaded = True
-                logger.info("Successfully loaded best model")
-            except Exception as e:
-                logger.error(f"Failed to load best model: {str(e)}")
+        if args.resume_best:
+            best_checkpoint_path = checkpoint_dir / "best_model.pt"
+            if best_checkpoint_path.exists():
+                # Resume from best model
+                try:
+                    logger.info("Loading best model checkpoint...")
+                    agent.load(best_checkpoint_path)
+                    checkpoint_loaded = True
+                    logger.info("Successfully loaded best model")
+                except Exception as e:
+                    logger.error(f"Failed to load best model: {str(e)}")
+            else:
+                logger.warning(f"Best model checkpoint not found at {best_checkpoint_path}")
         elif args.resume:
             # Find and load the latest checkpoint
             latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
@@ -298,20 +307,27 @@ def train():
         if not checkpoint_loaded:
             logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
     
-    # Initialize wandb (comment out to skip)
-    # logger.info("Initializing wandb...")
-    # wandb.init(
-    #     project="cities-skylines-2-rl",
-    #     config=vars(args)
-    # )
-    # logger.info("wandb initialized")
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        try:
+            logger.info("Initializing wandb...")
+            wandb.init(
+                project="cities-skylines-2-rl",
+                config=vars(args)
+            )
+            logger.info("wandb initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize wandb: {str(e)}")
+            args.use_wandb = False
     
     # Training loop
     if checkpoint_loaded:
         # Try to find the current best reward if we're resuming
-        if (checkpoint_dir / "best_model.pt").exists():
+        best_model_path = checkpoint_dir / "best_model.pt"
+        if best_model_path.exists():
             # Just a heuristic: assume the best model has a better reward than starting fresh
             best_reward = 0  # This will be updated on the first better reward
+            logger.info(f"Found existing best model, setting initial best_reward to {best_reward}")
     
     logger.info("Starting training loop...")
     for episode in range(start_episode, args.num_episodes):
@@ -324,7 +340,10 @@ def train():
         logger.info(f"Collected trajectory - Length: {episode_length}, Reward: {episode_reward:.2f}")
         
         # Check if episode ended stuck in a menu
-        if experiences.get('info', {}).get('menu_detected', False):
+        current_frame = env.screen_capture.capture_frame()
+        menu_detected = env.visual_estimator.detect_main_menu(current_frame)
+        
+        if menu_detected:
             logger.warning("Episode ended while stuck in a menu - taking corrective action")
             
             # Try clicking the RESUME GAME button directly with exact coordinates
@@ -356,13 +375,14 @@ def train():
         metrics = agent.update()
         logger.info(f"Updated agent - Metrics: {metrics}")
         
-        # Log episode results
-        # wandb.log({
-        #     "episode": episode,
-        #     "episode_reward": episode_reward,
-        #     "episode_length": episode_length,
-        #     **metrics
-        # })
+        # Log episode results to wandb if enabled
+        if args.use_wandb:
+            wandb.log({
+                "episode": episode,
+                "episode_reward": episode_reward,
+                "episode_length": episode_length,
+                **metrics
+            })
         
         # Save checkpoint if best reward
         if episode_reward > best_reward:

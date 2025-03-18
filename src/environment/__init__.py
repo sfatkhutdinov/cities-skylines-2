@@ -8,4 +8,4 @@ from .optimized_capture import OptimizedScreenCapture
 from .visual_metrics import VisualMetricsEstimator
 from .reward_system import RewardSystem
 
-__all__ = ['CitiesEnvironment', 'InputSimulator', 'OptimizedScreenCapture'] 
+__all__ = ['CitiesEnvironment', 'InputSimulator', 'OptimizedScreenCapture', 'VisualMetricsEstimator', 'RewardSystem'] 

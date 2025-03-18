@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple
-from src.config.hardware_config import HardwareConfig
+from ..config.hardware_config import HardwareConfig
 import cv2
 import os
 import logging
