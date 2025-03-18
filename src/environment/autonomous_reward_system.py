@@ -60,20 +60,26 @@ class WorldModelCNN(nn.Module):
             nn.ReLU()
         ).to(self.device, dtype=self.dtype)
         
+        # Action embedding layer - maps discrete action index to embedding
+        self.action_embedding = nn.Embedding(1000, 64).to(self.device, dtype=self.dtype)  # Support up to 1000 actions
+        
+        # Action fusion layer - combines action embedding with visual features
+        self.action_fusion = nn.Sequential(
+            nn.Linear(64, encoder_output.size(1) * encoder_output.size(2) * encoder_output.size(3)),
+            nn.ReLU()
+        ).to(self.device, dtype=self.dtype)
+        
         # World model (predicts next frame)
         self.frame_predictor = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.Conv2d(64 + 1, 64, kernel_size=3, padding=1),  # +1 channel for action influence
             nn.ReLU(),
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.ConvTranspose2d(32, 3, kernel_size=8, stride=4, padding=2, output_padding=0)
         ).to(self.device, dtype=self.dtype)
         
-        # Action embedding
-        self.action_embedder = nn.Sequential(
-            nn.Linear(1, 64),  # Assumes action is a single discrete value
-            nn.ReLU()
-        ).to(self.device, dtype=self.dtype)
+        # Store encoder output shape for reshaping
+        self.encoder_shape = encoder_output.shape[1:]
         
         # Initialize optimizer
         self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
@@ -121,11 +127,26 @@ class WorldModelCNN(nn.Module):
         # Encode frame
         encoded = self.encoder(frame)
         
-        # Embed action (we'll ignore it for now as it complicates architecture)
-        # In a full implementation, we would condition the prediction on the action
+        # Embed and incorporate action
+        action_tensor = torch.tensor([action], device=self.device).long()
+        action_embedding = self.action_embedding(action_tensor)
         
-        # Predict next frame
-        predicted = self.frame_predictor(encoded)
+        # Reshape action embedding to match spatial dimensions of encoded frame
+        action_spatial = self.action_fusion(action_embedding).view(-1, *self.encoder_shape)
+        
+        # Create an action influence channel
+        batch_size, channels, height, width = encoded.shape
+        action_channel = torch.zeros((batch_size, 1, height, width), device=self.device, dtype=self.dtype)
+        
+        # Apply action influence
+        for b in range(batch_size):
+            action_channel[b, 0] = action_spatial[b, 0].view(height, width)
+        
+        # Concatenate features with action channel
+        combined_features = torch.cat([encoded, action_channel], dim=1)
+        
+        # Predict next frame using the combined features
+        predicted = self.frame_predictor(combined_features)
         
         # Ensure output has the same dimensions as input
         if predicted.shape[-2:] != frame.shape[-2:]:
@@ -158,22 +179,35 @@ class WorldModelCNN(nn.Module):
         if len(curr.shape) == 3:
             curr = curr.unsqueeze(0)  # Add batch dimension
         
-        # Predict next frame
+        # Encode previous frame
         encoded = self.encoder(prev)
-        predicted = self.frame_predictor(encoded)
+        
+        # Embed and incorporate action
+        action_tensor = torch.tensor([action], device=self.device).long()
+        action_embedding = self.action_embedding(action_tensor)
+        
+        # Reshape action embedding to match spatial dimensions of encoded frame
+        action_spatial = self.action_fusion(action_embedding).view(-1, *self.encoder_shape)
+        
+        # Create an action influence channel
+        batch_size, channels, height, width = encoded.shape
+        action_channel = torch.zeros((batch_size, 1, height, width), device=self.device, dtype=self.dtype)
+        
+        # Apply action influence
+        for b in range(batch_size):
+            action_channel[b, 0] = action_spatial[b, 0].view(height, width)
+        
+        # Concatenate features with action channel
+        combined_features = torch.cat([encoded, action_channel], dim=1)
+        
+        # Predict next frame
+        predicted = self.frame_predictor(combined_features)
         
         # Ensure tensors have the same shape before computing loss
-        # Get the shapes of both tensors
-        pred_shape = predicted.shape
-        curr_shape = curr.shape
-        
-        # If shapes don't match, resize the predicted frame to match the current frame
-        # This is consistent with how _compute_prediction_error handles it
-        if pred_shape != curr_shape:
-            print(f"Resizing predicted tensor to match current frame: {pred_shape} -> {curr_shape}")
+        if predicted.shape != curr.shape:
             predicted = F.interpolate(
                 predicted, 
-                size=(curr_shape[2], curr_shape[3]),
+                size=(curr.shape[2], curr.shape[3]),
                 mode='bilinear',
                 align_corners=False
             )
@@ -965,7 +999,8 @@ class AutonomousRewardSystem:
             
         # Apply escalating penalty based on how long the agent has been stuck
         # This encourages the agent to learn to exit menus quickly
-        base_penalty = -0.2
-        escalation_factor = min(consecutive_menu_steps * 0.1, 1.0)
+        base_penalty = -5.0  # Increased from -0.2 to -5.0 for stronger discouragement
+        # Escalate much faster based on consecutive steps
+        escalation_factor = min(consecutive_menu_steps * 0.5, 10.0)  # Faster escalation, up to 10x
         
         return base_penalty * (1.0 + escalation_factor) 

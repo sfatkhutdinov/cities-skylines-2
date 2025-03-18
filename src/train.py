@@ -72,6 +72,26 @@ def signal_handler(sig, frame):
     logger.info("Received interrupt signal (CTRL+C). Will save checkpoint and exit after current episode.")
     stop_training = True
 
+    # Emergency release of all input devices
+    try:
+        from pynput.keyboard import Controller as KeyboardController
+        from pynput.mouse import Controller as MouseController
+        
+        # Release any keys that might be pressed
+        keyboard = KeyboardController()
+        for key in keyboard._pressed:
+            keyboard.release(key)
+        
+        # Release mouse buttons
+        mouse = MouseController()
+        mouse.release(mouse.Button.left)
+        mouse.release(mouse.Button.right)
+        mouse.release(mouse.Button.middle)
+        
+        logger.info("Released all keyboard and mouse input controls")
+    except Exception as e:
+        logger.error(f"Failed to release input controls: {e}")
+
 # Register the signal handler
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)

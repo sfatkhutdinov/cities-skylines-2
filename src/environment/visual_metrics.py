@@ -90,43 +90,44 @@ class VisualMetricsEstimator:
         logger.info("Fallback menu detection initialized")
         
     def detect_menu_fallback(self, frame: torch.Tensor) -> bool:
-        """Detect if current frame shows a menu using fallback method.
+        """Fallback method for menu detection based on visual features.
         
         Args:
-            frame (torch.Tensor): Current frame observation
+            frame (torch.Tensor): Input frame
             
         Returns:
-            bool: True if menu is detected, False otherwise
+            bool: True if menu detected, False otherwise
         """
-        # Convert tensor to numpy for OpenCV processing
-        if frame.device != torch.device('cpu'):
-            frame_np = frame.cpu().numpy()
-        else:
-            frame_np = frame.numpy()
+        if frame is None:
+            return False
             
-        # Convert from CHW to HWC format and scale to 0-255 range
-        if frame_np.shape[0] == 3:  # CHW format
-            frame_np = np.transpose(frame_np, (1, 2, 0))
-        frame_np = (frame_np * 255).astype(np.uint8)
+        # Convert frame to numpy array for OpenCV processing
+        if isinstance(frame, torch.Tensor):
+            frame_np = frame.detach().cpu().numpy()
+            if len(frame_np.shape) == 3:  # CHW format
+                frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+        else:
+            frame_np = frame
+            
+        # Ensure frame is in proper format
+        if frame_np is None or frame_np.size == 0 or frame_np.max() == 0:
+            return False
+            
+        # Convert to grayscale and proper format
+        if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
+            gray = cv2.cvtColor(frame_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        else:
+            gray = frame_np.astype(np.uint8)
+            
+        # Detect edges for UI elements
+        edges = cv2.Canny(gray, 50, 150)
         
-        # Convert to BGR for OpenCV
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        # Calculate UI element coverage percentage
+        ui_percentage = np.sum(edges > 0) / edges.size
+        self.ui_pattern_threshold = 0.02  # Lowered threshold (was 0.05) to be more aggressive
         
-        # Detect UI elements using color thresholding
-        ui_mask = np.zeros((frame_bgr.shape[0], frame_bgr.shape[1]), dtype=np.uint8)
-        
-        for lower, upper in self.menu_color_ranges:
-            lower = np.array(lower)
-            upper = np.array(upper)
-            mask = cv2.inRange(frame_bgr, lower, upper)
-            ui_mask = cv2.bitwise_or(ui_mask, mask)
-        
-        # Calculate percentage of UI elements
-        ui_percentage = np.sum(ui_mask > 0) / (ui_mask.shape[0] * ui_mask.shape[1])
-        
-        # Check for UI layout patterns (horizontal lines, grids, etc.)
-        edges = cv2.Canny(frame_bgr, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=100, maxLineGap=10)
+        # Look for horizontal lines (common in UI)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
         
         horizontal_lines = 0
         if lines is not None:
@@ -136,8 +137,38 @@ class VisualMetricsEstimator:
                 if angle < 10 or angle > 170:  # Almost horizontal lines
                     horizontal_lines += 1
         
-        # Decision based on combined factors
-        is_menu = (ui_percentage > self.ui_pattern_threshold) or (horizontal_lines > 5)
+        # Check for large areas of solid color (common in menus)
+        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        large_rectangles = 0
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            if area > (gray.shape[0] * gray.shape[1] * 0.05):  # Rectangles covering >5% of screen
+                large_rectangles += 1
+                
+        # Add text detection (menus often have text)
+        # Simple proxy for text: look for vertical edges close to horizontal edges
+        text_proxy = 0
+        kernel = np.ones((5,5), np.uint8)
+        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+        if lines is not None:
+            vertical_line_mask = np.zeros_like(edges)
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                if 80 < angle < 100:  # Almost vertical lines
+                    cv2.line(vertical_line_mask, (x1, y1), (x2, y2), 255, 2)
+            
+            # Count potential text areas
+            text_proxy = np.sum(vertical_line_mask & dilated_edges) / np.sum(dilated_edges + 1e-8)
+            
+        # Decision based on combined factors - more aggressive detection
+        is_menu = (ui_percentage > self.ui_pattern_threshold) or \
+                  (horizontal_lines > 3) or \
+                  (large_rectangles >= 2) or \
+                  (text_proxy > 0.1)
         
         return is_menu
         

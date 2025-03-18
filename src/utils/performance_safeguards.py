@@ -6,7 +6,7 @@ import torch
 import psutil
 import gc
 from typing import Optional, Dict
-from config.hardware_config import HardwareConfig
+from src.config.hardware_config import HardwareConfig
 
 class PerformanceSafeguards:
     def __init__(self, config: HardwareConfig):

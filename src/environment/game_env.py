@@ -1549,9 +1549,43 @@ class CitiesEnvironment:
     
     def close(self):
         """Clean up resources."""
-        self.screen_capture.close()
-        self.input_simulator.close()
-        
+        try:
+            # Ensure all keys and mouse buttons are released
+            logger.info("Releasing all input devices...")
+            
+            # Release any pressed keys
+            # Commonly used keys in the game
+            common_keys = ['w', 'a', 's', 'd', 'q', 'e', 'r', 'f', 't', 'g', 
+                          'escape', 'space', '1', '2', '3', '4', '5', '6']
+            
+            for key in common_keys:
+                try:
+                    self.input_simulator.release_key(key)
+                except:
+                    pass
+            
+            # Release all mouse buttons
+            try:
+                self.input_simulator.mouse.release(self.input_simulator.mouse.Button.left)
+                self.input_simulator.mouse.release(self.input_simulator.mouse.Button.right)
+                self.input_simulator.mouse.release(self.input_simulator.mouse.Button.middle)
+            except:
+                pass
+                
+            # Reset mouse to center position
+            try:
+                self._reset_mouse_position()
+            except:
+                pass
+                
+            # Close other resources
+            self.screen_capture.close()
+            self.input_simulator.close()
+            
+            logger.info("Environment resources cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error during environment cleanup: {e}")
+    
     def render(self):
         """Display the current frame (for debugging)."""
         if self.current_frame is not None:

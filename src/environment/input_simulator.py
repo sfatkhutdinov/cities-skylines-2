@@ -706,14 +706,33 @@ class InputSimulator:
             print(f"Error releasing mouse buttons: {e}")
             
         # Release common keyboard keys
-        for key in ["shift", "ctrl", "alt", "space"]:
+        common_keys = [
+            "w", "a", "s", "d", "q", "e", "r", "f", "t", "g", "z", "x", "c", "v", "b",
+            "1", "2", "3", "4", "5", "6", 
+            "shift", "ctrl", "alt", "space", "escape", "tab", "enter",
+            "up", "down", "left", "right"
+        ]
+        
+        for key in common_keys:
             try:
                 if key in self.key_map:
                     self.keyboard.release(self.key_map[key])
             except Exception as e:
                 print(f"Error releasing key {key}: {e}")
-                
-        print("Input simulator resources released")
+        
+        # Attempt to use direct Win32 method to ensure system-wide inputs are cleared
+        try:
+            # Block for 100ms to ensure all keys are released
+            time.sleep(0.1)
+            
+            # Use SendInput with empty inputs to flush any pending input
+            ctypes.windll.user32.BlockInput(True)  # Block inputs temporarily
+            time.sleep(0.05)
+            ctypes.windll.user32.BlockInput(False)  # Unblock inputs
+        except Exception as e:
+            print(f"Error during system-wide input release: {e}")
+            
+        print("Input simulator closed, all inputs released")
 
     def press_mouse_button(self, button: str = 'left'):
         """Press a mouse button without releasing it.
