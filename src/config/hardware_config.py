@@ -146,6 +146,10 @@ class HardwareConfig:
         print(f"Tensor cores: {self.tensor_cores}")
         print(f"Number of parallel environments: {self.num_parallel_envs}")
         
+        # Print frame stack and skip settings 
+        print(f"Frame stack: {self.frame_stack}")
+        print(f"Frame skip: {self.frame_skip}")
+        
     def get_device(self) -> torch.device:
         """Get PyTorch device."""
         return torch.device(self.device)

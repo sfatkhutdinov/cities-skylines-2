@@ -9,6 +9,7 @@ import time
 import signal
 import datetime
 import os
+import threading  # For async updates
 
 # Set up logging
 logging.basicConfig(
@@ -103,7 +104,12 @@ def collect_trajectory(
     dones = []
     total_reward = 0.0
     
+    # Get initial state
     state = env.reset()
+    
+    # For frame stacking - create history of last 4 frames
+    frame_stack_size = 4  # Match model expectation of 12 channels (4 frames * 3 channels)
+    frame_history = [state.clone() for _ in range(frame_stack_size)]
     
     # Define mini-batch size for parallel processing
     mini_batch_size = min(8, max_steps)  # Process up to 8 steps at once
@@ -123,7 +129,9 @@ def collect_trajectory(
         
         # Collect experience for the mini-batch
         for i in range(current_batch_size):
-            batch_states.append(state)
+            # Create stacked frame by concatenating last 4 frames along channel dimension
+            stacked_frame = torch.cat(frame_history, dim=0)
+            batch_states.append(stacked_frame)
             
             # If this is the last step in the batch, we'll use the results
             # Otherwise we're just pre-filling the batch
@@ -144,6 +152,13 @@ def collect_trajectory(
                     next_state, reward, done, info = env.step(action)
                     total_reward += reward
                     
+                    # Update frame history
+                    frame_history.pop(0)
+                    frame_history.append(next_state.clone())
+                    
+                    # Create stacked next state
+                    stacked_next_state = torch.cat(frame_history, dim=0)
+                    
                     # Store transition
                     states.append(batch_states[j])
                     actions.append(action)
@@ -151,7 +166,7 @@ def collect_trajectory(
                     values.append(value)
                     rewards.append(reward)
                     dones.append(done)
-                    next_states.append(next_state)
+                    next_states.append(stacked_next_state)
                     
                     # Prepare for next iteration
                     state = next_state
@@ -216,69 +231,54 @@ def find_latest_checkpoint(checkpoint_dir):
 
 def main():
     """Main training loop."""
-    global stop_training
-    logger.info("Starting training...")
     args = parse_args()
     
-    # Set debug level if requested
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
+    global stop_training
     
-    # Parse resolution 
-    try:
-        width, height = map(int, args.resolution.split('x'))
-        logger.info(f"Using resolution: {width}x{height}")
-    except:
-        logger.warning(f"Invalid resolution format: {args.resolution}, using default 320x240")
-        width, height = 320, 240
+    # Set up device
+    device = torch.device(args.device)
+    logger.info(f"Using device: {device}")
     
-    # Create checkpoint directory
+    # Create directory for checkpoints
     checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(exist_ok=True)
     logger.info(f"Created checkpoint directory at {checkpoint_dir}")
     
-    # Initialize environment and config
-    logger.info("Initializing environment...")
+    # Parse resolution string
+    if 'x' in args.resolution:
+        width, height = map(int, args.resolution.split('x'))
+    else:
+        # Default resolution
+        width, height = 320, 240
+    logger.info(f"Using resolution: {width}x{height}")
+    
+    # Initialize hardware config
     logger.info("Initializing config...")
-    config = HardwareConfig(
+    hardware_config = HardwareConfig(
+        device=args.device,
+        resolution=(width, height),
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
-        device=args.device,
-        resolution=(height, width),  # Use resolution from args
-        frame_stack=1  # Explicitly set frame_stack to 1 to avoid channel mismatch
+        frame_stack=4  # Explicitly set to match model expectation
     )
-    # Add mock_mode flag to config for the model to use
-    config.mock_mode = args.mock
-    logger.info(f"Config initialized with device: {config.device}, mock mode: {args.mock}")
+    logger.info(f"Config initialized with device: {args.device}, mock mode: {args.mock}")
     
-    # Initialize environment with config
+    # Initialize environment
+    logger.info("Initializing environment...")
     env = CitiesEnvironment(
-        config=config, 
-        mock_mode=args.mock, 
+        config=hardware_config,
+        mock_mode=args.mock,
         menu_screenshot_path=args.menu_screenshot
     )
-    # Set minimum delay between actions
-    env.min_action_delay = args.action_delay
-    logger.info(f"Environment initialized with mock mode: {args.mock}, action delay: {args.action_delay}s")
     
-    # If user requested to capture menu screenshot at startup
-    if args.capture_menu and not args.mock:
-        logger.info("Capturing menu screenshot at startup (assuming game is showing menu)")
-        menu_path = "menu_reference.png"
-        if env.capture_menu_reference(menu_path):
-            logger.info(f"Successfully captured menu screenshot to {menu_path}")
-        else:
-            logger.warning("Failed to capture menu screenshot")
-    
+    # Initialize agent
     logger.info("Initializing agent...")
-    agent = PPOAgent(config)
-    logger.info("Agent initialized")
+    agent = PPOAgent(hardware_config)
     
-    # Handle checkpoint resumption if requested
+    # Initialize episode counter and best reward tracking
     start_episode = 0
-    checkpoint_loaded = False
-    best_reward = float("-inf")
+    best_reward = float('-inf')
+    last_time_checkpoint = time.time()
     
     # Auto-resume logic: Automatically load checkpoints unless explicitly disabled
     should_auto_resume = not args.no_auto_resume and not args.resume and not args.resume_best
@@ -294,13 +294,12 @@ def main():
             try:
                 logger.info("Loading best model checkpoint...")
                 agent.load(checkpoint_dir / "best_model.pt")
-                checkpoint_loaded = True
                 logger.info("Successfully loaded best model")
             except Exception as e:
                 logger.error(f"Failed to load best model: {str(e)}")
                 
         # If best model loading was not requested or failed, try latest checkpoint
-        if not checkpoint_loaded and (args.resume or should_auto_resume):
+        if not (args.resume or args.resume_best or should_auto_resume):
             # Find and load the latest checkpoint
             latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
             if latest_checkpoint:
@@ -309,12 +308,11 @@ def main():
                     logger.info(f"Loading checkpoint from {checkpoint_path}...")
                     agent.load(checkpoint_path)
                     start_episode = episode_num
-                    checkpoint_loaded = True
                     logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
                 except Exception as e:
                     logger.error(f"Failed to load checkpoint: {str(e)}")
         
-        if not checkpoint_loaded:
+        if not (args.resume or args.resume_best or should_auto_resume):
             logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
         elif should_auto_resume:
             logger.info("Auto-resume successfully loaded checkpoint.")
@@ -341,7 +339,6 @@ def main():
     best_reward = float('-inf')
     episode_times = []
     total_steps = 0
-    last_time_checkpoint = time.time()
     
     for episode in range(start_episode, args.num_episodes):
         logger.info(f"Starting episode {episode+1}/{args.num_episodes}")
@@ -378,7 +375,7 @@ def main():
             env=env,
             agent=agent,
             max_steps=args.max_steps,
-            device=args.device,
+            device=device,
             args=args
         )
         trajectory_time = time.time() - trajectory_start_time
@@ -430,11 +427,6 @@ def main():
         # Log metrics
         logger.info(f"Episode {episode+1}: Reward={episode_reward:.2f}, Steps={len(states)}")
         
-        # Optional: wait for update to complete before next episode
-        # Uncomment if you want to ensure update completes before next trajectory
-        # while agent.is_updating:
-        #     time.sleep(0.1)
-            
         # Check if we should stop training
         if stop_training:
             logger.info("Stopping training due to interrupt signal")

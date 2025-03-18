@@ -406,40 +406,71 @@ class PPOAgent:
         self.intrinsic_rewards = []  # Clear intrinsic rewards
         self.dones = []
         
-    def save(self, path: str):
-        """Save agent state.
+    def save(self, path: str) -> None:
+        """Save the agent to disk.
         
         Args:
-            path (str): Path to save state to
+            path (str): Path to save to
         """
-        torch.save({
-            'network_state': self.network.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'icm_state': self.icm.state_dict(),  # Save ICM state
-            'curiosity_optimizer_state': self.curiosity_optimizer.state_dict()
-        }, path)
-        
-    def load(self, path: str):
-        """Load agent state.
+        # Make sure we're not in the middle of an update
+        with self.update_lock:
+            save_dict = {
+                'network': self.network.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'curiosity_module': self.icm.state_dict(),
+                'curiosity_optimizer': self.curiosity_optimizer.state_dict(),
+                'menu_action_indices': self.menu_action_indices,
+                'menu_action_penalties': self.menu_action_penalties,
+                'curiosity_weight': self.curiosity_weight,
+                'menu_penalty_decay': self.menu_penalty_decay,
+                'training_episodes': self.training_episodes
+            }
+            
+            # Save to disk
+            torch.save(save_dict, path)
+            
+    def load(self, path: str) -> None:
+        """Load the agent from disk.
         
         Args:
-            path (str): Path to load state from
+            path (str): Path to load from
         """
-        checkpoint = torch.load(path, map_location=self.device)
-        self.network.load_state_dict(checkpoint['network_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        # Make sure we're not in the middle of an update
+        with self.update_lock:
+            # Load the checkpoint
+            checkpoint = torch.load(path, map_location=self.device)
+            
+            # Load the network and optimizer states
+            self.network.load_state_dict(checkpoint['network'])
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+            
+            # Load the curiosity module if available
+            if 'curiosity_module' in checkpoint:
+                self.icm.load_state_dict(checkpoint['curiosity_module'])
+                self.curiosity_optimizer.load_state_dict(checkpoint['curiosity_optimizer'])
+                
+            # Load menu action data if available
+            if 'menu_action_indices' in checkpoint:
+                self.menu_action_indices = checkpoint['menu_action_indices']
+            if 'menu_action_penalties' in checkpoint:
+                self.menu_action_penalties = checkpoint['menu_action_penalties']
+                
+            # Load training progress variables if available
+            if 'curiosity_weight' in checkpoint:
+                self.curiosity_weight = checkpoint['curiosity_weight']
+            if 'menu_penalty_decay' in checkpoint:
+                self.menu_penalty_decay = checkpoint['menu_penalty_decay']
+            if 'training_episodes' in checkpoint:
+                self.training_episodes = checkpoint['training_episodes']
+                
+            print(f"Successfully loaded agent from {path}")
         
-        # Load ICM state if it exists
-        if 'icm_state' in checkpoint:
-            self.icm.load_state_dict(checkpoint['icm_state'])
-            self.curiosity_optimizer.load_state_dict(checkpoint['curiosity_optimizer_state'])
-        
-    def register_menu_action(self, action_idx: int, penalty: float = 0.5):
-        """Register an action that led to a menu state to discourage its selection.
+    def register_menu_action(self, action_idx: int, penalty: float = 0.5) -> None:
+        """Register an action that opens a menu so it can be avoided.
         
         Args:
-            action_idx (int): Index of the action that led to a menu
-            penalty (float): Penalty factor (0-1) to apply to this action's probability
+            action_idx (int): Index of the action to register
+            penalty (float): Penalty to apply to this action (0.0-1.0)
         """
         if not hasattr(self, 'menu_action_indices'):
             self.menu_action_indices = []
@@ -503,4 +534,42 @@ class PPOAgent:
                 next_state = next_state.unsqueeze(0)
                 
             # Store in buffer
+            self.next_states.append(next_state)
+
+    def update_menu_penalty(self, action_idx: int, reward: float) -> None:
+        """Update the menu penalty for an action based on reward.
+        
+        Args:
+            action_idx (int): Action index
+            reward (float): Reward received
+        """
+        # ... existing code ...
+        
+    def remember(self, state, action, action_prob, reward, value, done, next_state):
+        """Store experience in memory for later updates.
+        
+        Args:
+            state: Current environment state
+            action: Action taken
+            action_prob: Log probability of the action
+            reward: Reward received
+            value: Value prediction
+            done: Whether the episode is done
+            next_state: Next state
+        """
+        # Store in memory
+        if isinstance(action_prob, torch.Tensor):
+            action_prob = action_prob.item()
+            
+        if isinstance(value, torch.Tensor):
+            value = value.item() 
+            
+        self.states.append(state)
+        self.actions.append(action)
+        self.action_probs.append(action_prob)
+        self.values.append(value)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        
+        if next_state is not None:
             self.next_states.append(next_state) 

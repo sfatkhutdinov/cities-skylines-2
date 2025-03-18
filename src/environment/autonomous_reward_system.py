@@ -48,8 +48,9 @@ class WorldModelCNN(nn.Module):
             width, height = getattr(config, 'resolution', (1920, 1080))
             # Scale down to match the expected input resolution for the model
             model_width, model_height = 320, 240  # Typical processing resolution
-            # Create a dummy input to compute output shape
-            dummy_input = torch.zeros(1, 3, model_height, model_width, device=self.device)
+            # Create a dummy input to compute output shape - MUST use the same dtype as the encoder
+            dummy_input = torch.zeros(1, 3, model_height, model_width, 
+                                     device=self.device, dtype=self.dtype)
             encoder_output = self.encoder(dummy_input)
             flattened_size = encoder_output.numel() // encoder_output.size(0)
             

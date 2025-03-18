@@ -101,16 +101,24 @@ class OptimizedNetwork(nn.Module):
         self.to(config.get_device())
         
         # Apply PyTorch 2.0 compile optimization if available
-        if hasattr(torch, 'compile') and torch.cuda.is_available():
-            try:
+        try:
+            # Check for proper PyTorch 2.0+ and CUDA
+            torch_version = tuple(map(int, torch.__version__.split('.')[:2]))
+            supports_compile = torch_version >= (2, 0) and hasattr(torch, 'compile')
+            if supports_compile and torch.cuda.is_available():
                 logger.info("Applying PyTorch 2.0 model compilation for hardware optimization")
-                self.conv_layers = torch.compile(self.conv_layers)
-                self.fc_layers = torch.compile(self.fc_layers)
-                self.policy_head = torch.compile(self.policy_head)
-                self.value_head = torch.compile(self.value_head)
-                logger.info("Model compilation successful - this should improve performance")
-            except Exception as e:
-                logger.warning(f"PyTorch model compilation failed: {e}. Continuing with standard model.")
+                # Wrap compilation in try-except block
+                try:
+                    # Selective compile for key modules
+                    self.policy_head = torch.compile(self.policy_head)
+                    self.value_head = torch.compile(self.value_head)
+                    logger.info("Model compilation successful - this should improve performance")
+                except Exception as e:
+                    logger.warning(f"Module compilation failed, continuing with uncompiled version: {e}")
+            else:
+                logger.info("PyTorch 2.0 compilation not available (requires PyTorch 2.0+ and CUDA)")
+        except Exception as e:
+            logger.warning(f"Could not check for PyTorch compilation support: {e}")
         
     def _calculate_conv_output_size(self, in_channels, height, width):
         """Calculate the size of the flattened features after convolution."""
@@ -128,6 +136,20 @@ class OptimizedNetwork(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (action_probs, value)
         """
+        # Log input shape for debugging
+        input_shape = x.shape
+        logger.debug(f"Network input shape: {input_shape}")
+        
+        # Check for channel dimension mismatch
+        expected_channels = 3 * getattr(self.config, 'frame_stack', 4)  # Default to 4 frames if not specified
+        if input_shape[1] != expected_channels:
+            logger.warning(f"Input channel mismatch: got {input_shape[1]}, expected {expected_channels}")
+            
+            # Try to automatically determine if this is a frame stacking issue
+            if input_shape[1] == 3 and expected_channels > 3:
+                logger.warning(f"Input appears to be single frame (3 channels) but model expects {expected_channels} channels")
+                logger.warning("This might be a frame stacking issue. Make sure to stack frames if the model was trained with them")
+        
         # Ensure input is on the correct device
         x = x.to(self.config.get_device())
         
@@ -137,28 +159,38 @@ class OptimizedNetwork(nn.Module):
             
         # Handle incorrect input shape
         if x.shape[2] != self.expected_height or x.shape[3] != self.expected_width:
+            logger.debug(f"Resizing input from {x.shape[2]}x{x.shape[3]} to {self.expected_height}x{self.expected_width}")
             x = F.interpolate(x, size=(self.expected_height, self.expected_width), mode='bilinear', align_corners=False)
+        
+        try:
+            # Pass through convolutional layers
+            x = self.conv_layers(x)
             
-        # Pass through convolutional layers
-        x = self.conv_layers(x)
-        
-        # Flatten
-        x = x.view(x.size(0), -1)
-        
-        # Pass through fully connected layers
-        features = self.fc_layers(x)
-        
-        # Extract UI features for better interface recognition
-        ui_features = self.ui_features(features)
-        
-        # Get policy (action probabilities) and value
-        action_logits = self.policy_head(features)
-        value = self.value_head(features)
-        
-        # Apply softmax to get probabilities
-        action_probs = torch.softmax(action_logits, dim=1)
-        
-        return action_probs, value.squeeze(-1)
+            # Log shape after convolution for debugging
+            logger.debug(f"After conv shape: {x.shape}")
+            
+            # Flatten
+            x = x.view(x.size(0), -1)
+            
+            # Pass through fully connected layers
+            features = self.fc_layers(x)
+            
+            # Extract UI features for better interface recognition
+            ui_features = self.ui_features(features)
+            
+            # Get policy (action probabilities) and value
+            action_logits = self.policy_head(features)
+            value = self.value_head(features)
+            
+            # Apply softmax to get probabilities
+            action_probs = torch.softmax(action_logits, dim=1)
+            
+            return action_probs, value.squeeze(-1)
+        except RuntimeError as e:
+            # Enhanced error reporting
+            logger.error(f"Error during forward pass with input shape {input_shape}: {str(e)}")
+            logger.error(f"Model expected height: {self.expected_height}, width: {self.expected_width}, channels: {expected_channels}")
+            raise
         
     def get_action_probs(self, x: torch.Tensor) -> torch.Tensor:
         """Get action probabilities only.
