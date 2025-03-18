@@ -48,8 +48,15 @@ class OptimizedScreenCapture:
         self.frame_history: List[torch.Tensor] = []
         self.max_history_length = 4
         
-    def capture_frame(self) -> torch.Tensor:
-        """Capture and process a single frame."""
+    def capture_frame(self, fast_mode=False) -> torch.Tensor:
+        """Capture and process a single frame.
+        
+        Args:
+            fast_mode: If True, use faster but potentially lower quality capture for non-critical frames
+            
+        Returns:
+            torch.Tensor: The captured frame as a tensor with shape [C, H, W]
+        """
         # If in mock mode, return the mock frame
         if self.use_mock:
             # Add some random noise to simulate changes
@@ -57,7 +64,8 @@ class OptimizedScreenCapture:
             self.mock_frame = torch.clamp(self.mock_frame + noise, 0, 1)
             
             # Add to history
-            self._update_frame_history(self.mock_frame)
+            if not fast_mode:
+                self._update_frame_history(self.mock_frame)
             
             return self.mock_frame
             
@@ -176,7 +184,7 @@ class OptimizedScreenCapture:
                 except Exception as e2:
                     print(f"All capture methods failed: {str(e2)} - using mock frame")
                     self.use_mock = True
-                    return self.capture_frame()
+                    return self.capture_frame(fast_mode=fast_mode)
             
             # Convert from BGR to RGB if needed
             if len(frame_resized.shape) == 3 and frame_resized.shape[2] == 3:
@@ -189,15 +197,16 @@ class OptimizedScreenCapture:
             if frame_tensor.device != self.device:
                 frame_tensor = frame_tensor.to(self.device)
                 
-            # Add to history
-            self._update_frame_history(frame_tensor)
+            # Add to history only if not in fast mode
+            if not fast_mode:
+                self._update_frame_history(frame_tensor)
                 
             return frame_tensor
         except Exception as e:
             # Fallback to mock mode instead of raising an exception
             print(f"Screen capture completely failed: {str(e)}. Falling back to mock mode.")
             self.use_mock = True
-            return self.capture_frame()
+            return self.capture_frame(fast_mode=fast_mode)
             
     def _update_frame_history(self, frame: torch.Tensor):
         """Update frame history for temporal processing."""

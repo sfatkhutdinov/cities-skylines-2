@@ -124,7 +124,7 @@ class OptimizedNetwork(nn.Module):
         return flattened_size
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the network.
+        """Forward pass for the network.
         
         Args:
             x (torch.Tensor): Input state tensor
@@ -145,6 +145,14 @@ class OptimizedNetwork(nn.Module):
             if input_shape[1] == 3 and expected_channels > 3:
                 logger.warning(f"Input appears to be single frame (3 channels) but model expects {expected_channels} channels")
                 logger.warning("This might be a frame stacking issue. Make sure to stack frames if the model was trained with them")
+                
+                # Try to fix it by duplicating the input frame to match expected channels
+                if getattr(self.config, 'auto_fix_frame_stack', False):
+                    logger.warning(f"Attempting to auto-fix by duplicating frame {self.config.frame_stack} times")
+                    # Duplicate the frame to match expected channel count
+                    x_fixed = x.repeat(1, self.config.frame_stack, 1, 1)
+                    logger.warning(f"Auto-fixed input shape: {x_fixed.shape}")
+                    x = x_fixed
         
         # Ensure input is on the correct device
         x = x.to(self.config.get_device())
@@ -159,6 +167,12 @@ class OptimizedNetwork(nn.Module):
             x = F.interpolate(x, size=(self.expected_height, self.expected_width), mode='bilinear', align_corners=False)
         
         try:
+            # Final input validation
+            if x.shape[1] != expected_channels:
+                error_msg = f"Channel mismatch after processing: got {x.shape[1]}, expected {expected_channels}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+                
             # Pass through convolutional layers
             x = self.conv_layers(x)
             

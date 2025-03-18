@@ -466,6 +466,9 @@ class TemporalAssociationMemory:
         if len(previous_frames) < 5:  # Need sufficient history
             return 0.0
             
+        # Extract single frame if stacked
+        current_frame = self._extract_single_frame(current_frame)
+            
         # Extract learned color preferences
         color_preferences = {}
         for color_name, counts in self.color_outcome_associations.items():
@@ -761,70 +764,80 @@ class AutonomousRewardSystem:
             'stability': []
         }
         
-    def compute_reward(self, current_frame: torch.Tensor, action_taken: int) -> float:
-        """Compute reward based on intrinsic motivation and learned patterns.
+    def _extract_single_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        """Extract a single RGB frame from potentially stacked frames.
         
         Args:
-            current_frame (torch.Tensor): Current frame
-            action_taken (int): Action that was taken
+            frame (torch.Tensor): Input frame, may be stacked
             
         Returns:
-            float: Computed reward
+            torch.Tensor: Single RGB frame with 3 channels
         """
-        # Update step count and possibly training phase
+        # Check if this is a stacked frame (multiple of 3 channels)
+        if frame.shape[0] > 3 and frame.shape[0] % 3 == 0:
+            # Take the most recent frame (last 3 channels)
+            return frame[-3:]
+        
+        # Already a single frame
+        return frame
+        
+    def compute_reward(self, current_frame: torch.Tensor, action_taken: int, 
+                    action_info: Dict = None, visual_estimator = None) -> Tuple[float, Dict]:
+        """Compute reward based on learned patterns from raw observations.
+        
+        Args:
+            current_frame (torch.Tensor): Current frame observation
+            action_taken (int): Index of action taken
+            action_info (Dict, optional): Additional information about the action
+            visual_estimator (object, optional): Visual metrics estimator
+            
+        Returns:
+            Tuple[float, Dict]: Reward value and breakdown of reward components
+        """
+        # Track total steps
         self.total_steps += 1
+        
+        # Update training phase
         self._update_training_phase()
         
-        # Ensure the frame is correctly shaped and on the right device
-        if current_frame is None:
-            # In case of a missing frame, use a zero frame
-            height, width = getattr(self.config, 'resolution', (240, 320))
-            current_frame = torch.zeros(3, height, width, device=self.device, dtype=self.dtype)
-        else:
-            # Move to correct device
-            current_frame = current_frame.to(self.device, dtype=self.dtype)
-            
-            # Ensure dimensions match expected resolution
-            expected_height, expected_width = getattr(self.config, 'resolution', (240, 320))
-            if current_frame.shape[-2:] != (expected_height, expected_width):
-                # Reshape frame to match expected dimensions
-                current_frame = F.interpolate(
-                    current_frame.unsqueeze(0) if current_frame.dim() == 3 else current_frame,
-                    size=(expected_height, expected_width),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                current_frame = current_frame.squeeze(0) if current_frame.dim() == 4 else current_frame
+        # Extract single frame if current_frame is stacked
+        single_frame = self._extract_single_frame(current_frame)
         
-        # Store frame in history
-        self.frame_history.append(current_frame)
+        # Store frame history
+        self.frame_history.append(single_frame)
         
         # If we don't have enough history, return neutral reward
         if len(self.frame_history) < 2:
-            return 0.0
+            reward_breakdown = {
+                'curiosity': 0.0,
+                'novelty': 0.0,
+                'visual_change': 0.0,
+                'stability': 0.0
+            }
+            return 0.0, reward_breakdown
         
         # Get previous frame
         previous_frame = self.frame_history[-2]
         
         # 1. Prediction-based curiosity reward
         predicted_frame = self.world_model.predict_next_frame(list(self.frame_history)[:-1], action_taken)
-        prediction_error = self._compute_prediction_error(predicted_frame, current_frame)
+        prediction_error = self._compute_prediction_error(predicted_frame, single_frame)
         curiosity_reward = self._normalize_curiosity(prediction_error)
         
         # 2. Novelty detection reward
-        frame_embedding = self.world_model.encode_frame(current_frame)
+        frame_embedding = self.world_model.encode_frame(single_frame)
         novelty_score = self.state_archive.compute_novelty(frame_embedding)
         
         # 3. Visual change detection
-        visual_change = self._detect_visual_changes(current_frame, previous_frame)
+        visual_change = self._detect_visual_changes(single_frame, previous_frame)
         
         # 4. Temporal stability evaluation
-        stability_score = self.temporal_memory.evaluate_stability(current_frame, list(self.frame_history))
+        stability_score = self.temporal_memory.evaluate_stability(single_frame, list(self.frame_history))
         
         # Update models and memories
-        self.world_model.update(previous_frame, action_taken, current_frame)
+        self.world_model.update(previous_frame, action_taken, single_frame)
         self.state_archive.update(frame_embedding)
-        self.temporal_memory.update(previous_frame, action_taken, current_frame)
+        self.temporal_memory.update(previous_frame, action_taken, single_frame)
         self.action_tracker.update(action_taken, visual_change, stability_score)
         
         # Combine rewards using current phase weights
@@ -845,7 +858,15 @@ class AutonomousRewardSystem:
         if self.total_steps % 100 == 0:
             self._log_rewards()
         
-        return reward
+        # Create reward breakdown dictionary
+        reward_breakdown = {
+            'curiosity': curiosity_reward,
+            'novelty': novelty_score,
+            'visual_change': visual_change,
+            'stability': stability_score
+        }
+        
+        return reward, reward_breakdown
     
     def _compute_prediction_error(self, predicted: torch.Tensor, actual: torch.Tensor) -> float:
         """Compute prediction error between predicted and actual frames.
