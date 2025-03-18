@@ -218,16 +218,34 @@ class OptimizedScreenCapture:
                 torch.cuda.empty_cache()
     
     def get_frame_stack(self) -> torch.Tensor:
-        """Get stacked frames for temporal processing."""
+        """Get stacked frames for temporal processing.
+        
+        Returns:
+            torch.Tensor: Stacked frames tensor with shape [C*stack_size, H, W]
+        """
+        # If frame history is empty, capture a new frame
         if not self.frame_history:
-            return self.capture_frame().unsqueeze(0)
+            self.capture_frame()
             
-        # Ensure we have enough frames
-        while len(self.frame_history) < self.max_history_length:
-            self.frame_history.insert(0, self.frame_history[0].clone())
+        # Ensure we have enough frames - if not, duplicate the latest frame
+        while len(self.frame_history) < self.config.frame_stack:
+            # Get the most recent frame or create a new one if history is still empty
+            if self.frame_history:
+                # Duplicate the most recent frame
+                self.frame_history.insert(0, self.frame_history[-1].clone())
+            else:
+                # If somehow still empty, capture a new frame
+                latest_frame = self.capture_frame()
+                if latest_frame is None:
+                    # If capture failed, return None and let the caller handle it
+                    return None
+                    
+        # Take the most recent 'frame_stack' frames
+        frames_to_stack = self.frame_history[-self.config.frame_stack:]
             
         # Stack frames along channel dimension
-        return torch.cat(self.frame_history, dim=0)
+        # Each frame has shape [C, H, W], and we want [C*stack_size, H, W]
+        return torch.cat(frames_to_stack, dim=0)
         
     def compute_frame_difference(self) -> torch.Tensor:
         """Compute difference between current and previous frame."""

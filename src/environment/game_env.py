@@ -506,24 +506,27 @@ class CitiesEnvironment:
         """
         # In mock mode, return the mock frame
         if self.mock_mode:
-            return self.mock_frame
+            # Create stacked frames (4 frames x 3 channels = 12 channels)
+            stacked_frame = torch.cat([self.mock_frame] * self.config.frame_stack, dim=0)
+            return stacked_frame
             
-        # Capture the current frame from the game
-        frame = self.screen_capture.capture_frame()
+        # Use frame stack from screen capture
+        frame_stack = self.screen_capture.get_frame_stack()
         
-        # If capture failed, try to focus the window and try again
-        if frame is None:
-            logger.warning("Frame capture failed, trying to focus window")
+        # If frame stack capture failed, try to focus the window and try again
+        if frame_stack is None:
+            logger.warning("Frame stack capture failed, trying to focus window")
             self.input_simulator.ensure_game_window_focused()
             time.sleep(0.1)
-            frame = self.screen_capture.capture_frame()
+            frame_stack = self.screen_capture.get_frame_stack()
             
-            if frame is None:
-                logger.error("Frame capture failed again, returning zeros")
-                # Return a black frame with appropriate dimensions
-                return torch.zeros((3, 180, 320), device=self.config.get_device())
+            if frame_stack is None:
+                logger.error("Frame stack capture failed again, returning zeros")
+                # Return a black frame stack with appropriate dimensions (4 frames x 3 channels = 12 channels)
+                zeros = torch.zeros((3 * self.config.frame_stack, 180, 320), device=self.config.get_device())
+                return zeros
         
-        return frame
+        return frame_stack
     
     def step(self, action_index: int) -> Tuple[torch.Tensor, float, bool, dict]:
         """Take an action in the environment.
