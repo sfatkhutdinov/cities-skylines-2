@@ -2,12 +2,15 @@
 PPO agent for Cities: Skylines 2.
 """
 
+import logging
+logger = logging.getLogger(__name__)
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from typing import Tuple, Dict, Any, List
 from model.optimized_network import OptimizedNetwork
+import os
 
 class PPOAgent:
     """Proximal Policy Optimization agent."""
@@ -269,10 +272,38 @@ class PPOAgent:
         Args:
             path (str): Path to save state to
         """
-        torch.save({
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Save core model and optimizer states
+        checkpoint = {
             'network_state': self.network.state_dict(),
-            'optimizer_state': self.optimizer.state_dict()
-        }, path)
+            'optimizer_state': self.optimizer.state_dict(),
+            'last_state': self.last_state.cpu() if self.last_state is not None else None,
+            'running_stats': {
+                'rewards_mean': self.rewards_mean,
+                'rewards_std': self.rewards_std
+            },
+            'action_tracking': {}
+        }
+        
+        # Save action tracking if available
+        if hasattr(self, 'menu_action_indices'):
+            checkpoint['action_tracking']['menu_action_indices'] = self.menu_action_indices
+            checkpoint['action_tracking']['menu_action_penalties'] = self.menu_action_penalties
+        
+        # Save recent trajectories for continuation
+        checkpoint['recent_trajectories'] = {
+            'states': [s.cpu() if s is not None else None for s in self.states[-10:]],
+            'actions': self.actions[-10:] if self.actions else [],
+            'action_probs': self.action_probs[-10:] if self.action_probs else [],
+            'values': self.values[-10:] if self.values else [],
+            'rewards': self.rewards[-10:] if self.rewards else [],
+            'dones': self.dones[-10:] if self.dones else []
+        }
+        
+        torch.save(checkpoint, path)
+        logger.info(f"Agent state saved to {path}")
         
     def load(self, path: str):
         """Load agent state.
@@ -280,9 +311,46 @@ class PPOAgent:
         Args:
             path (str): Path to load state from
         """
-        checkpoint = torch.load(path, map_location=self.device)
-        self.network.load_state_dict(checkpoint['network_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        try:
+            checkpoint = torch.load(path, map_location=self.device)
+            
+            # Load core model and optimizer states
+            self.network.load_state_dict(checkpoint['network_state'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+            
+            # Load last state if it exists
+            if checkpoint.get('last_state') is not None:
+                self.last_state = checkpoint['last_state'].to(self.device)
+            
+            # Load running statistics
+            if 'running_stats' in checkpoint:
+                self.rewards_mean = checkpoint['running_stats'].get('rewards_mean', 0)
+                self.rewards_std = checkpoint['running_stats'].get('rewards_std', 1)
+            
+            # Load action tracking
+            if 'action_tracking' in checkpoint and checkpoint['action_tracking']:
+                self.menu_action_indices = checkpoint['action_tracking'].get('menu_action_indices', [])
+                self.menu_action_penalties = checkpoint['action_tracking'].get('menu_action_penalties', {})
+            
+            # Load recent trajectories
+            if 'recent_trajectories' in checkpoint:
+                # Only restore if we have valid trajectory data
+                if checkpoint['recent_trajectories']['states']:
+                    # Move states to device
+                    self.states = [
+                        s.to(self.device) if s is not None else None 
+                        for s in checkpoint['recent_trajectories']['states']
+                    ]
+                    self.actions = checkpoint['recent_trajectories']['actions']
+                    self.action_probs = checkpoint['recent_trajectories']['action_probs']
+                    self.values = checkpoint['recent_trajectories']['values']
+                    self.rewards = checkpoint['recent_trajectories']['rewards']
+                    self.dones = checkpoint['recent_trajectories']['dones']
+            
+            logger.info(f"Agent state loaded from {path}")
+        except Exception as e:
+            logger.error(f"Failed to load agent state: {str(e)}")
+            raise
         
     def register_menu_action(self, action_idx: int, penalty: float = 0.5):
         """Register an action that led to a menu state to discourage its selection.

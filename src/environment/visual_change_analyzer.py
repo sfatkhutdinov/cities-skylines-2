@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 from typing import List, Tuple, Dict, Optional, Union, Any
 import logging
+import pickle
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -48,54 +50,48 @@ class VisualChangeAnalyzer:
         
         Args:
             pattern: Visual pattern to predict for
-            k: Number of nearest neighbors to consider
+            k: Number of neighbors to consider
             
         Returns:
             float: Predicted outcome
         """
-        if not self.pattern_memory or pattern is None:
+        if not self.pattern_memory:
             return 0.0
             
         # Preprocess pattern
         pattern = self._preprocess_pattern(pattern)
+        if pattern is None:
+            return 0.0
+            
+        # Flatten pattern for easier distance calculation
+        flattened = pattern.flatten()
         
-        # Find k nearest neighbors
+        # Calculate distances to all stored patterns
         distances = []
-        for mem_pattern in self.pattern_memory:
-            try:
-                # Calculate pattern similarity
-                distance = np.mean(np.abs(pattern - mem_pattern))
-                distances.append(distance)
-            except Exception as e:
-                logger.error(f"Error calculating pattern distance: {e}")
-                distances.append(float('inf'))
+        for stored_pattern in self.pattern_memory:
+            # Handle potential shape mismatches
+            if stored_pattern.size != flattened.size:
+                continue
                 
-        # Get indices of k nearest neighbors
+            # Compute distance
+            distance = np.linalg.norm(stored_pattern - flattened)
+            distances.append(distance)
+            
         if not distances:
             return 0.0
             
-        k = min(k, len(distances))
-        nearest_indices = np.argsort(distances)[:k]
+        # Find k smallest distances
+        indices = np.argsort(distances)[:k]
         
-        # Get corresponding outcomes
-        nearest_outcomes = [self.outcomes_memory[i] for i in nearest_indices]
-        nearest_distances = [distances[i] for i in nearest_indices]
+        # Weight by inverse distance
+        weights = [1.0 / (distances[i] + 1e-6) for i in indices]
+        total_weight = sum(weights)
         
-        # Weight outcomes by inverse distance
-        weights = []
-        for dist in nearest_distances:
-            if dist < 1e-10:  # Avoid division by zero
-                weights.append(1.0)
-            else:
-                weights.append(1.0 / dist)
-                
-        # Normalize weights
-        sum_weights = sum(weights)
-        if sum_weights > 0:
-            weights = [w / sum_weights for w in weights]
+        if total_weight == 0:
+            return 0.0
             
-        # Calculate weighted average
-        prediction = sum(w * o for w, o in zip(weights, nearest_outcomes))
+        # Weighted average of outcomes
+        prediction = sum(weights[i] * self.outcomes_memory[indices[i]] for i in range(k)) / total_weight
         
         return prediction
         
@@ -107,63 +103,125 @@ class VisualChangeAnalyzer:
             curr_frame: Current frame
             
         Returns:
-            float: Visual change score (0.0 to 1.0)
+            float: Visual change score (higher = more change)
         """
+        # Input validation
         if prev_frame is None or curr_frame is None:
             return 0.0
             
-        # Make sure frames have the same shape
-        if prev_frame.shape != curr_frame.shape:
-            try:
-                curr_frame = cv2.resize(curr_frame, (prev_frame.shape[1], prev_frame.shape[0]))
-            except Exception as e:
-                logger.error(f"Frame resize failed: {e}")
-                return 0.0
-                
-        # Convert to grayscale if needed
-        if prev_frame.ndim == 3:
-            prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-        else:
-            prev_gray = prev_frame
-            
-        if curr_frame.ndim == 3:
-            curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
-        else:
-            curr_gray = curr_frame
-            
-        # Calculate difference
         try:
+            # Ensure frames are in RGB format
+            if prev_frame.ndim == 4:
+                prev_frame = prev_frame[0]  # Remove batch dimension
+            if curr_frame.ndim == 4:
+                curr_frame = curr_frame[0]
+                
+            # Convert to grayscale for basic change detection
+            prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+            curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
+            
+            # Calculate difference
             diff = cv2.absdiff(prev_gray, curr_gray)
-            score = np.mean(diff) / 255.0
-            return score
+            
+            # Calculate normalized change score
+            change_score = np.mean(diff) / 255.0
+            
+            # Scale to make score more pronounced
+            change_score = min(1.0, change_score * 5.0)
+            
+            return change_score
         except Exception as e:
-            logger.error(f"Error calculating visual change: {e}")
+            logger.error(f"Error computing visual change score: {e}")
             return 0.0
-    
+        
     def _preprocess_pattern(self, pattern: np.ndarray) -> np.ndarray:
-        """Preprocess pattern for memory efficiency.
+        """Preprocess pattern for more efficient storage and comparison.
         
         Args:
-            pattern: Input pattern
+            pattern: Raw visual pattern
             
         Returns:
             np.ndarray: Preprocessed pattern
         """
-        if pattern is None:
-            return np.zeros(self.feature_downscale, dtype=np.float32)
-            
         try:
-            # Convert to grayscale if needed
-            if pattern.ndim == 3:
-                pattern = cv2.cvtColor(pattern, cv2.COLOR_BGR2GRAY)
+            # Ensure pattern is valid
+            if pattern is None or pattern.size == 0:
+                return None
+                
+            # Convert to grayscale if it has colors
+            if pattern.ndim > 2 and pattern.shape[2] >= 3:
+                pattern = cv2.cvtColor(pattern, cv2.COLOR_RGB2GRAY)
                 
             # Resize for memory efficiency
-            pattern = cv2.resize(pattern, self.feature_downscale, interpolation=cv2.INTER_AREA)
+            pattern = cv2.resize(pattern, self.feature_downscale)
             
             # Normalize
             pattern = pattern.astype(np.float32) / 255.0
             
             return pattern
         except Exception as e:
-            logger.error(f"Pattern preprocessing failed: {e}")
-            return np.zeros(self.feature_downscale, dtype=np.float32) 
+            logger.error(f"Error preprocessing pattern: {e}")
+            return None
+            
+    def save_state(self, path: str) -> bool:
+        """Save the analyzer state to disk.
+        
+        Args:
+            path: Path to save the state
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            state = {
+                'memory_size': self.memory_size,
+                'pattern_memory': self.pattern_memory,
+                'outcomes_memory': self.outcomes_memory,
+                'feature_downscale': self.feature_downscale
+            }
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # Save using pickle
+            with open(path, 'wb') as f:
+                pickle.dump(state, f)
+                
+            logger.info(f"Saved visual change analyzer state with {len(self.pattern_memory)} patterns")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save visual change analyzer state: {str(e)}")
+            return False
+            
+    def load_state(self, path: str) -> bool:
+        """Load the analyzer state from disk.
+        
+        Args:
+            path: Path to load the state from
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not os.path.exists(path):
+                logger.warning(f"Visual change analyzer state file not found: {path}")
+                return False
+                
+            # Load using pickle
+            with open(path, 'rb') as f:
+                state = pickle.load(f)
+                
+            # Restore state
+            self.memory_size = state['memory_size']
+            self.pattern_memory = state['pattern_memory']
+            self.outcomes_memory = state['outcomes_memory']
+            self.feature_downscale = state['feature_downscale']
+            
+            logger.info(f"Loaded visual change analyzer state with {len(self.pattern_memory)} patterns")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load visual change analyzer state: {str(e)}")
+            # Initialize with empty state
+            self.pattern_memory = []
+            self.outcomes_memory = []
+            return False 

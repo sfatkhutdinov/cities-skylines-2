@@ -14,6 +14,8 @@ from collections import deque
 from src.config.hardware_config import HardwareConfig
 import cv2
 from skimage.metrics import structural_similarity as ssim
+from scipy.spatial import KDTree
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -313,132 +315,237 @@ class DensityEstimator:
         # Compute mean and std along batch dimension
         self.mean_vector = torch.mean(all_embeddings, dim=0)
         self.std_vector = torch.std(all_embeddings, dim=0)
+        
+    def save_state(self, path: str) -> None:
+        """Save the density estimator state to disk.
+        
+        Args:
+            path: Path to save the state
+        """
+        state_dict = {
+            'feature_dim': self.feature_dim,
+            'history_size': self.history_size,
+            'state_memory': [state.cpu() for state in self.state_memory],
+            'mean_vector': self.mean_vector.cpu() if self.mean_vector is not None else None,
+            'std_vector': self.std_vector.cpu() if self.std_vector is not None else None
+        }
+        torch.save(state_dict, path)
+        logger.info(f"Saved density estimator state with {len(self.state_memory)} memory entries")
+        
+    def load_state(self, path: str) -> None:
+        """Load the density estimator state from disk.
+        
+        Args:
+            path: Path to load the state from
+        """
+        try:
+            state_dict = torch.load(path, map_location='cpu')
+            self.feature_dim = state_dict['feature_dim']
+            self.history_size = state_dict['history_size']
+            
+            # Load state memory and move to device if needed
+            self.state_memory = []
+            for state in state_dict['state_memory']:
+                if self.device is not None:
+                    self.state_memory.append(state.to(self.device))
+                else:
+                    self.state_memory.append(state)
+                    
+            # Load statistics if they exist
+            if state_dict['mean_vector'] is not None:
+                self.mean_vector = state_dict['mean_vector']
+                if self.device is not None:
+                    self.mean_vector = self.mean_vector.to(self.device)
+                    
+            if state_dict['std_vector'] is not None:
+                self.std_vector = state_dict['std_vector']
+                if self.device is not None:
+                    self.std_vector = self.std_vector.to(self.device)
+                    
+            logger.info(f"Loaded density estimator state with {len(self.state_memory)} memory entries")
+        except Exception as e:
+            logger.error(f"Failed to load density estimator state: {str(e)}")
+            # Initialize fresh if loading fails
+            self.state_memory = []
+            self.mean_vector = None
+            self.std_vector = None
 
 
 class TemporalAssociationMemory:
-    """Tracks associations between actions, states, and outcomes over time."""
+    """Memory for learning associations between features and outcomes over time."""
     
-    def __init__(self, feature_dim: int = 512, history_size: int = 1000, device=None):
+    def __init__(self, feature_dim=512, history_size=1000, device=None):
         """Initialize temporal association memory.
         
         Args:
-            feature_dim: Dimension of feature embeddings
-            history_size: Maximum number of experiences to store
-            device: Torch device for computations
+            feature_dim (int): Dimension of feature vectors
+            history_size (int): Maximum number of memory entries
+            device: The device to use
         """
         self.feature_dim = feature_dim
         self.history_size = history_size
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
         
-        # Memory buffers for experiences
-        self.state_buffer = [] 
-        self.action_buffer = []
-        self.next_state_buffer = []
-        self.reward_buffer = []
+        # Memory storage
+        self.feature_memory = []
+        self.outcome_memory = []
         
-        # Learned associations
-        self.action_effect_model = nn.Sequential(
-            nn.Linear(feature_dim + 1, 128),  # +1 for action index
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, feature_dim)
-        ).to(self.device)
+        # For optimized retrieval
+        self.kdtree = None
+        self.last_update_size = 0
         
-        self.optimizer = torch.optim.Adam(self.action_effect_model.parameters(), lr=0.001)
-        
-    def update(self, state_features: torch.Tensor, action_idx: int, next_state_features: torch.Tensor, reward: float = 0.0):
-        """Update memory with new experience.
+    def store(self, feature: torch.Tensor, outcome: float) -> None:
+        """Store feature-outcome pair in memory.
         
         Args:
-            state_features: Features of current state
-            action_idx: Action taken
-            next_state_features: Features of next state
-            reward: Observed reward (optional)
+            feature (torch.Tensor): Feature embedding
+            outcome (float): Associated outcome (reward)
         """
-        # Ensure tensors are detached from computation graph
-        if state_features is not None:
-            state_features = state_features.detach().cpu()
-        if next_state_features is not None:
-            next_state_features = next_state_features.detach().cpu()
+        # Ensure feature is detached from computation graph and on CPU for storage
+        feature_cpu = feature.detach().cpu()
+        
+        # Store feature and outcome
+        self.feature_memory.append(feature_cpu)
+        self.outcome_memory.append(outcome)
+        
+        # Keep memory within size limit
+        if len(self.feature_memory) > self.history_size:
+            self.feature_memory.pop(0)
+            self.outcome_memory.pop(0)
             
-        # Store experience
-        self.state_buffer.append(state_features)
-        self.action_buffer.append(action_idx)
-        self.next_state_buffer.append(next_state_features)
-        self.reward_buffer.append(reward)
+        # Flag that we need to rebuild kd-tree for efficient retrieval
+        self.kdtree = None
         
-        # Maintain buffer size limit
-        if len(self.state_buffer) > self.history_size:
-            self.state_buffer.pop(0)
-            self.action_buffer.pop(0)
-            self.next_state_buffer.pop(0)
-            self.reward_buffer.pop(0)
-            
-        # Learn from experiences periodically
-        if len(self.state_buffer) % 50 == 0 and len(self.state_buffer) >= 100:
-            self._learn_associations()
-    
-    def _learn_associations(self):
-        """Learn to predict state transitions based on collected experiences."""
-        if len(self.state_buffer) < 100:
-            return
-            
-        # Sample batch of experiences
-        batch_size = min(64, len(self.state_buffer))
-        indices = np.random.choice(len(self.state_buffer), batch_size, replace=False)
-        
-        # Prepare batch
-        states = torch.stack([self.state_buffer[i] for i in indices]).to(self.device)
-        actions = torch.tensor([self.action_buffer[i] for i in indices], 
-                              dtype=torch.float32).unsqueeze(1).to(self.device)
-        next_states = torch.stack([self.next_state_buffer[i] for i in indices]).to(self.device)
-        
-        # Combine state and action
-        state_action = torch.cat([states, actions], dim=1)
-        
-        # Predict next state
-        predicted_delta = self.action_effect_model(state_action)
-        predicted_next_state = states + predicted_delta
-        
-        # Compute loss
-        loss = F.mse_loss(predicted_next_state, next_states)
-        
-        # Update model
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-    
-    def compute_association(self, state_features: torch.Tensor, action_idx: int, next_state_features: torch.Tensor) -> torch.Tensor:
-        """Compute how expected/consistent a transition is based on learned associations.
+    def query(self, feature: torch.Tensor, k: int = 5) -> float:
+        """Query memory for expected outcome given feature.
         
         Args:
-            state_features: Features of current state
-            action_idx: Action taken
-            next_state_features: Features of next state
+            feature (torch.Tensor): Feature to query
+            k (int): Number of nearest neighbors to consider
             
         Returns:
-            torch.Tensor: Association score (higher = more expected/consistent)
+            float: Expected outcome (weighted average of k nearest neighbors)
         """
-        with torch.no_grad():
-            # Combine state and action
-            state_action = torch.cat([
-                state_features, 
-                torch.tensor([[float(action_idx)]], device=state_features.device)
-            ], dim=1)
+        if not self.feature_memory:
+            return 0.0
             
-            # Predict next state
-            predicted_delta = self.action_effect_model(state_action)
-            predicted_next_state = state_features + predicted_delta
+        # Ensure feature is on CPU
+        feature_np = feature.detach().cpu().numpy().flatten()
+        
+        # Check if we need to rebuild KD-tree
+        if self.kdtree is None or len(self.feature_memory) != self.last_update_size:
+            # Convert stored features to numpy array
+            try:
+                feature_array = np.vstack([f.numpy().flatten() for f in self.feature_memory])
+                self.kdtree = KDTree(feature_array)
+                self.last_update_size = len(self.feature_memory)
+            except:
+                # Fall back to linear search if KD-tree fails
+                return self._linear_search(feature, k)
+        
+        # Find k nearest neighbors
+        try:
+            # Query KD-tree
+            distances, indices = self.kdtree.query(feature_np.reshape(1, -1), k=min(k, len(self.feature_memory)))
+            distances = distances[0]
+            indices = indices[0]
             
-            # Compute prediction error
-            prediction_error = F.mse_loss(predicted_next_state, next_state_features)
+            # Calculate weights based on inverse distance
+            weights = 1.0 / (distances + 1e-6)
+            total_weight = np.sum(weights)
             
-            # Convert to association score (inverse of error)
-            # Normalize to 0-1 range with exponential scaling
-            association_score = torch.exp(-5.0 * prediction_error)
+            if total_weight == 0:
+                return 0.0
+                
+            # Calculate weighted average of outcomes
+            weighted_sum = sum(weights[i] * self.outcome_memory[indices[i]] for i in range(len(indices)))
+            predicted_outcome = weighted_sum / total_weight
             
-            return association_score
+            return predicted_outcome
+        except:
+            # Fall back to linear search if KD-tree query fails
+            return self._linear_search(feature, k)
+            
+    def _linear_search(self, feature: torch.Tensor, k: int) -> float:
+        """Linear search fallback for when KD-tree is unavailable.
+        
+        Args:
+            feature (torch.Tensor): Query feature
+            k (int): Number of nearest neighbors
+            
+        Returns:
+            float: Predicted outcome
+        """
+        # Ensure feature is on CPU
+        feature_cpu = feature.detach().cpu()
+        
+        # Calculate distances to all stored features
+        distances = []
+        for stored_feature in self.feature_memory:
+            distance = torch.nn.functional.mse_loss(feature_cpu, stored_feature).item()
+            distances.append(distance)
+            
+        if not distances:
+            return 0.0
+            
+        # Find k nearest neighbors
+        k = min(k, len(distances))
+        indices = np.argsort(distances)[:k]
+        
+        # Calculate weights based on inverse distance
+        weights = [1.0 / (distances[i] + 1e-6) for i in indices]
+        total_weight = sum(weights)
+        
+        if total_weight == 0:
+            return 0.0
+            
+        # Calculate weighted average of outcomes
+        weighted_sum = sum(weights[i] * self.outcome_memory[indices[i]] for i in range(len(indices)))
+        predicted_outcome = weighted_sum / total_weight
+        
+        return predicted_outcome
+        
+    def save_state(self, path: str) -> None:
+        """Save the temporal association memory state to disk.
+        
+        Args:
+            path: Path to save the state
+        """
+        # Store all the necessary components
+        state_dict = {
+            'feature_dim': self.feature_dim,
+            'history_size': self.history_size,
+            'feature_memory': self.feature_memory,
+            'outcome_memory': self.outcome_memory
+        }
+        torch.save(state_dict, path)
+        logger.info(f"Saved temporal association memory with {len(self.feature_memory)} entries")
+        
+    def load_state(self, path: str) -> None:
+        """Load the temporal association memory state from disk.
+        
+        Args:
+            path: Path to load the state from
+        """
+        try:
+            state_dict = torch.load(path, map_location='cpu')
+            self.feature_dim = state_dict['feature_dim']
+            self.history_size = state_dict['history_size']
+            self.feature_memory = state_dict['feature_memory']
+            self.outcome_memory = state_dict['outcome_memory']
+            
+            # Reset KD-tree to be rebuilt on next query
+            self.kdtree = None
+            self.last_update_size = 0
+            
+            logger.info(f"Loaded temporal association memory with {len(self.feature_memory)} entries")
+        except Exception as e:
+            logger.error(f"Failed to load temporal association memory: {str(e)}")
+            # Initialize fresh if loading fails
+            self.feature_memory = []
+            self.outcome_memory = []
+            self.kdtree = None
+            self.last_update_size = 0
 
 
 class ActionOutcomeTracker:
@@ -616,7 +723,98 @@ class AutonomousRewardSystem:
         
         # Visual change analyzer for pattern recognition
         self.visual_change_analyzer = VisualChangeAnalyzer(memory_size=1000)
+    
+    def save_state(self, checkpoint_dir: str) -> bool:
+        """Save the entire reward system state to disk.
         
+        Args:
+            checkpoint_dir: Directory to save state files to
+            
+        Returns:
+            bool: True if successful, False if any component failed to save
+        """
+        try:
+            # Create checkpoint directory if it doesn't exist
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            # Save reward system metadata
+            metadata = {
+                'reward_scale': self.reward_scale,
+                'reward_shift': self.reward_shift,
+                'reward_history': self.reward_history,
+                'max_menu_penalty': self.max_menu_penalty,
+                'max_history_length': self.max_history_length
+            }
+            torch.save(metadata, os.path.join(checkpoint_dir, 'reward_system_metadata.pt'))
+            
+            # Save neural network components
+            torch.save(self.world_model.state_dict(), os.path.join(checkpoint_dir, 'world_model.pt'))
+            
+            # Save memory components
+            self.density_estimator.save_state(os.path.join(checkpoint_dir, 'density_estimator.pt'))
+            self.association_memory.save_state(os.path.join(checkpoint_dir, 'association_memory.pt'))
+            self.visual_change_analyzer.save_state(os.path.join(checkpoint_dir, 'visual_change_analyzer.pkl'))
+            
+            logger.info(f"Successfully saved reward system state to {checkpoint_dir}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save reward system state: {str(e)}")
+            return False
+    
+    def load_state(self, checkpoint_dir: str) -> bool:
+        """Load the entire reward system state from disk.
+        
+        Args:
+            checkpoint_dir: Directory to load state files from
+            
+        Returns:
+            bool: True if successful, False if any component failed to load
+        """
+        try:
+            # Check if checkpoint directory exists
+            if not os.path.exists(checkpoint_dir):
+                logger.warning(f"Checkpoint directory does not exist: {checkpoint_dir}")
+                return False
+            
+            # Load reward system metadata
+            metadata_path = os.path.join(checkpoint_dir, 'reward_system_metadata.pt')
+            if os.path.exists(metadata_path):
+                metadata = torch.load(metadata_path, map_location='cpu')
+                self.reward_scale = metadata['reward_scale']
+                self.reward_shift = metadata['reward_shift']
+                self.reward_history = metadata['reward_history']
+                self.max_menu_penalty = metadata['max_menu_penalty']
+                self.max_history_length = metadata['max_history_length']
+                logger.info(f"Loaded reward system metadata with {len(self.reward_history)} historical rewards")
+            
+            # Load neural network components
+            world_model_path = os.path.join(checkpoint_dir, 'world_model.pt')
+            if os.path.exists(world_model_path):
+                self.world_model.load_state_dict(torch.load(world_model_path, map_location=self.device))
+                logger.info("Loaded world model weights")
+            
+            # Load memory components
+            density_path = os.path.join(checkpoint_dir, 'density_estimator.pt')
+            if os.path.exists(density_path):
+                self.density_estimator.load_state(density_path)
+            
+            association_path = os.path.join(checkpoint_dir, 'association_memory.pt')
+            if os.path.exists(association_path):
+                self.association_memory.load_state(association_path)
+            
+            analyzer_path = os.path.join(checkpoint_dir, 'visual_change_analyzer.pkl')
+            if os.path.exists(analyzer_path):
+                self.visual_change_analyzer.load_state(analyzer_path)
+            
+            # Re-initialize the feature extractor reference (in case model was reloaded)
+            self.feature_extractor = self.world_model.encoder
+            
+            logger.info(f"Successfully loaded reward system state from {checkpoint_dir}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load reward system state: {str(e)}")
+            return False
+    
     def compute_reward(self, prev_frame: np.ndarray, action_idx: int, curr_frame: np.ndarray) -> float:
         """Compute reward based on visual changes without using domain knowledge.
         
@@ -813,12 +1011,12 @@ class AutonomousRewardSystem:
                 curr_features = self.world_model.encode_frame(curr_frame)
                 
             # Compute association score
-            score = self.association_memory.compute_association(prev_features, action_idx, curr_features)
+            score = self.association_memory.query(prev_features, k=5)
             
             # Update association memory
-            self.association_memory.update(prev_features, action_idx, curr_features)
+            self.association_memory.store(prev_features, score)
             
-            return score.item()
+            return score
         except Exception as e:
             logger.error(f"Error computing association reward: {e}")
             return 0.0

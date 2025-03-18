@@ -6,6 +6,10 @@ import wandb
 import logging
 import sys
 import time
+import os
+import signal
+import threading
+from datetime import datetime, timedelta
 
 # Set up logging
 logging.basicConfig(
@@ -55,6 +59,10 @@ def parse_args():
     parser.add_argument("--menu_screenshot", type=str, default=None, help="Path to a screenshot of the menu for reference-based detection")
     parser.add_argument("--capture_menu", action="store_true", help="Capture a menu screenshot at startup (assumes you're starting from the menu)")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--autosave_interval", type=int, default=15, help="Minutes between auto-saves")
+    parser.add_argument("--backup_checkpoints", type=int, default=5, help="Number of backup checkpoints to keep")
+    parser.add_argument("--force_cpu", action="store_true", help="Force CPU usage even if GPU is available")
+    parser.add_argument("--fp16", action="store_true", help="Use mixed precision (FP16) if available")
     return parser.parse_args()
 
 def collect_trajectory(env, agent, max_steps, render=False):
@@ -167,6 +175,254 @@ def find_latest_checkpoint(checkpoint_dir):
     episodes.sort(key=lambda x: x[0])
     return episodes[-1]  # Returns (episode_number, file_path)
 
+class CheckpointManager:
+    """Manages saving and loading checkpoints, including auto-saving functionality."""
+    
+    def __init__(self, checkpoint_dir, agent, env, autosave_interval=15, max_backups=5):
+        """Initialize checkpoint manager.
+        
+        Args:
+            checkpoint_dir (str): Directory to save checkpoints
+            agent (PPOAgent): Agent to checkpoint
+            env (CitiesEnvironment): Environment to checkpoint
+            autosave_interval (int): Minutes between auto-saves
+            max_backups (int): Maximum number of backup checkpoints to keep
+        """
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        
+        self.agent = agent
+        self.env = env
+        self.autosave_interval = autosave_interval
+        self.max_backups = max_backups
+        
+        # Create subdirectories
+        self.reward_system_dir = self.checkpoint_dir / "reward_system"
+        self.reward_system_dir.mkdir(exist_ok=True)
+        
+        # Variables for auto-saving
+        self.stop_autosave = threading.Event()
+        self.autosave_thread = None
+        self.last_autosave_time = datetime.now()
+        self.best_reward = float("-inf")
+        self.current_episode = 0
+    
+    def save_checkpoint(self, episode, is_best=False, is_final=False, is_autosave=False):
+        """Save checkpoint of the current agent and environment state.
+        
+        Args:
+            episode (int): Current episode number
+            is_best (bool): Whether this is the best checkpoint so far
+            is_final (bool): Whether this is the final checkpoint
+            is_autosave (bool): Whether this is an auto-save
+            
+        Returns:
+            str: Path to the saved checkpoint
+        """
+        try:
+            # Determine checkpoint name
+            if is_final:
+                checkpoint_path = self.checkpoint_dir / "final_model.pt"
+            elif is_best:
+                checkpoint_path = self.checkpoint_dir / "best_model.pt"
+            elif is_autosave:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                checkpoint_path = self.checkpoint_dir / f"autosave_{timestamp}.pt"
+            else:
+                checkpoint_path = self.checkpoint_dir / f"checkpoint_{episode}.pt"
+            
+            # Save agent state
+            self.agent.save(checkpoint_path)
+            
+            # Save environment's reward system state
+            if hasattr(self.env, 'reward_system') and hasattr(self.env.reward_system, 'save_state'):
+                rs_path = self.reward_system_dir / f"reward_system_{episode}"
+                self.env.reward_system.save_state(rs_path)
+            
+            # Save metadata
+            metadata_path = self.checkpoint_path_to_metadata_path(checkpoint_path)
+            metadata = {
+                'episode': episode,
+                'timestamp': datetime.now().isoformat(),
+                'is_best': is_best,
+                'is_final': is_final,
+                'is_autosave': is_autosave
+            }
+            torch.save(metadata, metadata_path)
+            
+            logger.info(f"Saved checkpoint to {checkpoint_path}")
+            
+            # Clean up old auto-saves if we have too many
+            if is_autosave:
+                self._clean_old_autosaves()
+                
+            return str(checkpoint_path)
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {str(e)}")
+            return None
+    
+    def load_checkpoint(self, path=None, use_best=False):
+        """Load checkpoint for agent and environment.
+        
+        Args:
+            path (str, optional): Specific checkpoint path to load
+            use_best (bool): Whether to load the best checkpoint
+            
+        Returns:
+            int: Episode number of the loaded checkpoint, or None if loading failed
+        """
+        try:
+            # Determine which checkpoint to load
+            if use_best:
+                checkpoint_path = self.checkpoint_dir / "best_model.pt"
+            elif path:
+                checkpoint_path = Path(path)
+            else:
+                latest = find_latest_checkpoint(self.checkpoint_dir)
+                if latest:
+                    _, checkpoint_path = latest
+                else:
+                    logger.warning("No checkpoint found to load")
+                    return None
+            
+            if not checkpoint_path.exists():
+                logger.warning(f"Checkpoint does not exist: {checkpoint_path}")
+                return None
+            
+            # Load agent state
+            self.agent.load(checkpoint_path)
+            
+            # Load metadata to get episode number
+            metadata_path = self.checkpoint_path_to_metadata_path(checkpoint_path)
+            episode = None
+            if metadata_path.exists():
+                metadata = torch.load(metadata_path)
+                episode = metadata.get('episode', 0)
+                self.current_episode = episode
+            else:
+                # Try to extract episode number from filename
+                try:
+                    episode = int(checkpoint_path.stem.split('_')[1])
+                    self.current_episode = episode
+                except (IndexError, ValueError):
+                    episode = 0
+            
+            # Load environment's reward system state
+            if hasattr(self.env, 'reward_system') and hasattr(self.env.reward_system, 'load_state'):
+                rs_path = self.reward_system_dir / f"reward_system_{episode}"
+                if os.path.exists(rs_path):
+                    self.env.reward_system.load_state(rs_path)
+                    logger.info(f"Loaded reward system state from {rs_path}")
+                else:
+                    logger.warning(f"Reward system state not found at {rs_path}")
+            
+            logger.info(f"Successfully loaded checkpoint from episode {episode}")
+            return episode
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {str(e)}")
+            return None
+    
+    def start_autosave_thread(self):
+        """Start a background thread that automatically saves checkpoints at regular intervals."""
+        self.stop_autosave.clear()
+        self.autosave_thread = threading.Thread(target=self._autosave_worker, daemon=True)
+        self.autosave_thread.start()
+        logger.info(f"Started auto-save thread (interval: {self.autosave_interval} minutes)")
+    
+    def stop_autosave_thread(self):
+        """Stop the auto-save thread."""
+        if self.autosave_thread:
+            self.stop_autosave.set()
+            self.autosave_thread.join(timeout=5.0)
+            logger.info("Stopped auto-save thread")
+    
+    def _autosave_worker(self):
+        """Worker function for auto-save thread."""
+        while not self.stop_autosave.is_set():
+            now = datetime.now()
+            time_since_last_save = now - self.last_autosave_time
+            
+            # Check if it's time for an auto-save
+            if time_since_last_save >= timedelta(minutes=self.autosave_interval):
+                logger.info("Auto-saving checkpoint...")
+                self.save_checkpoint(self.current_episode, is_autosave=True)
+                self.last_autosave_time = now
+            
+            # Sleep for a short time before checking again
+            for _ in range(30):  # Check every 2 seconds
+                if self.stop_autosave.is_set():
+                    break
+                time.sleep(2)
+    
+    def _clean_old_autosaves(self):
+        """Remove old auto-save files to keep only the most recent ones."""
+        autosaves = sorted(self.checkpoint_dir.glob("autosave_*.pt"), key=os.path.getmtime, reverse=True)
+        
+        # Keep only the most recent auto-saves
+        if len(autosaves) > self.max_backups:
+            for old_save in autosaves[self.max_backups:]:
+                try:
+                    # Also remove the corresponding metadata file
+                    metadata_path = self.checkpoint_path_to_metadata_path(old_save)
+                    if metadata_path.exists():
+                        os.remove(metadata_path)
+                    
+                    os.remove(old_save)
+                    logger.debug(f"Removed old auto-save: {old_save}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove old auto-save {old_save}: {str(e)}")
+    
+    def checkpoint_path_to_metadata_path(self, checkpoint_path):
+        """Convert a checkpoint path to its corresponding metadata path."""
+        return checkpoint_path.with_suffix('.meta')
+    
+    def update_best_reward(self, reward):
+        """Update the best reward seen so far.
+        
+        Args:
+            reward (float): New reward to compare against best
+            
+        Returns:
+            bool: Whether this is a new best reward
+        """
+        if reward > self.best_reward:
+            self.best_reward = reward
+            return True
+        return False
+    
+    def update_current_episode(self, episode):
+        """Update the current episode number."""
+        self.current_episode = episode
+
+def setup_signal_handlers(checkpoint_manager):
+    """Set up signal handlers for graceful termination.
+    
+    Args:
+        checkpoint_manager (CheckpointManager): Manager to handle saving on termination
+    """
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}, saving checkpoint before exit...")
+        
+        # Save a final checkpoint
+        checkpoint_manager.save_checkpoint(
+            checkpoint_manager.current_episode, 
+            is_final=True
+        )
+        
+        # Stop the auto-save thread
+        checkpoint_manager.stop_autosave_thread()
+        
+        logger.info("Checkpoint saved, exiting...")
+        sys.exit(0)
+    
+    # Register handlers for common termination signals
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+    
+    # On Windows, SIGBREAK is sent when the user closes the console window
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, signal_handler)
+
 def train():
     """Train the agent."""
     args = parse_args()
@@ -177,7 +433,7 @@ def train():
     
     log_file = log_dir / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.INFO if not args.debug else logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler(log_file),
@@ -188,28 +444,18 @@ def train():
     logger.info(f"Starting training with arguments: {args}")
     
     # Create checkpoint directory
-    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(exist_ok=True)
     
     # Load hardware config
     config = HardwareConfig(
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate
+        learning_rate=args.learning_rate,
+        force_cpu=args.force_cpu,
+        use_fp16=args.fp16
     )
     
-    # Update config with command-line args
-    config.gamma = args.gamma
-    config.frame_skip = args.frame_skip
-    
-    # Set PPO-specific parameters
-    config.ppo_epochs = args.ppo_epochs
-    config.clip_range = args.clip_range
-    config.value_loss_coef = args.value_loss_coef
-    config.entropy_coef = args.entropy_coef
-    config.max_grad_norm = args.max_grad_norm
-    config.gae_lambda = args.gae_lambda
-    
-    # Initialize environment with config
+    # Create environment and agent
     env = CitiesEnvironment(
         config=config, 
         mock_mode=args.mock, 
@@ -235,6 +481,18 @@ def train():
     # Connect environment and agent for better coordination
     env.agent = agent
     
+    # Create checkpoint manager
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir=checkpoint_dir,
+        agent=agent,
+        env=env,
+        autosave_interval=args.autosave_interval,
+        max_backups=args.backup_checkpoints
+    )
+    
+    # Set up signal handlers for graceful termination
+    setup_signal_handlers(checkpoint_manager)
+    
     # Handle checkpoint resumption if requested
     start_episode = 0
     checkpoint_loaded = False
@@ -242,31 +500,14 @@ def train():
     
     if args.resume or args.resume_best:
         if args.resume_best:
-            best_checkpoint_path = checkpoint_dir / "best_model.pt"
-            if best_checkpoint_path.exists():
-                # Resume from best model
-                try:
-                    logger.info("Loading best model checkpoint...")
-                    agent.load(best_checkpoint_path)
-                    checkpoint_loaded = True
-                    logger.info("Successfully loaded best model")
-                except Exception as e:
-                    logger.error(f"Failed to load best model: {str(e)}")
-            else:
-                logger.warning(f"Best model checkpoint not found at {best_checkpoint_path}")
+            episode = checkpoint_manager.load_checkpoint(use_best=True)
+            if episode is not None:
+                checkpoint_loaded = True
         elif args.resume:
-            # Find and load the latest checkpoint
-            latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
-            if latest_checkpoint:
-                episode_num, checkpoint_path = latest_checkpoint
-                try:
-                    logger.info(f"Loading checkpoint from episode {episode_num}...")
-                    agent.load(checkpoint_path)
-                    start_episode = episode_num
-                    checkpoint_loaded = True
-                    logger.info(f"Successfully loaded checkpoint from episode {episode_num}")
-                except Exception as e:
-                    logger.error(f"Failed to load checkpoint: {str(e)}")
+            episode = checkpoint_manager.load_checkpoint()
+            if episode is not None:
+                start_episode = episode
+                checkpoint_loaded = True
         
         if not checkpoint_loaded:
             logger.warning("No checkpoint found or loading failed. Starting training from scratch.")
@@ -284,91 +525,82 @@ def train():
             logger.warning(f"Failed to initialize wandb: {str(e)}")
             args.use_wandb = False
     
-    # Training loop
-    if checkpoint_loaded:
-        # Try to find the current best reward if we're resuming
-        best_model_path = checkpoint_dir / "best_model.pt"
-        if best_model_path.exists():
-            # Just a heuristic: assume the best model has a better reward than starting fresh
-            best_reward = 0  # This will be updated on the first better reward
-            logger.info(f"Found existing best model, setting initial best_reward to {best_reward}")
+    # Start auto-save thread
+    checkpoint_manager.start_autosave_thread()
     
-    logger.info("Starting training loop...")
-    for episode in range(start_episode, args.num_episodes):
-        logger.info(f"Starting episode {episode+1}/{args.num_episodes}")
+    # Training loop
+    try:
+        if checkpoint_loaded:
+            # Try to find the current best reward if we're resuming
+            best_model_path = checkpoint_dir / "best_model.pt"
+            if best_model_path.exists():
+                # Just a heuristic: assume the best model has a better reward than starting fresh
+                best_reward = 0  # This will be updated on the first better reward
+                logger.info(f"Found existing best model, setting initial best_reward to {best_reward}")
         
-        # Collect trajectory
-        experiences, episode_reward, episode_length = collect_trajectory(
-            env, agent, args.max_steps, render=args.render
-        )
-        logger.info(f"Collected trajectory - Length: {episode_length}, Reward: {episode_reward:.2f}")
+        logger.info("Starting training loop...")
         
-        # Process experiences for PPO update
-        if experiences:
-            # Extract components
-            states = []
-            actions = []
-            rewards = []
-            log_probs = []
-            values = []
-            dones = []
+        for episode in range(start_episode, args.num_episodes):
+            checkpoint_manager.update_current_episode(episode)
             
-            for state, action, reward, next_state, log_prob, value, done in experiences:
-                states.append(state)
-                actions.append(action.item())
-                rewards.append(reward)
-                log_probs.append(log_prob.item())
-                values.append(value.item())
-                dones.append(done)
+            # Collect trajectory
+            episode_start_time = time.time()
+            experiences, episode_reward, steps_taken = collect_trajectory(
+                env=env,
+                agent=agent,
+                max_steps=args.max_steps
+            )
+            episode_time = time.time() - episode_start_time
             
-            # Store in agent memory
-            agent.states = states
-            agent.actions = [torch.tensor([a]) for a in actions]  # Convert to tensor
-            agent.rewards = rewards
-            agent.dones = dones
+            # Update the agent
+            if experiences:
+                agent.update(experiences)
             
-            # Update agent policy
-            metrics = agent.update()
-            logger.info(f"Updated agent - Metrics: {metrics}")
+            # Log episode results
+            logger.info(f"Episode {episode+1}/{args.num_episodes} - Reward: {episode_reward:.2f}, Steps: {steps_taken}, Time: {episode_time:.2f}s")
             
-            # Log episode results to wandb if enabled
+            # Update wandb if enabled
             if args.use_wandb:
                 wandb.log({
                     "episode": episode,
-                    "episode_reward": episode_reward,
-                    "episode_length": episode_length,
-                    **metrics
+                    "reward": episode_reward,
+                    "steps": steps_taken,
+                    "time": episode_time
                 })
-        
-        # Check if episode ended stuck in a menu
-        current_frame = env.screen_capture.capture_frame()
-        menu_detected = env.visual_estimator.detect_main_menu(current_frame)
-        
-        if menu_detected:
-            logger.warning("Episode ended while stuck in a menu - taking corrective action")
-            env.input_simulator.handle_menu_recovery(retries=3)
-        
-        # Save checkpoint if best reward
-        if episode_reward > best_reward:
-            best_reward = episode_reward
-            agent.save(checkpoint_dir / "best_model.pt")
-            logger.info(f"Saved new best model with reward: {best_reward:.2f}")
             
-        # Save periodic checkpoint
-        if (episode + 1) % args.checkpoint_freq == 0:
-            agent.save(checkpoint_dir / f"checkpoint_{episode+1}.pt")
-            logger.info(f"Saved periodic checkpoint at episode {episode+1}")
+            # Save checkpoint if best reward
+            if checkpoint_manager.update_best_reward(episode_reward):
+                checkpoint_manager.save_checkpoint(episode, is_best=True)
             
-        print(f"Episode {episode+1}/{args.num_episodes} - Reward: {episode_reward:.2f}")
+            # Save periodic checkpoint
+            if (episode + 1) % args.checkpoint_freq == 0:
+                checkpoint_manager.save_checkpoint(episode + 1)
+            
+            print(f"Episode {episode+1}/{args.num_episodes} - Reward: {episode_reward:.2f}")
+            
+            # Add a delay between episodes to prevent system resource issues
+            time.sleep(2.0)
         
-        # Add a delay between episodes to prevent system resource issues
-        time.sleep(2.0)
+        # Save final model
+        checkpoint_manager.save_checkpoint(args.num_episodes, is_final=True)
+        logger.info("Training completed")
     
-    # Save final model
-    agent.save(checkpoint_dir / "final_model.pt")
-    logger.info("Saved final model")
-    env.close()
-    logger.info("Training completed")
+    except Exception as e:
+        logger.error(f"Training interrupted by exception: {str(e)}")
+        # Save emergency checkpoint
+        emergency_path = checkpoint_manager.save_checkpoint(
+            checkpoint_manager.current_episode, 
+            is_autosave=True
+        )
+        logger.info(f"Emergency checkpoint saved to {emergency_path}")
+        raise
+    
+    finally:
+        # Stop auto-save thread
+        checkpoint_manager.stop_autosave_thread()
+        
+        # Close environment
+        env.close()
 
 if __name__ == "__main__":
     train() 
