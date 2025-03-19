@@ -850,14 +850,23 @@ class AutonomousRewardSystem:
         try:
             # Convert to numpy for visual change calculation if needed
             if isinstance(prev_frame, torch.Tensor):
-                prev_frame_np = prev_frame.squeeze().cpu().numpy()
+                # Use detach to handle requires_grad tensors
+                prev_frame_np = prev_frame.detach().squeeze().cpu().numpy()
             else:
                 prev_frame_np = prev_frame
                 
             if isinstance(curr_frame, torch.Tensor):
-                curr_frame_np = curr_frame.squeeze().cpu().numpy()
+                # Use detach to handle requires_grad tensors
+                curr_frame_np = curr_frame.detach().squeeze().cpu().numpy()
             else:
                 curr_frame_np = curr_frame
+                
+            # Skip processing if either frame is None or empty
+            if prev_frame_np is None or curr_frame_np is None:
+                return 0.0
+                
+            if prev_frame_np.size == 0 or curr_frame_np.size == 0:
+                return 0.0
                 
             # Make sure shapes match for the diff calculation
             # If prev_frame has shape [C, H, W], transpose to [H, W, C]
@@ -872,14 +881,22 @@ class AutonomousRewardSystem:
                 # Resize to match
                 if prev_frame_np.ndim == 3 and curr_frame_np.ndim == 3:
                     # Both are 3D, resize to match curr_frame
-                    prev_frame_np = cv2.resize(prev_frame_np, 
-                                             (curr_frame_np.shape[1], curr_frame_np.shape[0]),
-                                             interpolation=cv2.INTER_LINEAR)
+                    h, w = curr_frame_np.shape[0], curr_frame_np.shape[1]
+                    prev_frame_np = cv2.resize(prev_frame_np, (w, h), interpolation=cv2.INTER_LINEAR)
                 elif prev_frame_np.ndim == 2 and curr_frame_np.ndim == 2:
                     # Both are 2D, resize to match curr_frame
-                    prev_frame_np = cv2.resize(prev_frame_np, 
-                                             (curr_frame_np.shape[1], curr_frame_np.shape[0]),
-                                             interpolation=cv2.INTER_LINEAR)
+                    h, w = curr_frame_np.shape[0], curr_frame_np.shape[1]
+                    prev_frame_np = cv2.resize(prev_frame_np, (w, h), interpolation=cv2.INTER_LINEAR)
+                elif prev_frame_np.ndim != curr_frame_np.ndim:
+                    # Convert one to match the other's dimensionality
+                    if prev_frame_np.ndim == 2 and curr_frame_np.ndim == 3:
+                        prev_frame_np = cv2.cvtColor(prev_frame_np, cv2.COLOR_GRAY2BGR)
+                        h, w = curr_frame_np.shape[0], curr_frame_np.shape[1]
+                        prev_frame_np = cv2.resize(prev_frame_np, (w, h), interpolation=cv2.INTER_LINEAR)
+                    elif prev_frame_np.ndim == 3 and curr_frame_np.ndim == 2:
+                        prev_frame_np = cv2.cvtColor(prev_frame_np, cv2.COLOR_BGR2GRAY)
+                        h, w = curr_frame_np.shape[0], curr_frame_np.shape[1]
+                        prev_frame_np = cv2.resize(prev_frame_np, (w, h), interpolation=cv2.INTER_LINEAR)
             
             # Reshape diff_pattern to 2D if needed
             if hasattr(self.visual_change_analyzer, 'input_shape'):
@@ -890,25 +907,18 @@ class AutonomousRewardSystem:
                 diff_pattern = cv2.absdiff(prev_frame_np, curr_frame_np)
                 
                 # Resize diff_pattern to match expected input shape for the analyzer
-                if diff_pattern.shape != expected_shape:
-                    if len(expected_shape) == 2:
-                        # Convert to grayscale if needed
-                        if diff_pattern.ndim == 3:
-                            diff_pattern = cv2.cvtColor(diff_pattern, cv2.COLOR_BGR2GRAY)
-                        # Resize to match expected dimensions
-                        diff_pattern = cv2.resize(diff_pattern, (expected_shape[1], expected_shape[0]))
-                    elif len(expected_shape) == 3:
-                        # Ensure diff_pattern has 3 channels
-                        if diff_pattern.ndim == 2:
-                            diff_pattern = cv2.cvtColor(diff_pattern, cv2.COLOR_GRAY2BGR)
-                        # Resize to match expected dimensions
-                        diff_pattern = cv2.resize(diff_pattern, (expected_shape[1], expected_shape[0]))
+                if diff_pattern.shape != expected_shape and len(expected_shape) == 2:
+                    # Convert to grayscale if needed
+                    if diff_pattern.ndim == 3:
+                        diff_pattern = cv2.cvtColor(diff_pattern, cv2.COLOR_BGR2GRAY)
+                    # Resize to match expected dimensions
+                    diff_pattern = cv2.resize(diff_pattern, (expected_shape[1], expected_shape[0]))
             else:
                 # Just calculate the diff without reshaping
                 diff_pattern = cv2.absdiff(prev_frame_np, curr_frame_np)
             
             # Compute mean pixel change
-            mean_diff = np.mean(diff_pattern)
+            mean_diff = float(np.mean(diff_pattern))
             
             # Use visual change analyzer to predict outcome from this pattern
             predicted_outcome = self.visual_change_analyzer.predict_outcome(diff_pattern)
@@ -936,9 +946,25 @@ class AutonomousRewardSystem:
             float: Density reward
         """
         try:
+            # Skip if frame is invalid
+            if curr_frame is None:
+                return 0.0
+                
+            # Handle detached tensors
+            if isinstance(curr_frame, torch.Tensor) and curr_frame.requires_grad:
+                curr_frame = curr_frame.detach()
+                
             # Extract features from frame
             with torch.no_grad():
                 features = self.world_model.encode_frame(curr_frame)
+                
+                # Ensure features is flattened to 1D for density estimation
+                if features.dim() > 1:
+                    # If features has shape [batch, features], take the first batch
+                    if features.dim() == 2 and features.size(0) > 1:
+                        features = features[0]
+                    # Flatten to 1D
+                    features = features.flatten()
                 
             # Compute density (novelty) of this state
             density = self.density_estimator.compute_novelty(features)
@@ -954,10 +980,16 @@ class AutonomousRewardSystem:
                 else:
                     density = density.item()
             
-            # Lower density = higher reward (encourage exploration of rare states)
-            reward = 1.0 - min(max(density, 0.0), 1.0)
+            # Ensure density is a valid float
+            density = float(density)
             
-            return reward
+            # Clamp density to [0, 1] range
+            density = max(0.0, min(1.0, density))
+            
+            # Lower density = higher reward (encourage exploration of rare states)
+            reward = 1.0 - density
+            
+            return float(reward)
         except Exception as e:
             logger.error(f"Error computing density reward: {e}")
             return 0.0
@@ -976,18 +1008,47 @@ class AutonomousRewardSystem:
             float: Association reward
         """
         try:
+            # Skip if frames are invalid
+            if prev_frame is None or curr_frame is None:
+                return 0.0
+                
+            # Handle detached tensors
+            if isinstance(prev_frame, torch.Tensor) and prev_frame.requires_grad:
+                prev_frame = prev_frame.detach()
+            if isinstance(curr_frame, torch.Tensor) and curr_frame.requires_grad:
+                curr_frame = curr_frame.detach()
+                
             # Extract features from frames
             with torch.no_grad():
                 prev_features = self.world_model.encode_frame(prev_frame)
                 curr_features = self.world_model.encode_frame(curr_frame)
                 
+                # Ensure features are flattened
+                if prev_features.dim() > 1:
+                    if prev_features.dim() == 2 and prev_features.size(0) > 1:
+                        prev_features = prev_features[0]
+                    prev_features = prev_features.flatten()
+                
+                if curr_features.dim() > 1:
+                    if curr_features.dim() == 2 and curr_features.size(0) > 1:
+                        curr_features = curr_features[0]
+                    curr_features = curr_features.flatten()
+                
             # Compute association score
             score = self.association_memory.query(prev_features, k=5)
             
             # Update association memory
-            self.association_memory.store(prev_features, score)
+            self.association_memory.store(prev_features, float(score))
             
-            return score
+            # Ensure score is a scalar
+            if isinstance(score, torch.Tensor):
+                # If tensor has multiple elements, take mean
+                if score.numel() > 1:
+                    score = score.mean().item()
+                else:
+                    score = score.item()
+                    
+            return float(score)
         except Exception as e:
             logger.error(f"Error computing association reward: {e}")
             return 0.0
@@ -1001,15 +1062,29 @@ class AutonomousRewardSystem:
             curr_frame: Current frame
             reward: Computed reward
         """
-        # Store reward in history for normalization
-        self.reward_history.append(reward)
-        if len(self.reward_history) > 100:  # Keep limited history
-            self.reward_history.pop(0)
-            
-        # Update frame history
-        self.frame_history.append(curr_frame.detach().cpu())
-        if len(self.frame_history) > self.max_history_length:
-            self.frame_history.pop(0)
+        try:
+            # Skip if frames are invalid
+            if curr_frame is None:
+                return
+                
+            # Store reward in history for normalization
+            self.reward_history.append(float(reward))
+            if len(self.reward_history) > 100:  # Keep limited history
+                self.reward_history.pop(0)
+                
+            # Update frame history - ensure we detach and use CPU tensors to avoid memory issues
+            if isinstance(curr_frame, torch.Tensor):
+                # Force detach to prevent gradient leakage
+                self.frame_history.append(curr_frame.detach().cpu())
+            else:
+                self.frame_history.append(curr_frame)
+                
+            # Maintain limited history
+            if len(self.frame_history) > self.max_history_length:
+                self.frame_history.pop(0)
+        except Exception as e:
+            logger.error(f"Error updating agent state: {e}")
+            # Continue without updating state
     
     def _normalize_reward(self, reward: float) -> float:
         """Normalize reward based on recent history.

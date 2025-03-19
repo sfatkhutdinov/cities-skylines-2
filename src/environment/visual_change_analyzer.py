@@ -24,6 +24,7 @@ class VisualChangeAnalyzer:
     @property
     def input_shape(self):
         """The expected input shape for patterns."""
+        # Always return as a tuple to prevent unpack errors
         return self.feature_downscale
         
     def update_association(self, visual_change_pattern: np.ndarray, outcome: float) -> None:
@@ -38,10 +39,12 @@ class VisualChangeAnalyzer:
             
         # Preprocess pattern for memory efficiency
         pattern = self._preprocess_pattern(visual_change_pattern)
-        
+        if pattern is None:
+            return
+            
         # Store pattern and outcome
         self.pattern_memory.append(pattern)
-        self.outcomes_memory.append(outcome)
+        self.outcomes_memory.append(float(outcome))
         
         # Keep memory size under limit
         if len(self.pattern_memory) > self.memory_size:
@@ -73,32 +76,60 @@ class VisualChangeAnalyzer:
         
         # Calculate distances to all stored patterns
         distances = []
-        for stored_pattern in self.pattern_memory:
+        valid_indices = []
+        
+        for i, stored_pattern in enumerate(self.pattern_memory):
+            # Skip invalid patterns
+            if stored_pattern is None:
+                continue
+                
             # Handle potential shape mismatches
-            if stored_pattern.size != flattened.size:
+            stored_flat = stored_pattern.flatten()
+            if stored_flat.size != flattened.size:
                 continue
                 
             # Compute distance
-            distance = np.linalg.norm(stored_pattern - flattened)
-            distances.append(distance)
+            try:
+                distance = np.linalg.norm(stored_flat - flattened)
+                distances.append(distance)
+                valid_indices.append(i)
+            except Exception as e:
+                logger.warning(f"Error computing distance: {e}")
+                continue
             
         if not distances:
             return 0.0
             
-        # Find k smallest distances
-        indices = np.argsort(distances)[:k]
+        # Find k smallest distances (or fewer if we don't have enough)
+        k = min(k, len(distances))
+        if k == 0:
+            return 0.0
+            
+        # Get indices of k smallest distances
+        nearest_indices = np.argsort(distances)[:k]
         
         # Weight by inverse distance
-        weights = [1.0 / (distances[i] + 1e-6) for i in indices]
+        weights = []
+        for idx in nearest_indices:
+            dist = distances[idx]
+            # Avoid division by zero
+            weight = 1.0 / (dist + 1e-6) 
+            weights.append(weight)
+            
         total_weight = sum(weights)
         
         if total_weight == 0:
             return 0.0
             
         # Weighted average of outcomes
-        prediction = sum(weights[i] * self.outcomes_memory[indices[i]] for i in range(k)) / total_weight
+        prediction = 0.0
+        for i, idx in enumerate(nearest_indices):
+            mem_idx = valid_indices[idx]
+            prediction += weights[i] * self.outcomes_memory[mem_idx]
+            
+        prediction /= total_weight
         
-        return prediction
+        return float(prediction)
         
     def get_visual_change_score(self, prev_frame: np.ndarray, curr_frame: np.ndarray) -> float:
         """Calculate a visual change score between frames.
@@ -122,9 +153,24 @@ class VisualChangeAnalyzer:
                 curr_frame = curr_frame[0]
                 
             # Convert to grayscale for basic change detection
-            prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
-            curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
-            
+            if prev_frame.ndim == 3 and prev_frame.shape[2] >= 3:
+                prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_RGB2GRAY)
+            elif prev_frame.ndim == 3 and prev_frame.shape[0] <= 3:
+                # Handle CHW format
+                prev_frame_hwc = prev_frame.transpose(1, 2, 0)
+                prev_gray = cv2.cvtColor(prev_frame_hwc, cv2.COLOR_RGB2GRAY)
+            else:
+                prev_gray = prev_frame
+                
+            if curr_frame.ndim == 3 and curr_frame.shape[2] >= 3:
+                curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
+            elif curr_frame.ndim == 3 and curr_frame.shape[0] <= 3:
+                # Handle CHW format
+                curr_frame_hwc = curr_frame.transpose(1, 2, 0)
+                curr_gray = cv2.cvtColor(curr_frame_hwc, cv2.COLOR_RGB2GRAY)
+            else:
+                curr_gray = curr_frame
+                
             # Calculate difference
             diff = cv2.absdiff(prev_gray, curr_gray)
             
@@ -134,7 +180,7 @@ class VisualChangeAnalyzer:
             # Scale to make score more pronounced
             change_score = min(1.0, change_score * 5.0)
             
-            return change_score
+            return float(change_score)
         except Exception as e:
             logger.error(f"Error computing visual change score: {e}")
             return 0.0
@@ -155,7 +201,7 @@ class VisualChangeAnalyzer:
                 
             # Convert torch tensor to numpy if needed
             if hasattr(pattern, 'cpu') and hasattr(pattern, 'numpy'):
-                pattern = pattern.cpu().numpy()
+                pattern = pattern.detach().cpu().numpy()
             
             # Handle common shape patterns
             # If shape is (batch, channel, height, width), remove batch dimension

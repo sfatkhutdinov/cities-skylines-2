@@ -1376,7 +1376,16 @@ class InputSimulator:
         """
         try:
             # Use win32api to get mouse position
-            x, y = win32api.GetCursorPos()
+            cursor_pos = win32api.GetCursorPos()
+            
+            # Make sure we have a valid tuple with two elements
+            if isinstance(cursor_pos, tuple) and len(cursor_pos) == 2:
+                x, y = cursor_pos
+            else:
+                # If not a valid tuple, use screen center
+                screen_width, screen_height = self.screen_width, self.screen_height
+                x, y = screen_width // 2, screen_height // 2
+                logger.warning(f"Invalid cursor position format: {cursor_pos}, using screen center")
             
             # If we have client position information, translate to client coordinates
             if hasattr(self, 'screen_capture') and self.screen_capture:
