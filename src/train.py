@@ -63,6 +63,8 @@ def parse_args():
     parser.add_argument("--checkpoint_freq", type=int, default=100, help="Episodes between checkpoints")
     parser.add_argument("--autosave_interval", type=int, default=15, help="Minutes between auto-saves")
     parser.add_argument("--backup_checkpoints", type=int, default=5, help="Number of backup checkpoints to keep")
+    parser.add_argument("--max_checkpoints", type=int, default=10, help="Max regular checkpoints to keep")
+    parser.add_argument("--max_disk_usage_gb", type=float, default=5.0, help="Maximum disk usage in GB for logs and checkpoints")
     parser.add_argument("--fresh_start", action="store_true", help="Force starting training from scratch, ignoring existing checkpoints")
     parser.add_argument("--use_best", action="store_true", help="Resume training from best checkpoint instead of latest")
     
@@ -106,6 +108,10 @@ def collect_trajectory(env, agent, max_steps, render=False):
     menu_transition_count = 0
     consecutive_menu_steps = 0
     
+    # For tracking game crashes
+    game_crash_wait_count = 0
+    max_crash_wait_steps = 60  # Maximum steps to wait for game restart
+    
     for step in range(max_steps):
         # Select action
         action, log_prob, value = agent.select_action(state)
@@ -134,6 +140,26 @@ def collect_trajectory(env, agent, max_steps, render=False):
         
         # Execute action in environment
         next_state, reward, done, info = env.step(action.item())
+        
+        # Check if game has crashed
+        if info.get("game_crashed", False):
+            logger.warning(f"Game crash detected (wait count: {game_crash_wait_count}/{max_crash_wait_steps})")
+            game_crash_wait_count += 1
+            
+            # If waiting too long for restart, end the episode
+            if game_crash_wait_count >= max_crash_wait_steps:
+                logger.error("Max wait time for game restart exceeded. Ending episode.")
+                done = True
+                break
+                
+            # Sleep to reduce CPU usage while waiting
+            time.sleep(3.0)
+            
+            # Skip storing this experience and continue waiting
+            continue
+        else:
+            # Reset crash wait counter if game is running
+            game_crash_wait_count = 0
         
         # Check if we just entered or exited a menu
         menu_detected = info.get("menu_detected", False)
@@ -193,7 +219,7 @@ def find_latest_checkpoint(checkpoint_dir):
 class CheckpointManager:
     """Manages saving and loading checkpoints, including auto-saving functionality."""
     
-    def __init__(self, checkpoint_dir, agent, env, autosave_interval=15, max_backups=5):
+    def __init__(self, checkpoint_dir, agent, env, autosave_interval=15, max_backups=5, max_checkpoints=10, max_disk_usage_gb=5.0):
         """Initialize checkpoint manager.
         
         Args:
@@ -202,6 +228,8 @@ class CheckpointManager:
             env (CitiesEnvironment): Environment to checkpoint
             autosave_interval (int): Minutes between auto-saves
             max_backups (int): Maximum number of backup checkpoints to keep
+            max_checkpoints (int): Maximum number of regular checkpoints to keep
+            max_disk_usage_gb (float): Maximum disk usage in GB for logs and checkpoints
         """
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
@@ -210,6 +238,8 @@ class CheckpointManager:
         self.env = env
         self.autosave_interval = autosave_interval
         self.max_backups = max_backups
+        self.max_checkpoints = max_checkpoints
+        self.max_disk_usage_bytes = max_disk_usage_gb * 1024 * 1024 * 1024  # Convert GB to bytes
         
         # Create subdirectories
         self.reward_system_dir = self.checkpoint_dir / "reward_system"
@@ -221,6 +251,10 @@ class CheckpointManager:
         self.last_autosave_time = datetime.now()
         self.best_reward = float("-inf")
         self.current_episode = 0
+        
+        # Track disk usage
+        self.last_disk_check_time = time.time()
+        self.disk_check_interval = 300  # Check disk usage every 5 minutes
     
     def save_checkpoint(self, episode, is_best=False, is_final=False, is_autosave=False):
         """Save checkpoint of the current agent and environment state.
@@ -234,6 +268,9 @@ class CheckpointManager:
         Returns:
             str: Path to the saved checkpoint
         """
+        # Check disk usage and clean up if necessary
+        self._check_and_cleanup_disk_usage()
+        
         try:
             # Determine checkpoint name
             if is_final:
@@ -399,6 +436,120 @@ class CheckpointManager:
                 except Exception as e:
                     logger.warning(f"Failed to remove old auto-save {old_save}: {str(e)}")
     
+    def _clean_old_checkpoints(self):
+        """Remove old regular checkpoints to keep only the most recent ones."""
+        # Find all regular checkpoints
+        checkpoints = []
+        for cp_file in self.checkpoint_dir.glob("checkpoint_*.pt"):
+            try:
+                episode = int(cp_file.stem.split('_')[1])
+                checkpoints.append((episode, cp_file))
+            except ValueError:
+                continue
+                
+        # Sort by episode number (newest first)
+        checkpoints.sort(reverse=True, key=lambda x: x[0])
+        
+        # Keep only the most recent checkpoints
+        if len(checkpoints) > self.max_checkpoints:
+            for _, old_save in checkpoints[self.max_checkpoints:]:
+                try:
+                    # Also remove the corresponding metadata file
+                    metadata_path = self.checkpoint_path_to_metadata_path(old_save)
+                    if metadata_path.exists():
+                        os.remove(metadata_path)
+                    
+                    os.remove(old_save)
+                    logger.debug(f"Removed old checkpoint: {old_save}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove old checkpoint {old_save}: {str(e)}")
+
+    def _get_directory_size(self, path):
+        """Get the size of a directory and all its contents in bytes."""
+        total_size = 0
+        for dirpath, _, filenames in os.walk(path):
+            for filename in filenames:
+                file_path = os.path.join(dirpath, filename)
+                total_size += os.path.getsize(file_path)
+        return total_size
+    
+    def _check_and_cleanup_disk_usage(self):
+        """Check disk usage and clean up old files if approaching limit."""
+        # Only check periodically to avoid excessive I/O
+        current_time = time.time()
+        if current_time - self.last_disk_check_time < self.disk_check_interval:
+            return
+            
+        self.last_disk_check_time = current_time
+        
+        # Get checkpoint directory size
+        checkpoint_size = self._get_directory_size(self.checkpoint_dir)
+        
+        # Get log directory size
+        log_dir = Path("logs")
+        log_size = self._get_directory_size(log_dir) if log_dir.exists() else 0
+        
+        # Calculate total size
+        total_size = checkpoint_size + log_size
+        
+        # Convert to GB for logging
+        total_size_gb = total_size / (1024 * 1024 * 1024)
+        max_size_gb = self.max_disk_usage_bytes / (1024 * 1024 * 1024)
+        
+        logger.info(f"Disk usage: {total_size_gb:.2f}GB / {max_size_gb:.2f}GB (checkpoints: {checkpoint_size / (1024*1024*1024):.2f}GB, logs: {log_size / (1024*1024*1024):.2f}GB)")
+        
+        # If approaching the limit, clean up aggressively
+        if total_size > 0.8 * self.max_disk_usage_bytes:
+            logger.warning(f"Disk usage approaching limit ({total_size_gb:.2f}GB / {max_size_gb:.2f}GB). Cleaning up old files...")
+            
+            # Clean up checkpoints more aggressively
+            self._clean_old_autosaves()
+            self._clean_old_checkpoints()
+            
+            # If still over limit, clean up old log files
+            if total_size > 0.9 * self.max_disk_usage_bytes and log_dir.exists():
+                log_files = sorted(log_dir.glob("*.log"), key=os.path.getmtime)
+                # Keep at least the 2 most recent log files
+                if len(log_files) > 2:
+                    for old_log in log_files[:-2]:
+                        try:
+                            os.remove(old_log)
+                            logger.info(f"Removed old log file: {old_log}")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove old log {old_log}: {str(e)}")
+        
+        # If over the limit, take drastic measures
+        if total_size > self.max_disk_usage_bytes:
+            logger.error(f"Disk usage exceeded limit ({total_size_gb:.2f}GB / {max_size_gb:.2f}GB). Taking emergency measures...")
+            
+            # Keep only the best model and latest checkpoint
+            best_path = self.checkpoint_dir / "best_model.pt"
+            best_meta = self.checkpoint_path_to_metadata_path(best_path)
+            final_path = self.checkpoint_dir / "final_model.pt"
+            final_meta = self.checkpoint_path_to_metadata_path(final_path)
+            
+            # Find latest checkpoint
+            latest = find_latest_checkpoint(self.checkpoint_dir)
+            latest_path = latest[1] if latest else None
+            latest_meta = self.checkpoint_path_to_metadata_path(latest_path) if latest_path else None
+            
+            # Remove all other checkpoint files
+            for checkpoint_file in self.checkpoint_dir.glob("*.pt"):
+                if checkpoint_file not in [best_path, final_path, latest_path]:
+                    try:
+                        os.remove(checkpoint_file)
+                        logger.info(f"Emergency cleanup: Removed {checkpoint_file}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove {checkpoint_file}: {str(e)}")
+            
+            # Remove all other metadata files
+            for meta_file in self.checkpoint_dir.glob("*.meta"):
+                if meta_file not in [best_meta, final_meta, latest_meta]:
+                    try:
+                        os.remove(meta_file)
+                    except Exception:
+                        pass
+    
     def checkpoint_path_to_metadata_path(self, checkpoint_path):
         """Convert a checkpoint path to its corresponding metadata path."""
         return checkpoint_path.with_suffix('.meta')
@@ -560,7 +711,9 @@ def train():
         agent=agent,
         env=env,
         autosave_interval=args.autosave_interval,
-        max_backups=args.backup_checkpoints
+        max_backups=args.backup_checkpoints,
+        max_checkpoints=args.max_checkpoints,
+        max_disk_usage_gb=args.max_disk_usage_gb
     )
     
     # Set up signal handlers with environment reference
@@ -645,9 +798,15 @@ def train():
             )
             episode_time = time.time() - episode_start_time
             
+            # Check if we had valid experiences (might be empty if game crashed)
+            if not experiences:
+                logger.warning("No valid experiences collected in this episode. Possible game crash.")
+                # Wait a bit before trying again
+                time.sleep(10.0)
+                continue
+            
             # Update the agent
-            if experiences:
-                agent.update(experiences)
+            agent.update(experiences)
             
             # Log episode results
             logger.info(f"Episode {episode+1}/{args.num_episodes} - Reward: {episode_reward:.2f}, Steps: {steps_taken}, Time: {episode_time:.2f}s")

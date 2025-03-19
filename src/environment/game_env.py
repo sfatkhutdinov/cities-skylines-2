@@ -160,6 +160,16 @@ class CitiesEnvironment:
         
         # New attributes
         self.in_menu = False
+        
+        # Game crash detection
+        self.game_crashed = False
+        self.game_window_missing_count = 0
+        self.max_window_missing_threshold = 5  # Number of consecutive checks before considering game crashed
+        self.last_crash_check_time = time.time()
+        self.crash_check_interval = 2.0  # Seconds between crash checks
+        self.waiting_for_game_restart = False
+        self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
+        self.last_game_restart_check = time.time()
     
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
@@ -331,28 +341,33 @@ class CitiesEnvironment:
         self.suppress_menu_actions = False
         self.menu_action_suppression_steps = 0
         
-        # Handle mock mode
-        if self.mock_mode:
-            logger.info("Using mock environment")
-            # Create mock observation with correct channel/dimension order [C, H, W]
-            self.current_frame = torch.rand(3, 180, 320, device=self.device)
-            return self.current_frame
-            
-        # For real game mode, try to focus the game window
-        logger.info("Focusing Cities: Skylines II window...")
-        if not self.input_simulator.find_game_window():
-            logger.warning("Cities: Skylines II window not found. Make sure the game is running.")
-            logger.warning("Falling back to mock mode for environment testing...")
-            self.mock_mode = True
-            self.current_frame = torch.rand((3, 224, 224), device=self.device)
-            return self.current_frame
+        # Reset game state detection
+        self.game_crashed = False
+        self.game_window_missing_count = 0
+        self.waiting_for_game_restart = False
         
-        if not self.input_simulator.ensure_game_window_focused():
-            logger.warning("Could not focus Cities: Skylines II window. Continuing anyway.")
-            logger.warning("You may need to manually focus the game window for proper interaction.")
+        # Check if game is running
+        if not self._check_game_running():
+            logger.warning("Game does not appear to be running during reset. Will wait for game to start.")
+            self._wait_for_game_start()
         
         # Capture initial frame
-        initial_frame = self.screen_capture.capture_frame()
+        frame = self.screen_capture.capture_frame()
+        
+        # If in mock mode, just return mock frame
+        if self.mock_mode:
+            self.current_frame = self._get_mock_frame()
+            logger.info("Reset complete in mock mode")
+            return self.current_frame
+            
+        # If for some reason we can't capture frame, return mock frame
+        if frame is None:
+            logger.warning("Could not capture initial frame, providing mock frame")
+            self.current_frame = self._get_mock_frame()
+            return self.current_frame
+            
+        # Process frame and keep it as current state
+        self.current_frame = self._process_frame(frame)
         
         # Check if this is the first run and we don't have a menu reference yet
         if not self.has_menu_reference and not self.menu_detection_initialized:
@@ -382,41 +397,31 @@ class CitiesEnvironment:
         menu_attempts = 0
         max_menu_exit_attempts = 5
         
-        while self.visual_estimator.detect_main_menu(initial_frame) and menu_attempts < max_menu_exit_attempts:
-            menu_attempts += 1
-            logger.info(f"Main menu detected during reset (attempt {menu_attempts}/{max_menu_exit_attempts}) - trying to exit")
+        while self.check_menu_state() and menu_attempts < max_menu_exit_attempts:
+            logger.info(f"Detected menu during reset, attempting to exit (attempt {menu_attempts+1})")
             
-            # For Cities Skylines II menu, use the exact coordinates for RESUME GAME button
-            logger.info("Clicking RESUME GAME button with exact coordinates (720, 513)")
+            # Try to exit menu
+            self.input_simulator.key_press('escape')
+            time.sleep(0.7)
             
-            # Get screen dimensions for scaling
+            # Try clicking resume button
             width, height = self._get_screen_dimensions()
-            
-            # Exact coordinates from user: (720, 513) for 1920x1080 resolution
-            resume_x, resume_y = (720, 513)
-            
-            # Scale for different resolutions
-            if width != 1920 or height != 1080:
-                x_scale = width / 1920
-                y_scale = height / 1080
-                resume_x = int(resume_x * x_scale)
-                resume_y = int(resume_y * y_scale)
-            
-            # Click the button with precision
-            logger.info(f"Clicking at coordinates: ({resume_x}, {resume_y})")
+            resume_x = int(width * 0.15)
+            resume_y = int(height * 0.25)
             self.input_simulator.mouse_click(resume_x, resume_y)
-            time.sleep(1.0)  # Longer delay for reliable click registration
+            time.sleep(0.7)
             
-            # Update frame to check if we're still in the menu
+            # Try again with specific resume coords for main menu
+            resume_x = int(width * 0.5)  # Center X
+            resume_y = int(height * 0.4)  # About 40% down from top
+            self.input_simulator.mouse_click(resume_x, resume_y)
+            time.sleep(0.7)
+            
+            # Increment counter
+            menu_attempts += 1
+            
+            # Update frame
             initial_frame = self.screen_capture.capture_frame()
-            
-            # If still in menu, try alternative positions
-            if self.visual_estimator.detect_main_menu(initial_frame) and menu_attempts < max_menu_exit_attempts:
-                # Try the input simulator's safe menu handling method which has additional positions
-                logger.info("Still in menu, using safe menu handling with multiple positions")
-                self.input_simulator.safe_menu_handling()
-                time.sleep(1.0)
-                initial_frame = self.screen_capture.capture_frame()
         
         if menu_attempts >= max_menu_exit_attempts:
             logger.warning("Failed to exit menu after multiple attempts - continuing anyway")
@@ -541,7 +546,29 @@ class CitiesEnvironment:
                 - Done flag
                 - Additional info
         """
-        info = {"menu_detected": False}
+        info = {"menu_detected": False, "game_crashed": False}
+        
+        # Check if the game has crashed before taking any action
+        self._check_game_running()
+        
+        # If game has crashed, return a special state
+        if self.game_crashed or self.waiting_for_game_restart:
+            logger.warning("Game crash detected during step, waiting for restart")
+            
+            # Check if game has restarted
+            if self._check_for_game_restart():
+                logger.info("Game has restarted, resuming training")
+                self.game_crashed = False
+                self.waiting_for_game_restart = False
+                self.game_window_missing_count = 0
+            else:
+                # Return placeholder state and info
+                mock_frame = self._get_mock_frame()
+                info["game_crashed"] = True
+                info["waiting_for_restart"] = True
+                
+                # Return minimal reward, don't count as episode end
+                return mock_frame, -0.1, False, info
         
         # If action_idx is None or invalid, choose a random action
         if action_idx is None or action_idx < 0 or action_idx >= len(self.actions):
@@ -1088,4 +1115,147 @@ class CitiesEnvironment:
         if frame_tensor.device != self.device:
             frame_tensor = frame_tensor.to(self.device)
             
+        return frame_tensor
+
+    def _check_game_running(self) -> bool:
+        """Check if the game is still running.
+        
+        Returns:
+            bool: True if game is running, False otherwise
+        """
+        # Don't check too frequently
+        current_time = time.time()
+        if current_time - self.last_crash_check_time < self.crash_check_interval:
+            return not self.game_crashed
+            
+        self.last_crash_check_time = current_time
+        
+        # Skip check in mock mode
+        if self.mock_mode:
+            return True
+            
+        # Try to find the game window
+        has_window = self.input_simulator.find_game_window()
+        
+        if not has_window:
+            self.game_window_missing_count += 1
+            logger.warning(f"Game window not found (count: {self.game_window_missing_count}/{self.max_window_missing_threshold})")
+            
+            # If too many consecutive failures, consider the game crashed
+            if self.game_window_missing_count >= self.max_window_missing_threshold:
+                if not self.game_crashed:
+                    logger.error("GAME CRASH DETECTED - waiting for game to restart")
+                    self.game_crashed = True
+                    self.waiting_for_game_restart = True
+                return False
+        else:
+            # Reset counter if window found
+            self.game_window_missing_count = 0
+            
+            # If we were in crashed state but now window is found,
+            # game might have restarted
+            if self.game_crashed:
+                logger.info("Game window found after crash, resuming normal operation")
+                self.game_crashed = False
+                self.waiting_for_game_restart = False
+                
+        return not self.game_crashed
+        
+    def _check_for_game_restart(self) -> bool:
+        """Check if the game has restarted after a crash.
+        
+        Returns:
+            bool: True if game has restarted, False otherwise
+        """
+        # Don't check too frequently
+        current_time = time.time()
+        if current_time - self.last_game_restart_check < self.game_restart_check_interval:
+            return False
+            
+        self.last_game_restart_check = current_time
+        
+        # Try to find the game window
+        has_window = self.input_simulator.find_game_window()
+        
+        if has_window:
+            # Try to capture a frame to verify game is actually running
+            frame = self.screen_capture.capture_frame()
+            if frame is not None:
+                logger.info("Game has successfully restarted, frame captured")
+                return True
+                
+        return False
+        
+    def _wait_for_game_start(self) -> None:
+        """Wait for the game to start after a crash."""
+        logger.info("Waiting for game to start...")
+        
+        # Loop until game is running or timeout
+        wait_start_time = time.time()
+        max_wait_time = 300  # 5 minutes timeout
+        
+        while time.time() - wait_start_time < max_wait_time:
+            # Check if game window found
+            if self.input_simulator.find_game_window():
+                # Try to capture a frame
+                frame = self.screen_capture.capture_frame()
+                if frame is not None:
+                    logger.info("Game started successfully!")
+                    return
+                    
+            # Wait before checking again
+            time.sleep(5.0)
+            logger.info("Still waiting for game to start...")
+            
+        logger.warning("Timed out waiting for game to start")
+        
+    def _get_mock_frame(self) -> torch.Tensor:
+        """Generate a mock frame for when the game is not running.
+        
+        Returns:
+            torch.Tensor: Mock frame
+        """
+        # Create a special frame for crashed state - red for crashed, yellow for waiting
+        height, width = self.config.process_resolution
+        
+        # Create a numpy array for the frame
+        frame_np = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        if self.game_crashed:
+            # Red background for crash
+            frame_np[:, :, 2] = 120  # Red channel (BGR in OpenCV)
+            
+            # Add text message about crash
+            try:
+                import cv2
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(frame_np, "GAME CRASHED", (width//6, height//3), font, 1.5, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame_np, "Please restart the game", (width//6, height//2), font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame_np, "Agent will wait automatically", (width//6, 2*height//3), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            except ImportError:
+                logger.warning("OpenCV not available for adding text to mock frame")
+            
+        elif self.waiting_for_game_restart:
+            # Yellow background for waiting
+            frame_np[:, :, 0] = 100  # Blue channel 
+            frame_np[:, :, 1] = 200  # Green channel
+            frame_np[:, :, 2] = 200  # Red channel
+            
+            # Add text message about waiting
+            try:
+                import cv2
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(frame_np, "WAITING FOR GAME", (width//6, height//3), font, 1.5, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame_np, "Agent will resume automatically", (width//6, height//2), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame_np, "when game is detected", (width//6, 2*height//3), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            except ImportError:
+                logger.warning("OpenCV not available for adding text to mock frame")
+        
+        # Convert to tensor with shape [C, H, W]
+        frame_tensor = torch.from_numpy(frame_np).float().permute(2, 0, 1) / 255.0
+        
+        # Move to the correct device
+        if frame_tensor.device != self.config.device:
+            frame_tensor = frame_tensor.to(self.config.device)
+        
         return frame_tensor
