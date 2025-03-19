@@ -148,6 +148,19 @@ class VisualChangeAnalyzer:
             if pattern is None or pattern.size == 0:
                 return None
                 
+            # Convert torch tensor to numpy if needed
+            if hasattr(pattern, 'cpu') and hasattr(pattern, 'numpy'):
+                pattern = pattern.cpu().numpy()
+            
+            # Handle common shape patterns
+            # If shape is (batch, channel, height, width), remove batch dimension
+            if pattern.ndim == 4 and pattern.shape[0] == 1:
+                pattern = pattern[0]
+                
+            # If shape is (channel, height, width), transpose to (height, width, channel)
+            if pattern.ndim == 3 and pattern.shape[0] <= 3:
+                pattern = pattern.transpose(1, 2, 0)
+                
             # Convert to grayscale if it has colors
             if pattern.ndim > 2 and pattern.shape[2] >= 3:
                 pattern = cv2.cvtColor(pattern, cv2.COLOR_RGB2GRAY)

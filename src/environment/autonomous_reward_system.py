@@ -816,10 +816,14 @@ class AutonomousRewardSystem:
             # Calculate prediction error
             prediction_error = F.mse_loss(predicted_frame, curr_frame)
             
+            # Convert scalar tensor to float explicitly
+            if isinstance(prediction_error, torch.Tensor):
+                prediction_error = prediction_error.item()
+            
             # Scale prediction error to a reward
             # Higher error = higher reward (encourages exploration)
             # But not too high (clip to avoid pursuing completely random states)
-            reward = torch.clamp(prediction_error, 0.0, 1.0).item()
+            reward = min(max(prediction_error, 0.0), 1.0)
             
             return reward
         except Exception as e:
@@ -851,11 +855,30 @@ class AutonomousRewardSystem:
             else:
                 curr_frame_np = curr_frame
                 
-            # Calculate visual change using our analyzer
-            diff_pattern = cv2.absdiff(
-                prev_frame_np.transpose(1, 2, 0) if prev_frame_np.ndim == 3 else prev_frame_np, 
-                curr_frame_np.transpose(1, 2, 0) if curr_frame_np.ndim == 3 else curr_frame_np
-            )
+            # Make sure shapes match for the diff calculation
+            # If prev_frame has shape [C, H, W], transpose to [H, W, C]
+            if prev_frame_np.ndim == 3 and prev_frame_np.shape[0] <= 3:
+                prev_frame_np = prev_frame_np.transpose(1, 2, 0)
+            # Same for curr_frame
+            if curr_frame_np.ndim == 3 and curr_frame_np.shape[0] <= 3:
+                curr_frame_np = curr_frame_np.transpose(1, 2, 0)
+            
+            # Ensure both frames have the same shape
+            if prev_frame_np.shape != curr_frame_np.shape:
+                # Resize to match
+                if prev_frame_np.ndim == 3 and curr_frame_np.ndim == 3:
+                    # Both are 3D, resize to match curr_frame
+                    prev_frame_np = cv2.resize(prev_frame_np, 
+                                              (curr_frame_np.shape[1], curr_frame_np.shape[0]),
+                                              interpolation=cv2.INTER_LINEAR)
+                elif prev_frame_np.ndim == 2 and curr_frame_np.ndim == 2:
+                    # Both are 2D, resize to match curr_frame
+                    prev_frame_np = cv2.resize(prev_frame_np, 
+                                              (curr_frame_np.shape[1], curr_frame_np.shape[0]),
+                                              interpolation=cv2.INTER_LINEAR)
+            
+            # Calculate visual change
+            diff_pattern = cv2.absdiff(prev_frame_np, curr_frame_np)
             
             # Compute mean pixel change
             mean_diff = np.mean(diff_pattern)
@@ -896,8 +919,16 @@ class AutonomousRewardSystem:
             # Update density estimator
             self.density_estimator.update(features)
             
+            # Make sure density is a scalar
+            if isinstance(density, torch.Tensor):
+                # If tensor has multiple elements, take mean
+                if density.numel() > 1:
+                    density = density.mean().item()
+                else:
+                    density = density.item()
+            
             # Lower density = higher reward (encourage exploration of rare states)
-            reward = 1.0 - torch.clamp(density, 0.0, 1.0).item()
+            reward = 1.0 - min(max(density, 0.0), 1.0)
             
             return reward
         except Exception as e:
