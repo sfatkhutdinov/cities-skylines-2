@@ -9,6 +9,7 @@ import time
 import os
 import signal
 import threading
+import atexit
 from datetime import datetime, timedelta
 
 # Set up logging
@@ -22,6 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 logger.debug("Starting script...")
+
+# Global variable to track exit state
+_exit_requested = False
 
 try:
     logger.debug("Importing environment...")
@@ -342,28 +346,40 @@ class CheckpointManager:
     
     def stop_autosave_thread(self):
         """Stop the auto-save thread."""
-        if self.autosave_thread:
+        if self.autosave_thread and self.autosave_thread.is_alive():
+            logger.info("Stopping auto-save thread...")
             self.stop_autosave.set()
-            self.autosave_thread.join(timeout=5.0)
-            logger.info("Stopped auto-save thread")
+            try:
+                self.autosave_thread.join(timeout=5.0)
+                if self.autosave_thread.is_alive():
+                    logger.warning("Auto-save thread did not terminate within timeout")
+                else:
+                    logger.info("Auto-save thread stopped successfully")
+            except Exception as e:
+                logger.error(f"Error stopping auto-save thread: {str(e)}")
     
     def _autosave_worker(self):
         """Worker function for auto-save thread."""
         while not self.stop_autosave.is_set():
-            now = datetime.now()
-            time_since_last_save = now - self.last_autosave_time
-            
-            # Check if it's time for an auto-save
-            if time_since_last_save >= timedelta(minutes=self.autosave_interval):
-                logger.info("Auto-saving checkpoint...")
-                self.save_checkpoint(self.current_episode, is_autosave=True)
-                self.last_autosave_time = now
-            
-            # Sleep for a short time before checking again
-            for _ in range(30):  # Check every 2 seconds
-                if self.stop_autosave.is_set():
-                    break
-                time.sleep(2)
+            try:
+                now = datetime.now()
+                time_since_last_save = now - self.last_autosave_time
+                
+                # Check if it's time for an auto-save
+                if time_since_last_save >= timedelta(minutes=self.autosave_interval):
+                    logger.info("Auto-saving checkpoint...")
+                    self.save_checkpoint(self.current_episode, is_autosave=True)
+                    self.last_autosave_time = now
+                
+                # Sleep for a short time before checking again, but check for stop event frequently
+                for _ in range(10):  # Check every 0.5 seconds instead of 2 seconds
+                    if self.stop_autosave.is_set():
+                        return
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error in auto-save worker: {str(e)}")
+                # Don't crash the thread on error
+                time.sleep(5)
     
     def _clean_old_autosaves(self):
         """Remove old auto-save files to keep only the most recent ones."""
@@ -405,26 +421,47 @@ class CheckpointManager:
         """Update the current episode number."""
         self.current_episode = episode
 
-def setup_signal_handlers(checkpoint_manager):
+def setup_signal_handlers(checkpoint_manager, env=None):
     """Set up signal handlers for graceful termination.
     
     Args:
         checkpoint_manager (CheckpointManager): Manager to handle saving on termination
+        env (CitiesEnvironment, optional): Environment to close on exit
     """
+    global _exit_requested
+    
     def signal_handler(sig, frame):
+        global _exit_requested
+        if _exit_requested:
+            logger.warning("Forced exit requested, terminating immediately without cleanup")
+            os._exit(1)
+            
+        _exit_requested = True
         logger.info(f"Received signal {sig}, saving checkpoint before exit...")
         
-        # Save a final checkpoint
-        checkpoint_manager.save_checkpoint(
-            checkpoint_manager.current_episode, 
-            is_final=True
-        )
-        
-        # Stop the auto-save thread
-        checkpoint_manager.stop_autosave_thread()
-        
-        logger.info("Checkpoint saved, exiting...")
-        sys.exit(0)
+        try:
+            # Save a final checkpoint
+            checkpoint_manager.save_checkpoint(
+                checkpoint_manager.current_episode, 
+                is_final=True
+            )
+            
+            # Stop the auto-save thread
+            checkpoint_manager.stop_autosave_thread()
+            
+            # Close environment if provided
+            if env is not None:
+                logger.info("Closing environment...")
+                try:
+                    env.close()
+                except Exception as e:
+                    logger.error(f"Error closing environment: {str(e)}")
+            
+            logger.info("Checkpoint saved, exiting gracefully...")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            sys.exit(1)
     
     # Register handlers for common termination signals
     signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
@@ -433,6 +470,19 @@ def setup_signal_handlers(checkpoint_manager):
     # On Windows, SIGBREAK is sent when the user closes the console window
     if hasattr(signal, 'SIGBREAK'):
         signal.signal(signal.SIGBREAK, signal_handler)
+    
+    # Register cleanup function with atexit
+    def cleanup():
+        if not _exit_requested:
+            logger.info("Performing cleanup during normal exit...")
+            checkpoint_manager.stop_autosave_thread()
+            if env is not None:
+                try:
+                    env.close()
+                except Exception as e:
+                    logger.error(f"Error closing environment during cleanup: {str(e)}")
+    
+    atexit.register(cleanup)
 
 def train():
     """Train the agent."""
@@ -513,8 +563,8 @@ def train():
         max_backups=args.backup_checkpoints
     )
     
-    # Set up signal handlers for graceful termination
-    setup_signal_handlers(checkpoint_manager)
+    # Set up signal handlers with environment reference
+    setup_signal_handlers(checkpoint_manager, env)
     
     # Handle checkpoint resumption (auto-resume by default unless fresh_start is specified)
     start_episode = 0
@@ -628,6 +678,15 @@ def train():
         checkpoint_manager.save_checkpoint(args.num_episodes, is_final=True)
         logger.info("Training completed")
     
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user (KeyboardInterrupt)")
+        # Save emergency checkpoint
+        emergency_path = checkpoint_manager.save_checkpoint(
+            checkpoint_manager.current_episode, 
+            is_autosave=True
+        )
+        logger.info(f"Emergency checkpoint saved to {emergency_path}")
+    
     except Exception as e:
         logger.error(f"Training interrupted by exception: {str(e)}")
         # Save emergency checkpoint
@@ -643,7 +702,10 @@ def train():
         checkpoint_manager.stop_autosave_thread()
         
         # Close environment
-        env.close()
+        try:
+            env.close()
+        except Exception as e:
+            logger.error(f"Error closing environment in finally block: {str(e)}")
 
 if __name__ == "__main__":
     train() 
