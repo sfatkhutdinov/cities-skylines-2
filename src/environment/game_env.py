@@ -1275,7 +1275,7 @@ class CitiesEnvironment:
             torch.Tensor: Mock frame
         """
         # Create a special frame for crashed state - red for crashed, yellow for waiting
-        height, width = self.config.process_resolution
+        height, width = self.screen_capture.process_resolution
         
         # Create a numpy array for the frame
         frame_np = np.zeros((height, width, 3), dtype=np.uint8)
