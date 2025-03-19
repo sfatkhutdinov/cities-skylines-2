@@ -49,11 +49,8 @@ class CitiesEnvironment:
         self.input_simulator = InputSimulator()
         
         # Create screen capture instance
-        self.screen_capture = ScreenCapture(
-            device=self.config.device,
-            process_resolution=self.config.process_resolution,
-            fps_limit=self.config.fps_limit,
-            use_threading=self.config.use_threading
+        self.screen_capture = OptimizedScreenCapture(
+            config=self.config
         )
         
         # Pass the screen capture reference to the input simulator
@@ -552,7 +549,7 @@ class CitiesEnvironment:
             if frame is None:
                 logger.error("Frame capture failed again, returning zeros")
                 # Return a black frame with appropriate dimensions
-                return torch.zeros((3, 180, 320), device=self.device)
+                return torch.zeros((3, 180, 320), device=self.config.get_device())
         
         return frame
     
@@ -782,9 +779,27 @@ class CitiesEnvironment:
                     button = action_info.get("button", "left")
                     double = action_info.get("double", False)
                     
-                    # Use current mouse position for click
-                    # This requires the agent to first move the mouse to the desired position
-                    return self.input_simulator.mouse_click(button=button, double=double)
+                    # Get position if specified, otherwise use the current mouse position
+                    if "position" in action_info:
+                        position = action_info.get("position")
+                        if isinstance(position, tuple) and len(position) == 2:
+                            x, y = position
+                        else:
+                            # Fallback to center of screen
+                            width, height = self._get_screen_dimensions()
+                            x, y = width // 2, height // 2
+                    else:
+                        # Use current mouse position
+                        try:
+                            x, y = self.input_simulator.get_mouse_position()
+                        except Exception as e:
+                            # Fallback to center of screen
+                            width, height = self._get_screen_dimensions()
+                            x, y = width // 2, height // 2
+                            logger.warning(f"Could not get mouse position: {e}, using center of screen")
+                    
+                    # Execute click
+                    return self.input_simulator.mouse_click(x, y, button=button, double=double)
                 
                 elif mouse_action in ["down", "up"]:
                     # Get button
@@ -1077,13 +1092,34 @@ class CitiesEnvironment:
         # If we have visual diversity reward system, use it
         if hasattr(self, 'reward_system') and self.reward_system:
             # Get additional reward from autonomous system
-            autonomous_reward = self.reward_system.compute_reward(
-                curr_frame, 
-                action_info.get("type", "unknown"),
-                success
-            )
-            reward += autonomous_reward
-            
+            try:
+                # We need prev_frame, action_idx (int), and curr_frame (np.ndarray)
+                if prev_frame is not None and curr_frame is not None:
+                    # Convert action_type to action_idx if needed
+                    action_type = action_info.get("type", "unknown")
+                    if isinstance(action_type, str):
+                        # Map string action types to indices
+                        action_type_map = {
+                            "key": 0, 
+                            "mouse": 1, 
+                            "combined": 2, 
+                            "wait": 3,
+                            "speed": 4
+                        }
+                        action_idx = action_type_map.get(action_type, 0)
+                    else:
+                        action_idx = action_type
+                    
+                    autonomous_reward = self.reward_system.compute_reward(
+                        prev_frame,
+                        action_idx,
+                        curr_frame
+                    )
+                    reward += autonomous_reward
+            except Exception as e:
+                logger.error(f"Error computing reward: {str(e)}")
+                # Don't add any reward if there was an error
+        
         # Scale reward - this is a hyperparameter you can tune
         reward *= 0.1
             
@@ -1100,7 +1136,7 @@ class CitiesEnvironment:
         """
         if frame is None:
             # Return zeros if frame capture failed
-            return torch.zeros((3, 180, 320), device=self.device)
+            return torch.zeros((3, 180, 320), device=self.config.get_device())
             
         # If frame is already a PyTorch tensor, handle it differently
         if isinstance(frame, torch.Tensor):
@@ -1135,8 +1171,8 @@ class CitiesEnvironment:
         frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1)  # HWC to CHW
         
         # Move to device
-        if frame_tensor.device != self.device:
-            frame_tensor = frame_tensor.to(self.device)
+        if frame_tensor.device != self.config.get_device():
+            frame_tensor = frame_tensor.to(self.config.get_device())
             
         return frame_tensor
 
@@ -1278,7 +1314,7 @@ class CitiesEnvironment:
         frame_tensor = torch.from_numpy(frame_np).float().permute(2, 0, 1) / 255.0
         
         # Move to the correct device
-        if frame_tensor.device != self.config.device:
-            frame_tensor = frame_tensor.to(self.config.device)
+        if frame_tensor.device != self.config.get_device():
+            frame_tensor = frame_tensor.to(self.config.get_device())
         
         return frame_tensor
