@@ -707,14 +707,22 @@ class CitiesEnvironment:
                 mouse_action = action_info.get("action", "")
                 
                 if mouse_action == "move":
-                    # Get normalized coordinates (0.0 to 1.0)
-                    norm_x = action_info.get("x", 0.5)
-                    norm_y = action_info.get("y", 0.5)
+                    # Get position coordinates
+                    position = action_info.get("position", (0.5, 0.5))
+                    if isinstance(position, tuple) and len(position) == 2:
+                        screen_x, screen_y = position
+                    else:
+                        # Fallback to normalized coordinates (0.0 to 1.0)
+                        norm_x = action_info.get("x", 0.5)
+                        norm_y = action_info.get("y", 0.5)
+                        
+                        # Convert to screen coordinates
+                        width, height = self._get_screen_dimensions()
+                        screen_x = int(norm_x * width)
+                        screen_y = int(norm_y * height)
                     
-                    # Convert to screen coordinates
-                    width, height = self._get_screen_dimensions()
-                    screen_x = int(norm_x * width)
-                    screen_y = int(norm_y * height)
+                    # Log the move for debugging
+                    logger.debug(f"Moving mouse to: ({screen_x}, {screen_y})")
                     
                     # Execute move
                     return self.input_simulator.mouse_move(screen_x, screen_y)
