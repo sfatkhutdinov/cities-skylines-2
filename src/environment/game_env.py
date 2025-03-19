@@ -168,6 +168,11 @@ class CitiesEnvironment:
             self.waiting_for_game_restart = False
             self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
             self.last_game_restart_check = time.time()
+            
+            # Initialize likely_in_menu_from_mouse_test
+            self.likely_in_menu_from_mouse_test = False
+            self.mouse_freedom_visual_change = 1.0  # Initialize with high value (indicates not in menu)
+            self.last_mouse_freedom_test_time = 0
         
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
@@ -654,6 +659,24 @@ class CitiesEnvironment:
             logger.warning("Failed to capture frame for menu detection")
             return False
         
+        # If we've been having trouble with menu detection, run a mouse freedom test
+        # This is only done rarely to avoid disrupting gameplay
+        menu_uncertain = (hasattr(self, 'menu_stuck_counter') and 
+                         self.menu_stuck_counter > 0 and 
+                         self.menu_stuck_counter % 3 == 0)  # Every 3rd uncertain detection
+                         
+        if menu_uncertain and not hasattr(self, 'last_mouse_freedom_test_time'):
+            self.last_mouse_freedom_test_time = 0
+            
+        current_time = time.time()
+        if (menu_uncertain and 
+            hasattr(self, 'last_mouse_freedom_test_time') and 
+            current_time - self.last_mouse_freedom_test_time > 30):  # At most once every 30 seconds
+            logger.info("Running mouse freedom test to help with menu detection")
+            self.last_mouse_freedom_test_time = current_time
+            self.test_mouse_freedom()
+            # The test_mouse_freedom method will update self.likely_in_menu_from_mouse_test
+        
         # Use menu handler if available
         if hasattr(self, 'menu_handler') and self.menu_handler is not None:
             menu_detected, menu_type, confidence = self.menu_handler.detect_menu(current_frame)
@@ -999,6 +1022,7 @@ class CitiesEnvironment:
     def test_mouse_freedom(self):
         """Test mouse freedom by moving to different positions on the screen.
         This helps verify the mouse can reach all parts of the game window.
+        Also measures visual change to detect if in a menu.
         """
         if not hasattr(self.screen_capture, 'client_position'):
             logger.warning("Client position not available, using system metrics")
@@ -1033,6 +1057,10 @@ class CitiesEnvironment:
         # Record current position to return to at the end
         current_x, current_y = win32api.GetCursorPos()
         
+        # Capture frame before moving mouse
+        initial_frame = self.screen_capture.capture_frame()
+        visual_changes = []
+        
         try:
             # Move to each test point with verification
             for i, (x, y) in enumerate(test_points):
@@ -1050,6 +1078,17 @@ class CitiesEnvironment:
                 self.input_simulator.mouse_move(x, y, use_win32=True)
                 time.sleep(0.2)  # Wait for movement to complete
                 
+                # Capture frame after moving mouse to measure visual change
+                new_frame = self.screen_capture.capture_frame()
+                if initial_frame is not None and new_frame is not None:
+                    # Calculate visual change
+                    try:
+                        visual_change = self.visual_estimator.calculate_frame_difference(initial_frame, new_frame)
+                        visual_changes.append(visual_change)
+                        logger.debug(f"Visual change after mouse move to ({x},{y}): {visual_change:.6f}")
+                    except Exception as e:
+                        logger.error(f"Error calculating visual change: {e}")
+                
                 # Verify position
                 new_pos = win32api.GetCursorPos()
                 if abs(new_pos[0] - x) > 5 or abs(new_pos[1] - y) > 5:
@@ -1057,6 +1096,23 @@ class CitiesEnvironment:
                     # Try again with direct positioning
                     win32api.SetCursorPos((x, y))
                     time.sleep(0.2)
+            
+            # Calculate average visual change from mouse movement
+            if visual_changes:
+                avg_visual_change = sum(visual_changes) / len(visual_changes)
+                max_visual_change = max(visual_changes)
+                logger.info(f"Mouse movement visual change - Avg: {avg_visual_change:.6f}, Max: {max_visual_change:.6f}")
+                
+                # If visual change is very low, likely in a menu
+                if max_visual_change < 0.01:
+                    logger.warning("Very low visual change detected during mouse movement, likely in a menu")
+                    # Store this information for the menu detection system
+                    self.mouse_freedom_visual_change = max_visual_change
+                    self.likely_in_menu_from_mouse_test = True
+                else:
+                    logger.info("Normal visual change detected during mouse movement, likely not in a menu")
+                    self.mouse_freedom_visual_change = max_visual_change
+                    self.likely_in_menu_from_mouse_test = False
             
             # Return to center position
             center_x, center_y = width // 2, height // 2
@@ -1095,9 +1151,6 @@ class CitiesEnvironment:
                 # PyTorch tensor in CHW format
                 if len(curr_frame.shape) == 3 and curr_frame.shape[0] == 3:
                     return curr_frame.shape[2], curr_frame.shape[1]
-                return curr_frame.shape[1], curr_frame.shape[0]
-            else:
-                # Numpy array in HWC format
                 return curr_frame.shape[1], curr_frame.shape[0]
                 
         # Last resort fallback

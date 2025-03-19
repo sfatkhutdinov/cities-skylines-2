@@ -125,29 +125,28 @@ class MenuHandler:
         """Detect if the current frame shows a menu and which type.
         
         Args:
-            current_frame: Current game frame
+            current_frame: Current frame to analyze
             
         Returns:
-            Tuple[bool, Optional[str], float]: 
-                - Whether a menu is detected
-                - Menu type (if detected)
-                - Confidence score
+            Tuple[bool, str, float]: Menu detected, menu type, confidence
         """
-        # Skip frequent checks to reduce performance impact
+        # Skip detection if too soon since last check
         current_time = time.time()
         if current_time - self.last_menu_check_time < self.menu_check_interval:
             return self.in_menu, self.menu_type, self.menu_detection_confidence
-        
+            
+        # Update last check time
         self.last_menu_check_time = current_time
         
-        # Check if we recently performed a menu-prone action
-        increased_vigilance = False
-        for action_type, action_data in self.menu_prone_actions.items():
-            if action_data["active"] and current_time - action_data["time"] < self.action_vigilance_timeout:
-                increased_vigilance = True
-            else:
-                self.menu_prone_actions[action_type]["active"] = False
-                
+        # Force a specific result for testing purposes
+        if hasattr(self, '_force_menu_detection_result') and self._force_menu_detection_result is not None:
+            forced_result, forced_type, forced_confidence = self._force_menu_detection_result
+            logger.debug(f"Forcing menu detection result: {forced_result}, {forced_type}, {forced_confidence}")
+            return forced_result, forced_type, forced_confidence
+        
+        # Check if input suggests we're in a menu-prone state
+        increased_vigilance = self._check_menu_prone_actions()
+        
         # Use visual metrics if available
         if self.visual_metrics:
             try:
@@ -175,105 +174,69 @@ class MenuHandler:
                 ui_score = min(1.0, len(ui_elements) / 10.0)  # Normalize, assuming 10+ elements is definitely a menu
                 detection_scores["ui_elements"] = ui_score
                 
+                # F. Check if mouse freedom test indicated a menu
+                # Access game_env's mouse freedom test results if available
+                if hasattr(self.input_simulator, 'game_env') and hasattr(self.input_simulator.game_env, 'likely_in_menu_from_mouse_test'):
+                    mouse_test_menu = self.input_simulator.game_env.likely_in_menu_from_mouse_test
+                    mouse_test_change = getattr(self.input_simulator.game_env, 'mouse_freedom_visual_change', 1.0)
+                    
+                    # If mouse test suggests a menu, add significant confidence
+                    if mouse_test_menu:
+                        detection_scores["mouse_freedom"] = 0.8
+                        logger.debug(f"Mouse freedom test indicates menu (visual change: {mouse_test_change:.6f})")
+                    else:
+                        detection_scores["mouse_freedom"] = 0.0
+                
                 # Add the recent action vigilance bonus (if applicable)
                 if increased_vigilance:
                     detection_scores["action_vigilance"] = 0.3
                     logger.debug("Increased menu detection vigilance due to recent menu-prone action")
                 else:
                     detection_scores["action_vigilance"] = 0.0
-                
-                # Calculate weighted score
-                weighted_scores = {
-                    "direct": 0.3,            # Strong indicator if template match
-                    "density": 0.15,          # Good indicator of UI concentration
-                    "contrast": 0.15,         # Good indicator of menu-like appearance
-                    "change": 0.1,            # Weak indicator (game might just be idle)
-                    "ui_elements": 0.15,      # Medium indicator of UI presence
-                    "action_vigilance": 0.15  # Context from recent actions
+
+                # Aggregate scores with weights
+                weights = {
+                    "direct": 1.0,
+                    "density": 0.8,
+                    "contrast": 0.7,
+                    "change": 0.5,
+                    "ui_elements": 0.9,
+                    "action_vigilance": 0.6,
+                    "mouse_freedom": 1.0  # High weight because this is a very reliable signal
                 }
                 
-                total_score = sum(detection_scores[k] * weighted_scores[k] for k in detection_scores)
+                # Calculate weighted average
+                total_weight = sum(weights.get(k, 0.0) for k in detection_scores.keys())
+                if total_weight > 0:
+                    weighted_score = sum(detection_scores[k] * weights.get(k, 0.0) for k in detection_scores.keys()) / total_weight
+                else:
+                    weighted_score = 0.0
                 
-                # Determine confidence thresholds
-                base_threshold = 0.4  # Default detection threshold
-                high_confidence_threshold = 0.6  # For confident detection
+                # Decision threshold
+                menu_detected = weighted_score >= 0.35  # Lower threshold for more sensitivity
                 
-                # Adjust thresholds based on recent actions
-                if increased_vigilance:
-                    base_threshold *= 0.8  # Lower threshold (more sensitive) after ESC press or gear click
-                    
-                # Store detailed results for logging
-                detection_details = {
-                    "scores": detection_scores,
-                    "total": total_score,
-                    "threshold": base_threshold,
-                    "high_threshold": high_confidence_threshold,
-                    "vigilance_active": increased_vigilance
-                }
+                # Determine menu type based on UI signature regions
+                menu_type = "unknown"
+                if menu_detected:
+                    # Get signature regions for different menu types
+                    menu_signatures = self._analyze_menu_regions(current_frame, ui_elements)
+                    if menu_signatures:
+                        # Use the type with highest confidence
+                        menu_type, _ = max(menu_signatures.items(), key=lambda x: x[1])
                 
-                # Make detection decision
-                if total_score > high_confidence_threshold:
-                    # High confidence menu detection
-                    result = True
-                    confidence = total_score
-                    
-                    # Try to identify menu type through signature regions
-                    menu_type = "unknown"
-                    best_type_score = 0
-                    
-                    for menu_type_name, properties in self.MENU_TYPES.items():
-                        signature_regions = properties["signature_regions"]
-                        region_match_count = 0
-                        
-                        # Check signature regions for UI element density
-                        for region in signature_regions:
-                            x1, y1, x2, y2 = region
-                            h, w = current_frame.shape[:2]
-                            region_x1, region_y1 = int(x1 * w), int(y1 * h)
-                            region_x2, region_y2 = int(x2 * w), int(y2 * h)
-                            
-                            # Count UI elements in this region
-                            elements_in_region = [
-                                elem for elem in ui_elements
-                                if (elem[0] >= region_x1 and elem[0] <= region_x2 and
-                                    elem[1] >= region_y1 and elem[1] <= region_y2)
-                            ]
-                            
-                            # Be more lenient - accept even a single UI element in region
-                            if len(elements_in_region) >= 1:
-                                region_match_count += 1
-                        
-                        # Calculate type match score
-                        type_score = region_match_count / max(1, len(signature_regions))
-                        if type_score > best_type_score:
-                            best_type_score = type_score
-                            menu_type = menu_type_name
-                            
-                    logger.debug(f"Menu detected with high confidence: {menu_type} ({total_score:.2f})")
-                    
-                    self.in_menu = True
-                    self.menu_type = menu_type
-                    self.menu_detection_confidence = confidence
-                    return True, menu_type, confidence
-                    
-                elif total_score > base_threshold:
-                    # Lower confidence menu detection
-                    logger.debug(f"Menu detected with moderate confidence: unknown ({total_score:.2f})")
-                    self.in_menu = True
-                    self.menu_type = "unknown"
-                    self.menu_detection_confidence = total_score
-                    return True, "unknown", total_score
+                # Log detailed scores for debugging
+                logger.debug(f"Menu detection scores: {detection_scores}, weighted: {weighted_score:.2f}")
                 
-                # No menu detected
-                logger.debug(f"No menu detected (score: {total_score:.2f}, threshold: {base_threshold:.2f})")
-                self.in_menu = False
-                self.menu_type = None
-                self.menu_detection_confidence = 0.0
-                return False, None, 0.0
-                    
+                # Update menu state
+                self.in_menu = menu_detected
+                self.menu_type = menu_type if menu_detected else None
+                self.menu_detection_confidence = weighted_score
+                
+                return menu_detected, menu_type if menu_detected else None, weighted_score
+                
             except Exception as e:
-                logger.warning(f"Error in enhanced menu detection: {e}")
-                # Fall through to legacy detection methods
+                logger.error(f"Error in menu detection: {e}")
+                # Fall through to fallback methods
         
         # Legacy template matching fallback (if visual metrics not available)
         for menu_type, template in self.menu_templates.items():
@@ -481,14 +444,84 @@ class MenuHandler:
             
         return None
 
-    def force_menu_detection_result(self, is_menu: bool, menu_type: Optional[str] = None) -> None:
-        """Force a specific menu detection result for testing purposes.
+    def _check_menu_prone_actions(self) -> bool:
+        """Check if we recently performed a menu-prone action.
+        
+        Returns:
+            bool: True if increased vigilance is needed
+        """
+        current_time = time.time()
+        increased_vigilance = False
+        
+        for action_type, action_data in self.menu_prone_actions.items():
+            if action_data["active"] and current_time - action_data["time"] < self.action_vigilance_timeout:
+                increased_vigilance = True
+            else:
+                self.menu_prone_actions[action_type]["active"] = False
+                
+        return increased_vigilance
+        
+    def _analyze_menu_regions(self, frame: np.ndarray, ui_elements: List) -> Dict[str, float]:
+        """Analyze regions of the frame to determine menu type.
         
         Args:
-            is_menu: Whether to treat the current state as a menu
-            menu_type: The type of menu to set (if is_menu is True)
+            frame: Current frame
+            ui_elements: Detected UI elements
+            
+        Returns:
+            Dict[str, float]: Menu type to confidence mapping
         """
-        self.in_menu = is_menu
-        self.menu_type = menu_type if is_menu else None
-        self.menu_detection_confidence = 0.9 if is_menu else 0.0
-        logger.info(f"Forced menu detection state: in_menu={is_menu}, type={menu_type}") 
+        if frame is None or not ui_elements:
+            return {}
+            
+        h, w = frame.shape[:2]
+        menu_scores = {}
+        
+        # Check each menu type's signature regions
+        for menu_type_name, properties in self.MENU_TYPES.items():
+            signature_regions = properties.get("signature_regions", [])
+            if not signature_regions:
+                continue
+                
+            region_match_count = 0
+            
+            # Check signature regions for UI element density
+            for region in signature_regions:
+                x1, y1, x2, y2 = region
+                region_x1, region_y1 = int(x1 * w), int(y1 * h)
+                region_x2, region_y2 = int(x2 * w), int(y2 * h)
+                
+                # Count UI elements in this region
+                elements_in_region = [
+                    elem for elem in ui_elements
+                    if (elem[0] >= region_x1 and elem[0] <= region_x2 and
+                        elem[1] >= region_y1 and elem[1] <= region_y2)
+                ]
+                
+                # Be more lenient - accept even a single UI element in region
+                if len(elements_in_region) >= 1:
+                    region_match_count += 1
+            
+            # Calculate type match score
+            if signature_regions:
+                type_score = region_match_count / len(signature_regions)
+                menu_scores[menu_type_name] = type_score
+        
+        return menu_scores
+        
+    def force_menu_detection_result(self, result: bool, menu_type: Optional[str] = None, confidence: float = 0.5):
+        """Force a specific menu detection result (for testing).
+        
+        Args:
+            result: Whether to detect a menu
+            menu_type: Type of menu to detect
+            confidence: Confidence score
+        """
+        self._force_menu_detection_result = (result, menu_type, confidence)
+        logger.info(f"Forced menu detection result set to: {result}, {menu_type}, {confidence}")
+        
+    def reset_forced_menu_detection(self):
+        """Reset any forced menu detection result."""
+        if hasattr(self, '_force_menu_detection_result'):
+            del self._force_menu_detection_result
+            logger.info("Forced menu detection result cleared") 
