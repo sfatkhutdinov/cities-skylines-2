@@ -511,9 +511,34 @@ class InputSimulator:
         """Scroll the mouse wheel.
         
         Args:
-            clicks (int): Number of clicks (positive for up, negative for down)
+            clicks (int): Positive for scrolling up, negative for scrolling down
+            
+        Returns:
+            bool: True if successful, False otherwise
         """
-        self.mouse.scroll(0, clicks)
+        try:
+            if not self.ensure_game_window_focused():
+                logger.warning("Failed to focus game window for mouse scroll")
+                return False
+                
+            # Mouse wheel deltas are typically multiples of 120
+            # https://docs.microsoft.com/en-us/windows/win32/inputdev/wm-mousewheel
+            wheel_delta = clicks * 120
+            
+            # Create the input event
+            wheel_event = win32api.mouse_event(
+                win32con.MOUSEEVENTF_WHEEL,
+                0, 0,  # x, y (not used for wheel events)
+                wheel_delta,  # wheel delta
+                0  # extra info
+            )
+            
+            time.sleep(0.05)  # Small delay to ensure scroll is registered
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error scrolling mouse: {e}")
+            return False
         
     def rotate_camera(self, start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.5):
         """Rotate camera using middle mouse button drag.
@@ -583,116 +608,95 @@ class InputSimulator:
         self.mouse.release(Button.right)
         time.sleep(0.1)
         
-    def key_press(self, key: str, duration: float = 0.1) -> bool:
-        """Press a key with a short duration.
+    def key_press(self, key, duration=0.1, force_direct=False):
+        """Press a key on the keyboard.
         
         Args:
-            key (str): Key to press
-            duration (float): How long to hold the key
+            key: Key to press (can be a string like 'a', 'enter', etc.)
+            duration: How long to hold the key down
+            force_direct: Force direct key press, even for escape key
             
         Returns:
             bool: True if successful, False otherwise
         """
-        # First ensure the game window is focused
-        if not self.ensure_game_window_focused():
-            print(f"Failed to focus game window before key press: {key}")
-            # We'll still attempt the key press, but log the issue
-        
-        # Check for escape key with improved safety logic
-        if key.lower() in ['escape', 'esc']:
-            if hasattr(self, 'block_escape') and self.block_escape:
-                print("WARNING: Blocked ESC key press - using safe menu handling instead")
-                return self.safe_menu_handling()
-        
-        # Check for potentially problematic key presses and block them
-        dangerous_keys = ['f4', 'alt+f4', 'ctrl+w', 'alt+tab']
-        if key.lower() in dangerous_keys:
-            print(f"WARNING: Blocked dangerous key press: {key}")
-            return False
-        
         try:
-            # Get the key from the map
-            if key in self.key_map:
-                k = self.key_map[key]
-            else:
-                # If not in map, try direct key
-                k = key
+            # Special handling for escape key to avoid game window issues
+            if key.lower() == 'escape' and not force_direct:
+                logger.info("WARNING: Blocked ESC key press - using safe menu handling instead")
+                return self.safe_menu_handling()
                 
-            # Log the key press action
-            print(f"Pressing key: {key} for {duration:.2f}s")
+            if not self.ensure_game_window_focused():
+                logger.warning("Failed to focus game window, key press may not work")
+                
+            # Convert string key to virtual key code
+            if isinstance(key, str):
+                key = key.lower()
+                if key in self.key_map:
+                    key_code = self.key_map[key]
+                else:
+                    key_code = ord(key.upper())
+            else:
+                key_code = key
+                
+            # Press key down
+            self.keyboard.press(key_code)
             
-            # Press and release with specified duration
-            self.keyboard.press(k)
+            # Wait for specified duration
+            time.sleep(duration)
             
-            # Use an adaptive timeout based on duration
-            # For very short presses (< 0.1s), use a minimum of 0.05s
-            actual_duration = max(0.05, duration)
-            time.sleep(actual_duration)
+            # Release key
+            self.keyboard.release(key_code)
             
-            self.keyboard.release(k)
-            time.sleep(0.05)  # Small delay after release
-            
-            # Verify that the key was released properly
-            try:
-                # For most keys we can't directly verify, but we can make sure the keyboard state is reset
-                self.keyboard.release(k)  # Try releasing again to ensure it's released
-            except:
-                pass
+            # Small delay to ensure key press is registered
+            time.sleep(0.05)
             
             return True
-        except Exception as e:
-            print(f"Error pressing key {key}: {str(e)}")
             
-            # Try to ensure key is released on error
-            try:
-                if key in self.key_map:
-                    self.keyboard.release(self.key_map[key])
-            except:
-                pass
-                
+        except Exception as e:
+            logger.error(f"Error during key press: {e}")
             return False
             
-    def safe_menu_handling(self) -> bool:
-        """Handle being stuck in a menu using a safe sequence of escape and clicks.
+    def safe_menu_handling(self, max_attempts=3, current_attempt=0):
+        """Safe menu handling for cases where direct ESC press doesn't work.
+        
+        This tries various methods to handle menu navigation safely.
         
         Returns:
-            bool: True if the menu was likely handled successfully
+            bool: True if successful, False otherwise
         """
+        # Prevent infinite recursion
+        if current_attempt >= max_attempts:
+            logger.warning(f"Safe menu handling failed after {max_attempts} attempts")
+            return False
+            
         logger.info("Attempting safe menu handling routine")
         
-        # Safety mechanism: try to close any menu by pressing ESC and clicking center
-        success = False
-        
-        # Sequence 1: Press ESC a few times with delays
-        logger.info("Trying escape key sequence")
-        for _ in range(3):
-            self.key_press("escape", duration=0.1)
-            time.sleep(0.5)
-        
-        # Get screen dimensions
-        width, height = self._get_screen_dimensions()
-        center_x, center_y = width // 2, height // 2
-        
-        # Sequence 2: Click center of screen
-        logger.info(f"Clicking center of screen ({center_x}, {center_y})")
-        self.mouse_click(center_x, center_y)
-        time.sleep(0.5)
-        
-        # Sequence 3: Try clicking at known menu button locations
-        self._click_common_menu_buttons()
-        
-        # Sequence 4: Try pressing common menu navigation keys
-        logger.info("Trying menu navigation keys")
-        for key in ["tab", "enter", "space"]:
-            self.key_press(key, duration=0.1)
-            time.sleep(0.3)
-        
-        # Sequence 5: More aggressive approach - click in grid pattern
-        if not success:
-            logger.info("Trying grid pattern clicks")
-            self._click_grid_pattern()
+        try:
+            # Try different approaches to handle menu interaction
+            logger.info("Trying escape key sequence")
             
-        return True
+            # Focus window first
+            if not self.ensure_game_window_focused():
+                logger.warning("Failed to focus game window for safe menu handling")
+                
+            # Use direct key press with force_direct=True to avoid recursion
+            self.key_press("escape", duration=0.1, force_direct=True)
+            
+            # Wait a bit for menu to appear/disappear
+            time.sleep(0.3)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in safe menu handling: {e}")
+            
+            # Increment attempt counter to prevent infinite recursion
+            current_attempt += 1
+            if current_attempt < max_attempts:
+                time.sleep(0.5)  # Wait before retry
+                return self.safe_menu_handling(max_attempts, current_attempt)
+                
+            return False
         
     def _click_common_menu_buttons(self) -> None:
         """Click at positions where common menu buttons are typically located."""
@@ -1383,20 +1387,19 @@ class InputSimulator:
                 x, y = cursor_pos
             else:
                 # If not a valid tuple, use screen center
-                screen_width, screen_height = self.screen_width, self.screen_height
+                screen_width, screen_height = self._get_screen_dimensions()
                 x, y = screen_width // 2, screen_height // 2
                 logger.warning(f"Invalid cursor position format: {cursor_pos}, using screen center")
             
             # If we have client position information, translate to client coordinates
-            if hasattr(self, 'screen_capture') and self.screen_capture:
-                if hasattr(self.screen_capture, 'client_position') and self.screen_capture.client_position:
-                    client_left, client_top, _, _ = self.screen_capture.client_position
-                    x = x - client_left
-                    y = y - client_top
+            if hasattr(self, 'game_window_rect') and self.game_window_rect:
+                client_left, client_top, _, _ = self.game_window_rect
+                x = x - client_left
+                y = y - client_top
             
             return (x, y)
         except Exception as e:
             logger.error(f"Error getting mouse position: {e}")
             # Return center of screen as fallback
-            screen_width, screen_height = self.screen_width, self.screen_height
+            screen_width, screen_height = self._get_screen_dimensions()
             return (screen_width // 2, screen_height // 2)

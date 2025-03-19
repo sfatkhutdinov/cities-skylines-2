@@ -823,8 +823,11 @@ class CitiesEnvironment:
                     direction = action_info.get("direction", "down")
                     amount = action_info.get("amount", 5)
                     
+                    # Convert direction to sign for clicks
+                    clicks = amount if direction == "up" else -amount
+                    
                     # Execute scroll
-                    return self.input_simulator.mouse_scroll(direction=direction, amount=amount)
+                    return self.input_simulator.mouse_scroll(clicks)
                 
                 elif mouse_action == "drag":
                     # Handle drag action with proper error checking
@@ -860,8 +863,8 @@ class CitiesEnvironment:
                     
                     # Execute drag
                     return self.input_simulator.mouse_drag(
-                        from_screen_x, from_screen_y, 
-                        to_screen_x, to_screen_y
+                        start=(from_screen_x, from_screen_y), 
+                        end=(to_screen_x, to_screen_y)
                     )
             
             elif action_type == "combined":

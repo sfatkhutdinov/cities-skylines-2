@@ -810,26 +810,53 @@ class AutonomousRewardSystem:
             float: Prediction error reward
         """
         try:
-            # Predict next frame using world model
-            predicted_frame = self.world_model.predict_next_frame(prev_frame, action_idx)
+            # Handle detached tensors
+            if isinstance(prev_frame, torch.Tensor) and prev_frame.requires_grad:
+                prev_frame = prev_frame.detach()
+            if isinstance(curr_frame, torch.Tensor) and curr_frame.requires_grad:
+                curr_frame = curr_frame.detach()
             
-            # Calculate prediction error
+            # Predict next frame using world model - ensure we pass a list of frames
+            predicted_frame = self.world_model.predict_next_frame([prev_frame], action_idx)
+            
+            # Calculate prediction error - ensure we're working with valid tensors
+            # Explicitly check tensor shapes to avoid boolean tensor comparison
+            if predicted_frame.shape != curr_frame.shape:
+                # Resize to match if needed
+                if len(curr_frame.shape) > len(predicted_frame.shape):
+                    curr_frame = curr_frame.squeeze(0)
+                elif len(predicted_frame.shape) > len(curr_frame.shape):
+                    predicted_frame = predicted_frame.squeeze(0)
+                    
+                # If shapes still don't match, resize using interpolate
+                if tuple(predicted_frame.shape) != tuple(curr_frame.shape):
+                    predicted_frame = F.interpolate(
+                        predicted_frame.unsqueeze(0),
+                        size=curr_frame.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+            
+            # Calculate MSE error
             prediction_error = F.mse_loss(predicted_frame, curr_frame)
             
             # Convert scalar tensor to float explicitly
             if isinstance(prediction_error, torch.Tensor):
                 # Handle tensors with multiple values by taking the mean
                 if prediction_error.numel() > 1:
-                    prediction_error = prediction_error.mean().item()
-                else:
-                    prediction_error = prediction_error.item()
+                    prediction_error = prediction_error.mean()
+                
+                # Detach and convert to float
+                if prediction_error.requires_grad:
+                    prediction_error = prediction_error.detach()
+                prediction_error = float(prediction_error.cpu().item())
             
             # Scale prediction error to a reward
             # Higher error = higher reward (encourages exploration)
             # But not too high (clip to avoid pursuing completely random states)
             reward = min(max(prediction_error, 0.0), 1.0)
             
-            return reward
+            return float(reward)
         except Exception as e:
             logger.error(f"Error computing prediction error reward: {e}")
             return 0.0
