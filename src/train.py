@@ -27,6 +27,48 @@ logger.debug("Starting script...")
 # Global variable to track exit state
 _exit_requested = False
 
+# Setup proper file logging
+def setup_file_logging():
+    """Configure logging to write to timestamped log files."""
+    try:
+        # Create logs directory if it doesn't exist
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Test write permissions
+        test_file_path = os.path.join(log_dir, "test_write.tmp")
+        try:
+            with open(test_file_path, 'w') as f:
+                f.write("Test")
+            os.remove(test_file_path)
+            print(f"Log directory '{log_dir}' is writable")
+        except (IOError, PermissionError) as e:
+            print(f"WARNING: Cannot write to log directory '{log_dir}': {e}")
+            print("Logs may not be saved properly")
+        
+        # Generate log filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"training_{timestamp}.log")
+        
+        # Create file handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        
+        # Add the file handler to the root logger
+        root_logger = logging.getLogger()
+        root_logger.addHandler(file_handler)
+        
+        logger.info(f"Logging to file: {log_file}")
+        return log_file
+    except Exception as e:
+        logger.error(f"Failed to set up file logging: {e}")
+        print(f"ERROR: Failed to set up file logging: {e}")
+        return None
+
+# Initialize file logging
+log_file_path = setup_file_logging()
+
 try:
     logger.debug("Importing environment...")
     from environment.game_env import CitiesEnvironment
@@ -639,21 +681,13 @@ def train():
     """Train the agent."""
     args = parse_args()
     
-    # Setup logging
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    
-    log_file = log_dir / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    logging.basicConfig(
-        level=logging.INFO if not args.verbose else logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
+    # Adjust log level based on verbosity flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose logging enabled")
     
     logger.info(f"Starting training with arguments: {args}")
+    print(f"Starting training with arguments: {args}")
     
     # Create checkpoint directory
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -785,9 +819,12 @@ def train():
                 logger.info(f"Found existing best model, setting initial best_reward to {best_reward}")
         
         logger.info("Starting training loop...")
+        print("Starting training loop...")
         
         for episode in range(start_episode, args.num_episodes):
             checkpoint_manager.update_current_episode(episode)
+            
+            print(f"Starting episode {episode+1}/{args.num_episodes}...")
             
             # Collect trajectory
             episode_start_time = time.time()
@@ -800,7 +837,9 @@ def train():
             
             # Check if we had valid experiences (might be empty if game crashed)
             if not experiences:
-                logger.warning("No valid experiences collected in this episode. Possible game crash.")
+                message = "No valid experiences collected in this episode. Possible game crash."
+                logger.warning(message)
+                print(f"WARNING: {message}")
                 # Wait a bit before trying again
                 time.sleep(10.0)
                 continue
@@ -867,4 +906,23 @@ def train():
             logger.error(f"Error closing environment in finally block: {str(e)}")
 
 if __name__ == "__main__":
-    train() 
+    try:
+        print("=============================================")
+        print("Starting Cities: Skylines 2 autonomous agent")
+        print("=============================================")
+        if log_file_path:
+            print(f"Logs will be written to: {log_file_path}")
+            print("Check this file for detailed logs and errors")
+        else:
+            print("WARNING: Log file setup failed - logs will only be displayed on console")
+        
+        logger.info("=============================================")
+        logger.info("Starting Cities: Skylines 2 autonomous agent")
+        logger.info("=============================================")
+        train()
+        logger.info("Training completed successfully")
+        print("Training completed successfully")
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}", exc_info=True)
+        print(f"Fatal error: {e}")
+        sys.exit(1) 
