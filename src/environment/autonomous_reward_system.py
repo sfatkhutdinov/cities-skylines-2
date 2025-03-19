@@ -818,7 +818,11 @@ class AutonomousRewardSystem:
             
             # Convert scalar tensor to float explicitly
             if isinstance(prediction_error, torch.Tensor):
-                prediction_error = prediction_error.item()
+                # Handle tensors with multiple values by taking the mean
+                if prediction_error.numel() > 1:
+                    prediction_error = prediction_error.mean().item()
+                else:
+                    prediction_error = prediction_error.item()
             
             # Scale prediction error to a reward
             # Higher error = higher reward (encourages exploration)
@@ -869,16 +873,39 @@ class AutonomousRewardSystem:
                 if prev_frame_np.ndim == 3 and curr_frame_np.ndim == 3:
                     # Both are 3D, resize to match curr_frame
                     prev_frame_np = cv2.resize(prev_frame_np, 
-                                              (curr_frame_np.shape[1], curr_frame_np.shape[0]),
-                                              interpolation=cv2.INTER_LINEAR)
+                                             (curr_frame_np.shape[1], curr_frame_np.shape[0]),
+                                             interpolation=cv2.INTER_LINEAR)
                 elif prev_frame_np.ndim == 2 and curr_frame_np.ndim == 2:
                     # Both are 2D, resize to match curr_frame
                     prev_frame_np = cv2.resize(prev_frame_np, 
-                                              (curr_frame_np.shape[1], curr_frame_np.shape[0]),
-                                              interpolation=cv2.INTER_LINEAR)
+                                             (curr_frame_np.shape[1], curr_frame_np.shape[0]),
+                                             interpolation=cv2.INTER_LINEAR)
             
-            # Calculate visual change
-            diff_pattern = cv2.absdiff(prev_frame_np, curr_frame_np)
+            # Reshape diff_pattern to 2D if needed
+            if hasattr(self.visual_change_analyzer, 'input_shape'):
+                # Get expected shape from the analyzer
+                expected_shape = self.visual_change_analyzer.input_shape
+                
+                # Calculate visual change
+                diff_pattern = cv2.absdiff(prev_frame_np, curr_frame_np)
+                
+                # Resize diff_pattern to match expected input shape for the analyzer
+                if diff_pattern.shape != expected_shape:
+                    if len(expected_shape) == 2:
+                        # Convert to grayscale if needed
+                        if diff_pattern.ndim == 3:
+                            diff_pattern = cv2.cvtColor(diff_pattern, cv2.COLOR_BGR2GRAY)
+                        # Resize to match expected dimensions
+                        diff_pattern = cv2.resize(diff_pattern, (expected_shape[1], expected_shape[0]))
+                    elif len(expected_shape) == 3:
+                        # Ensure diff_pattern has 3 channels
+                        if diff_pattern.ndim == 2:
+                            diff_pattern = cv2.cvtColor(diff_pattern, cv2.COLOR_GRAY2BGR)
+                        # Resize to match expected dimensions
+                        diff_pattern = cv2.resize(diff_pattern, (expected_shape[1], expected_shape[0]))
+            else:
+                # Just calculate the diff without reshaping
+                diff_pattern = cv2.absdiff(prev_frame_np, curr_frame_np)
             
             # Compute mean pixel change
             mean_diff = np.mean(diff_pattern)

@@ -21,6 +21,11 @@ class VisualChangeAnalyzer:
         self.outcomes_memory = []  # Corresponding outcomes
         self.feature_downscale = (16, 16)  # Downsample size for memory efficiency
         
+    @property
+    def input_shape(self):
+        """The expected input shape for patterns."""
+        return self.feature_downscale
+        
     def update_association(self, visual_change_pattern: np.ndarray, outcome: float) -> None:
         """Update association between a visual change pattern and observed outcome.
         

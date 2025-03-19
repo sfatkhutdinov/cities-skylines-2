@@ -73,3 +73,4 @@ Thumbs.db
 data/
 screenshots/
 **/*.pyc
+latest_log.txt

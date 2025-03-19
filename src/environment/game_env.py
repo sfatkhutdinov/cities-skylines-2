@@ -783,23 +783,30 @@ class CitiesEnvironment:
                     if "position" in action_info:
                         position = action_info.get("position")
                         if isinstance(position, tuple) and len(position) == 2:
-                            x, y = position
+                            screen_x, screen_y = position
                         else:
                             # Fallback to center of screen
                             width, height = self._get_screen_dimensions()
-                            x, y = width // 2, height // 2
+                            screen_x, screen_y = width // 2, height // 2
                     else:
                         # Use current mouse position
                         try:
-                            x, y = self.input_simulator.get_mouse_position()
+                            mouse_pos = self.input_simulator.get_mouse_position()
+                            if isinstance(mouse_pos, tuple) and len(mouse_pos) == 2:
+                                screen_x, screen_y = mouse_pos
+                            else:
+                                # Fallback to center of screen
+                                width, height = self._get_screen_dimensions()
+                                screen_x, screen_y = width // 2, height // 2
+                                logger.warning(f"Invalid mouse position format: {mouse_pos}, using center of screen")
                         except Exception as e:
                             # Fallback to center of screen
                             width, height = self._get_screen_dimensions()
-                            x, y = width // 2, height // 2
+                            screen_x, screen_y = width // 2, height // 2
                             logger.warning(f"Could not get mouse position: {e}, using center of screen")
                     
                     # Execute click
-                    return self.input_simulator.mouse_click(x, y, button=button, double=double)
+                    return self.input_simulator.mouse_click(screen_x, screen_y, button=button, double=double)
                 
                 elif mouse_action in ["down", "up"]:
                     # Get button
@@ -820,21 +827,36 @@ class CitiesEnvironment:
                     return self.input_simulator.mouse_scroll(direction=direction, amount=amount)
                 
                 elif mouse_action == "drag":
-                    # Get target normalized coordinates (0.0 to 1.0)
+                    # Handle drag action with proper error checking
+                    width, height = self._get_screen_dimensions()
+                    
+                    # Get target normalized coordinates
                     to_norm_x = action_info.get("to_x", 0.5)
                     to_norm_y = action_info.get("to_y", 0.5)
                     
                     # Convert to screen coordinates
-                    width, height = self._get_screen_dimensions()
                     to_screen_x = int(to_norm_x * width)
                     to_screen_y = int(to_norm_y * height)
                     
-                    # Get current mouse position as start position
+                    # Get starting position with proper error handling
                     try:
-                        from_screen_x, from_screen_y = self.input_simulator.get_mouse_position()
+                        mouse_pos = self.input_simulator.get_mouse_position()
+                        if isinstance(mouse_pos, tuple) and len(mouse_pos) == 2:
+                            from_screen_x, from_screen_y = mouse_pos
+                        else:
+                            # Default to center if not a valid tuple
+                            from_screen_x, from_screen_y = width // 2, height // 2
+                            logger.warning(f"Invalid mouse position format: {mouse_pos}, using center of screen as start")
                     except Exception:
                         # If can't get position, use center of screen
                         from_screen_x, from_screen_y = width // 2, height // 2
+                        logger.warning("Failed to get mouse position, using center of screen as start")
+                    
+                    # Also check if start point is explicitly specified
+                    if "start" in action_info:
+                        start_pos = action_info.get("start")
+                        if isinstance(start_pos, tuple) and len(start_pos) == 2:
+                            from_screen_x, from_screen_y = start_pos
                     
                     # Execute drag
                     return self.input_simulator.mouse_drag(
@@ -855,7 +877,20 @@ class CitiesEnvironment:
                 success = False
                 # Perform mouse action
                 if mouse_action == "click":
-                    success = self.input_simulator.mouse_click(button=button)
+                    # Get current mouse position for click
+                    try:
+                        mouse_pos = self.input_simulator.get_mouse_position()
+                        if isinstance(mouse_pos, tuple) and len(mouse_pos) == 2:
+                            screen_x, screen_y = mouse_pos
+                            success = self.input_simulator.mouse_click(screen_x, screen_y, button=button)
+                        else:
+                            # Use center of screen if invalid format
+                            width, height = self._get_screen_dimensions()
+                            screen_x, screen_y = width // 2, height // 2
+                            success = self.input_simulator.mouse_click(screen_x, screen_y, button=button)
+                    except Exception as e:
+                        logger.error(f"Error getting mouse position for combined action: {e}")
+                        success = False
                 
                 # Release key
                 time.sleep(0.05)  # Brief delay
@@ -868,6 +903,30 @@ class CitiesEnvironment:
                 duration = action_info.get("duration", 0.5)
                 time.sleep(duration)
                 return True
+            
+            elif action_type == "speed":
+                # Handle game speed action
+                speed_value = action_info.get("speed", 1.0)
+                
+                # Convert to speed level (0-4)
+                if speed_value <= 0.1:
+                    speed_level = 0
+                elif speed_value <= 0.3:
+                    speed_level = 1
+                elif speed_value <= 0.6:
+                    speed_level = 2
+                elif speed_value <= 0.8:
+                    speed_level = 3
+                else:
+                    speed_level = 4
+                
+                # Use the existing method to set game speed
+                if hasattr(self, '_set_game_speed'):
+                    self._set_game_speed(speed_level)
+                    return True
+                else:
+                    logger.warning("Speed control not available")
+                    return False
             
             else:
                 # Unknown action type
@@ -1318,3 +1377,50 @@ class CitiesEnvironment:
             frame_tensor = frame_tensor.to(self.config.get_device())
         
         return frame_tensor
+
+    def _handle_menu_action(self, action_info: Dict) -> bool:
+        """Handle actions specifically when in menu mode.
+        
+        This is a specialized action handler for menu navigation.
+        
+        Args:
+            action_info (Dict): Dictionary containing action details
+            
+        Returns:
+            bool: Whether the action was successfully executed
+        """
+        try:
+            action_type = action_info.get("type", "")
+            
+            # Use menu handler if available
+            if hasattr(self, 'menu_handler') and self.menu_handler is not None:
+                # For mouse movement actions in menu
+                if action_type == "mouse" and action_info.get("action") == "move":
+                    position = action_info.get("position", (0.5, 0.5))
+                    if isinstance(position, tuple) and len(position) == 2:
+                        x, y = position
+                        return self.menu_handler.navigate_to_menu_position(x, y)
+                
+                # For click actions in menu
+                elif action_type == "mouse" and action_info.get("action") == "click":
+                    # Get position
+                    if "position" in action_info:
+                        position = action_info.get("position")
+                        if isinstance(position, tuple) and len(position) == 2:
+                            x, y = position
+                            return self.menu_handler.click_menu_position(x, y)
+                
+                # Handle key presses in menu
+                elif action_type == "key":
+                    key = action_info.get("key", "")
+                    if key.lower() == "escape":
+                        return self.menu_handler.exit_current_menu()
+                    elif key.lower() in ["enter", "return"]:
+                        return self.menu_handler.confirm_menu_selection()
+            
+            # Fallback to normal action execution
+            return self._execute_action(action_info)
+            
+        except Exception as e:
+            logger.error(f"Error handling menu action: {e}")
+            return False
