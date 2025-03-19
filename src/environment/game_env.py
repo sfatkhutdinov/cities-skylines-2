@@ -173,6 +173,12 @@ class CitiesEnvironment:
             self.likely_in_menu_from_mouse_test = False
             self.mouse_freedom_visual_change = 1.0  # Initialize with high value (indicates not in menu)
             self.last_mouse_freedom_test_time = 0
+            
+            # Menu detection state
+            self.previous_menu_state = False
+            self.menu_entry_time = 0
+            self.last_menu_exit_time = 0
+            self.menu_entry_count = 0
         
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
@@ -1179,6 +1185,55 @@ class CitiesEnvironment:
         if menu_detected:
             reward -= 1.0
             
+            # Store the timestamp when we first detected the menu
+            if not hasattr(self, 'menu_entry_time') or not hasattr(self, 'previous_menu_state') or not self.previous_menu_state:
+                self.menu_entry_time = time.time()
+        
+        # Add a reward for successfully exiting a menu (but prevent farming)
+        if hasattr(self, 'previous_menu_state') and self.previous_menu_state and not menu_detected:
+            # Successfully exited a menu
+            # Calculate how long we were in the menu
+            current_time = time.time()
+            menu_duration = current_time - getattr(self, 'menu_entry_time', current_time)
+            
+            # Only give exit reward if we were in the menu for a reasonable time
+            # This prevents the agent from rapidly toggling the menu for rewards
+            if menu_duration > 1.0:  # Must be in menu for at least 1 second
+                # Base reward for exiting menu
+                exit_reward = 0.5
+                
+                # Scale reward based on how quickly the agent exited (encourage faster exits)
+                # Cap at reasonable maximum time to not overly punish long menu stays
+                time_factor = min(menu_duration, 10.0) / 10.0  # Normalize to 0-1
+                # Inverted - faster exits (lower time_factor) get higher rewards
+                time_bonus = (1.0 - time_factor) * 0.5
+                
+                # Add the exit reward and time bonus
+                reward += exit_reward + time_bonus
+                
+                logger.debug(f"Menu exit reward: +{exit_reward + time_bonus:.2f} after {menu_duration:.1f}s in menu")
+                
+                # Reset menu cooldown timer - this prevents immediate re-entry farming
+                self.last_menu_exit_time = current_time
+                self.menu_entry_count = getattr(self, 'menu_entry_count', 0) + 1
+        
+        # Extra penalty for repeatedly entering/exiting menus (anti-farming)
+        if menu_detected and not getattr(self, 'previous_menu_state', False):
+            # Just entered a menu, check if this is too soon after exiting one
+            current_time = time.time()
+            time_since_last_exit = current_time - getattr(self, 'last_menu_exit_time', 0)
+            menu_entry_count = getattr(self, 'menu_entry_count', 0)
+            
+            # Penalty for entering menu too soon after exiting
+            if time_since_last_exit < 5.0 and menu_entry_count > 0:
+                # Calculate penalty that increases with each rapid re-entry
+                farming_penalty = min(0.5 * menu_entry_count, 3.0)
+                reward -= farming_penalty
+                logger.debug(f"Menu farming penalty: -{farming_penalty:.2f} (re-entered after {time_since_last_exit:.1f}s)")
+        
+        # Update menu state tracking
+        self.previous_menu_state = menu_detected
+        
         # Get frames before and after action
         prev_frame = getattr(self, 'prev_frame', None)
         curr_frame = self.screen_capture.capture_frame()
