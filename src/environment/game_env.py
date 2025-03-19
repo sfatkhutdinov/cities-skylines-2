@@ -31,27 +31,56 @@ class CitiesEnvironment:
         """Initialize the environment.
         
         Args:
-            config: Optional hardware configuration
-            mock_mode: If True, use a mock environment for testing/training without the actual game
-            menu_screenshot_path: Path to a reference screenshot of the menu screen
-            **kwargs: Additional keyword arguments
+            config (HardwareConfig, optional): Hardware configuration for optimization
+            mock_mode (bool): Whether to use mock environment
+            menu_screenshot_path (str, optional): Path to menu screenshot for reference
+            **kwargs: Additional arguments
         """
-        self.config = config or HardwareConfig()
+        # Setup logging
+        self.logger = logging.getLogger(__name__)
+        
+        # Store config
+        self.config = config if config else HardwareConfig()
         self.mock_mode = mock_mode
-        self.device = self.config.get_device()
+        self.menu_reference_path = menu_screenshot_path
+        self.has_menu_reference = self.menu_reference_path is not None and os.path.exists(str(self.menu_reference_path))
         
         # Initialize components
-        self.screen_capture = OptimizedScreenCapture(self.config)
         self.input_simulator = InputSimulator()
-        # Connect input simulator to screen capture for coordinate translation
+        
+        # Create screen capture instance
+        self.screen_capture = ScreenCapture(
+            device=self.config.device,
+            process_resolution=self.config.process_resolution,
+            fps_limit=self.config.fps_limit,
+            use_threading=self.config.use_threading
+        )
+        
+        # Pass the screen capture reference to the input simulator
         self.input_simulator.screen_capture = self.screen_capture
+        
+        # Initialize visual metrics estimator
         self.visual_estimator = VisualMetricsEstimator(self.config)
+        
+        # Setup menu detection
+        self.menu_detection_initialized = False
+        self.detect_menu_every_n_steps = 10
+        self.menu_stuck_counter = 0
+        self.max_menu_stuck_steps = 5  # Initialize the missing attribute
+        self.in_menu = False
+        
+        # Game crash detection
+        self.game_crashed = False
+        self.game_window_missing_count = 0
+        self.max_window_missing_threshold = 5  # Number of consecutive checks before considering game crashed
+        self.last_crash_check_time = time.time()
+        self.crash_check_interval = 2.0  # Seconds between crash checks
+        self.waiting_for_game_restart = False
+        self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
+        self.last_game_restart_check = time.time()
         
         # Initialize image utilities for visual processing
         self.image_utils = ImageUtils(debug_mode=False)
-        
-        # Initialize menu detection with reference image if provided
-        self.menu_reference_path = menu_screenshot_path
         
         # Check if the menu reference exists in the specified path or root directory
         if menu_screenshot_path and os.path.exists(menu_screenshot_path):
@@ -75,8 +104,6 @@ class CitiesEnvironment:
                 logger.info(f"Using default menu reference image found at {default_path}")
             else:
                 self.has_menu_reference = False
-        
-        self.menu_detection_initialized = False
         
         if self.has_menu_reference:
             try:
@@ -124,10 +151,6 @@ class CitiesEnvironment:
         self.fps_history = []
         self.last_optimization_check = time.time()
         self.optimization_interval = 60  # Check optimization every 60 seconds
-        
-        # Counter for how long the agent has been stuck in a menu
-        self.menu_stuck_counter = 0
-        self.max_menu_penalty = -1000.0  # Set as per user instruction to -1000.0
         
         # Add menu action suppression
         self.suppress_menu_actions = False
