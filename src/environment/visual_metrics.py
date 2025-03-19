@@ -988,9 +988,9 @@ class VisualMetricsEstimator:
                 gray = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
             else:
                 gray = frame_np
-                
-            # Try multiple thresholds to catch different UI elements
-            for threshold in [150, 200, 220]:
+            
+            # 1. Multi-threshold UI element detection
+            for threshold in [120, 150, 180, 200, 220]:
                 _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
                 contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
@@ -1000,7 +1000,7 @@ class VisualMetricsEstimator:
                     if w > 5 and h > 5 and w < frame_np.shape[1] // 2 and h < frame_np.shape[0] // 2:
                         ui_elements.append((x, y, w, h))
             
-            # Also try edge detection to find UI borders
+            # 2. Edge detection for UI borders
             edges = cv2.Canny(gray, 30, 150)
             # Dilate edges to connect nearby lines
             kernel = np.ones((3, 3), np.uint8)
@@ -1013,6 +1013,57 @@ class VisualMetricsEstimator:
                 if w > 20 and h > 20 and w < frame_np.shape[1] * 0.8 and h < frame_np.shape[0] * 0.8:
                     ui_elements.append((x, y, w, h))
             
+            # 3. Adaptive thresholding for better text detection
+            adaptive_thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+            )
+            contours, _ = cv2.findContours(adaptive_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                # Filter for text-like proportions
+                if w > 5 and h > 5 and w/h < 15 and h/w < 15:
+                    ui_elements.append((x, y, w, h))
+                
+            # 4. Search for rectangular shapes (menu panels)
+            # Use morphological operations to enhance rectangular shapes
+            morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            morph_close = cv2.morphologyEx(edges.copy(), cv2.MORPH_CLOSE, morph_kernel)
+            
+            contours, _ = cv2.findContours(morph_close, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                # Approximate contour to simplify shape
+                epsilon = 0.02 * cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+                
+                # Check if shape is rectangular (4-sided) or close to it
+                if len(approx) >= 4 and len(approx) <= 6:
+                    x, y, w, h = cv2.boundingRect(approx)
+                    # Filter for panels
+                    if w > 30 and h > 30:
+                        ui_elements.append((x, y, w, h))
+            
+            # 5. Sort and merge overlapping elements
+            ui_elements = sorted(ui_elements, key=lambda x: (x[0], x[1]))
+            i = 0
+            while i < len(ui_elements) - 1:
+                x1, y1, w1, h1 = ui_elements[i]
+                x2, y2, w2, h2 = ui_elements[i + 1]
+                
+                # Check for significant overlap
+                if (x1 <= x2 + w2 and x2 <= x1 + w1 and 
+                    y1 <= y2 + h2 and y2 <= y1 + h1):
+                    # Merge the boxes
+                    x = min(x1, x2)
+                    y = min(y1, y2)
+                    w = max(x1 + w1, x2 + w2) - x
+                    h = max(y1 + h1, y2 + h2) - y
+                    
+                    ui_elements[i] = (x, y, w, h)
+                    ui_elements.pop(i + 1)
+                else:
+                    i += 1
+            
             # Remove duplicates
             unique_elements = []
             for elem in ui_elements:
@@ -1022,4 +1073,132 @@ class VisualMetricsEstimator:
             return unique_elements
         except Exception as e:
             logger.error(f"Error detecting UI elements: {e}")
-            return [] 
+            return []
+
+    def calculate_ui_density(self, frame: np.ndarray) -> float:
+        """Calculate UI element density from a frame.
+        
+        Args:
+            frame: Input frame
+            
+        Returns:
+            float: UI element density score (0.0 to 1.0)
+        """
+        try:
+            # Detect UI elements
+            ui_elements = self.detect_ui_elements(frame)
+            
+            if not ui_elements:
+                return 0.0
+            
+            # Calculate frame dimensions
+            if isinstance(frame, torch.Tensor):
+                if frame.dim() == 3 and frame.shape[0] == 3:  # CHW format
+                    height, width = frame.shape[1], frame.shape[2]
+                else:
+                    height, width = frame.shape[:2]
+            else:  # Numpy array
+                height, width = frame.shape[:2]
+            
+            # Calculate total area of UI elements and frame
+            total_ui_area = sum(w * h for _, _, w, h in ui_elements)
+            frame_area = height * width
+            
+            # Calculate density
+            density = min(1.0, total_ui_area / (frame_area * 0.3))  # Normalize with a 30% threshold
+            
+            # Add bonus for well-distributed UI elements across the screen
+            screen_regions = [0, 0, 0, 0]  # top-left, top-right, bottom-left, bottom-right
+            for x, y, w, h in ui_elements:
+                center_x, center_y = x + w//2, y + h//2
+                
+                # Determine which region this element is in
+                region_idx = (center_y > height//2) * 2 + (center_x > width//2)
+                screen_regions[region_idx] += 1
+            
+            # Bonus for UI elements in multiple regions (likely menu)
+            region_coverage = len([r for r in screen_regions if r > 0]) / 4.0
+            density += region_coverage * 0.2  # Add up to 0.2 for full region coverage
+            
+            return min(1.0, density)
+        except Exception as e:
+            logger.error(f"Error calculating UI density: {e}")
+            return 0.0
+
+    def detect_menu_contrast_pattern(self, frame: np.ndarray) -> float:
+        """Detect menu-like contrast patterns in a frame.
+        
+        Args:
+            frame: Input frame
+            
+        Returns:
+            float: Menu pattern confidence (0.0 to 1.0)
+        """
+        try:
+            # Convert PyTorch tensor to numpy if needed
+            if isinstance(frame, torch.Tensor):
+                frame_np = frame.detach().cpu().numpy()
+                # Convert from PyTorch's CHW format to HWC format if needed
+                if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:
+                    frame_np = frame_np.transpose(1, 2, 0)
+                # Ensure values are in range 0-255
+                if frame_np.max() <= 1.0:
+                    frame_np = (frame_np * 255).astype(np.uint8)
+            else:
+                frame_np = frame
+            
+            # Convert to grayscale for analysis
+            if len(frame_np.shape) == 3:
+                gray = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = frame_np
+            
+            # 1. Analyze edge intensity in central region (menus often have strong edges in center)
+            height, width = gray.shape[:2]
+            center_x, center_y = width // 2, height // 2
+            center_width, center_height = width // 2, height // 2
+            center_region = gray[
+                max(0, center_y - center_height//2):min(height, center_y + center_height//2),
+                max(0, center_x - center_width//2):min(width, center_x + center_width//2)
+            ]
+            
+            # Calculate edge intensity
+            center_edges = cv2.Canny(center_region, 30, 150)
+            edge_intensity = np.mean(center_edges) / 255.0
+            
+            # 2. Check for contrast variation (menus often have consistent contrast)
+            # Calculate local contrast using standard deviation of pixel values
+            local_contrasts = []
+            for y in range(0, height, height//4):
+                for x in range(0, width, width//4):
+                    region = gray[y:min(y+height//4, height), x:min(x+width//4, width)]
+                    if region.size > 0:
+                        local_contrasts.append(np.std(region))
+            
+            # Lower variance in contrast is more menu-like
+            contrast_variance = np.std(local_contrasts) / np.mean(local_contrasts) if np.mean(local_contrasts) > 0 else 1.0
+            contrast_score = max(0, 1.0 - contrast_variance)
+            
+            # 3. Check for horizontal/vertical line presence (menu borders)
+            horizontal_lines = cv2.HoughLinesP(
+                center_edges, 1, np.pi/180, threshold=20, 
+                minLineLength=width//10, maxLineGap=width//20
+            )
+            vertical_lines = cv2.HoughLinesP(
+                center_edges, 1, np.pi/180, threshold=20, 
+                minLineLength=height//10, maxLineGap=height//20
+            )
+            
+            line_score = 0.0
+            if horizontal_lines is not None or vertical_lines is not None:
+                h_count = 0 if horizontal_lines is None else len(horizontal_lines)
+                v_count = 0 if vertical_lines is None else len(vertical_lines)
+                line_score = min(1.0, (h_count + v_count) / 10.0)  # Normalize, max of 10 lines
+            
+            # Combine scores with weights
+            menu_score = (edge_intensity * 0.3 + contrast_score * 0.3 + line_score * 0.4)
+            
+            return menu_score
+        except Exception as e:
+            logger.error(f"Error detecting menu contrast pattern: {e}")
+            return 0.0 

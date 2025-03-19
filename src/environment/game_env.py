@@ -27,173 +27,148 @@ logger = logging.getLogger(__name__)
 class CitiesEnvironment:
     """Environment for interacting with Cities: Skylines 2."""
     
-    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, menu_screenshot_path: Optional[str] = None, **kwargs):
-        """Initialize the environment.
+    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, menu_screenshot_path: Optional[str] = None, disable_menu_detection: bool = False, **kwargs):
+        """Initialize the Cities: Skylines 2 environment.
         
         Args:
-            config (HardwareConfig, optional): Hardware configuration for optimization
-            mock_mode (bool): Whether to use mock environment
-            menu_screenshot_path (str, optional): Path to menu screenshot for reference
+            config: Hardware configuration
+            mock_mode: Whether to use mock mode (no actual game interaction)
+            menu_screenshot_path: Path to a screenshot of a menu for detection
+            disable_menu_detection: Whether to disable menu detection
             **kwargs: Additional arguments
         """
-        # Setup logging
-        self.logger = logging.getLogger(__name__)
-        
-        # Store config
-        self.config = config if config else HardwareConfig()
+        # Basic setup
+        self.config = config or HardwareConfig()
         self.mock_mode = mock_mode
-        self.menu_reference_path = menu_screenshot_path
-        self.has_menu_reference = self.menu_reference_path is not None and os.path.exists(str(self.menu_reference_path))
-        
-        # Process kwargs for additional options
-        self.disable_menu_detection = kwargs.get('disable_menu_detection', False)
-        
-        # Initialize components
-        self.input_simulator = InputSimulator()
-        
-        # Create screen capture instance
-        self.screen_capture = OptimizedScreenCapture(
-            config=self.config
-        )
-        
-        # Pass the screen capture reference to the input simulator
-        self.input_simulator.screen_capture = self.screen_capture
-        
-        # Initialize visual metrics estimator
-        self.visual_estimator = VisualMetricsEstimator(self.config)
-        
-        # Setup menu detection
-        self.menu_detection_initialized = False
-        self.detect_menu_every_n_steps = 10
+        self.device = self.config.get_device()
+        self.dtype = self.config.get_dtype()
         self.menu_stuck_counter = 0
-        self.max_menu_stuck_steps = 5  # Initialize the missing attribute
-        self.in_menu = False
+        self.disable_menu_detection = disable_menu_detection
         
-        # Game crash detection
-        self.game_crashed = False
-        self.game_window_missing_count = 0
-        self.max_window_missing_threshold = 5  # Number of consecutive checks before considering game crashed
-        self.last_crash_check_time = time.time()
-        self.crash_check_interval = 2.0  # Seconds between crash checks
-        self.waiting_for_game_restart = False
-        self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
-        self.last_game_restart_check = time.time()
+        if self.disable_menu_detection:
+            logger.info("Menu detection is disabled - menu detection and recovery will be skipped")
         
-        # Initialize image utilities for visual processing
-        self.image_utils = ImageUtils(debug_mode=False)
-        
-        # Check if the menu reference exists in the specified path or root directory
-        if menu_screenshot_path and os.path.exists(menu_screenshot_path):
-            self.has_menu_reference = True
-        elif menu_screenshot_path:
-            # If not found in the specified path, try looking in the root directory
-            root_path = os.path.join(os.getcwd(), os.path.basename(menu_screenshot_path))
-            if os.path.exists(root_path):
-                self.menu_reference_path = root_path
-                self.has_menu_reference = True
-                logger.info(f"Found menu reference image in root directory: {root_path}")
+        # Set up components for interacting with the game
+        if not mock_mode:
+            # Initialize screen capture
+            self.screen_capture = OptimizedScreenCapture(
+                config=self.config
+            )
+            
+            # Initialize input simulator
+            self.input_simulator = InputSimulator()
+            
+            # Properly set screen_capture in input_simulator for action tracking
+            self.input_simulator.screen_capture = self.screen_capture
+            
+            # Initialize visual metrics estimator
+            self.visual_estimator = VisualMetricsEstimator(self.config)
+            
+            # Performance monitoring hooks into visual estimator
+            if hasattr(self.visual_estimator, "visual_change_analyzer"):
+                self.visual_change_analyzer = self.visual_estimator.visual_change_analyzer
             else:
-                self.has_menu_reference = False
-                logger.warning(f"Menu reference image not found at {menu_screenshot_path} or {root_path}")
-        else:
-            # Check if there's a default menu_reference.png in the root directory
-            default_path = os.path.join(os.getcwd(), "menu_reference.png")
-            if os.path.exists(default_path):
-                self.menu_reference_path = default_path
+                self.visual_change_analyzer = VisualChangeAnalyzer(self.config)
+                self.visual_estimator.visual_change_analyzer = self.visual_change_analyzer
+            
+            # Load menu reference if provided
+            self.has_menu_reference = False
+            self.menu_reference_path = menu_screenshot_path
+            self.menu_detection_initialized = False
+            
+            if menu_screenshot_path and os.path.exists(menu_screenshot_path):
+                logger.info(f"Using menu reference image: {menu_screenshot_path}")
                 self.has_menu_reference = True
-                logger.info(f"Using default menu reference image found at {default_path}")
-            else:
-                self.has_menu_reference = False
-        
-        if self.has_menu_reference:
-            try:
+                self.visual_estimator.initialize_menu_detection(menu_screenshot_path)
+                self.menu_detection_initialized = True
+            elif os.path.exists("menu_reference.png"):
+                # Try to use a default reference if available
+                self.menu_reference_path = os.path.abspath("menu_reference.png")
+                logger.info(f"Using default menu reference image found at {self.menu_reference_path}")
+                self.has_menu_reference = True
                 self.visual_estimator.initialize_menu_detection(self.menu_reference_path)
                 self.menu_detection_initialized = True
-                logger.info(f"Initialized menu detection using reference image: {self.menu_reference_path}")
-            except Exception as e:
-                logger.error(f"Failed to initialize menu detection: {e}")
-                self.has_menu_reference = False
-                # Implement fallback menu detection
-                logger.info("Setting up fallback menu detection based on color patterns")
+            else:
+                # No menu reference image, set up fallback menu detection
+                logger.info("No menu reference image available, setting up fallback menu detection")
                 self.visual_estimator.setup_fallback_menu_detection()
-        else:
-            # No menu reference image, set up fallback menu detection
-            logger.info("No menu reference image available, setting up fallback menu detection")
-            self.visual_estimator.setup_fallback_menu_detection()
+            
+            # Use autonomous reward system
+            self.reward_system = AutonomousRewardSystem(self.config)
+            self.safeguards = PerformanceSafeguards(self.config)
+            
+            # Initialize menu handler for more advanced menu detection and recovery
+            self.menu_handler = MenuHandler(
+                screen_capture=self.screen_capture,
+                input_simulator=self.input_simulator,
+                visual_metrics=self.visual_estimator
+            )
+            
+            # Set menu_handler reference in screen_capture for action tracking
+            self.screen_capture.menu_handler = self.menu_handler
+            
+            # Define action space
+            self.actions = self._setup_actions()
+            self.num_actions = len(self.actions)
+            
+            # State tracking
+            self.current_frame = None
+            self.steps_taken = 0
+            self.max_steps = kwargs.get('max_steps', 1000)
+            self.last_action_time = time.time()
+            self.min_action_delay = 0.1  # Minimum delay between actions
+            
+            # Game state tracking
+            self.paused = False
+            self.game_speed = 1
+            
+            # Performance tracking
+            self.fps_history = []
+            self.last_optimization_check = time.time()
+            self.optimization_interval = 60  # Check optimization every 60 seconds
+            
+            # Add menu action suppression
+            self.suppress_menu_actions = False
+            self.menu_action_suppression_steps = 0
+            self.max_menu_suppression_steps = 15  # How long to suppress menu actions after exiting a menu
+            
+            # Add adaptive frame skip
+            self.adaptive_frame_skip = True
+            self.min_frame_skip = 1
+            self.max_frame_skip = 6
+            self.current_frame_skip = getattr(self.config, 'frame_skip', 2)
+            self.activity_level = 0.0  # 0.0 = passive, 1.0 = very active
+            self.activity_history = []
+            self.activity_history_max_len = 30
+            
+            # For mock mode, create a dummy frame
+            if self.mock_mode:
+                # Create a simple 3-channel frame (320x240 RGB)
+                self.mock_frame = torch.ones((3, 240, 320), dtype=torch.float32)
+                # Add some random elements to make it more realistic
+                self.mock_frame = torch.rand_like(self.mock_frame)
+                # Inform the screen capture to use mock mode
+                self.screen_capture.use_mock = True
+            
+            # Menu handling
+            self.detect_menu_every_n_steps = 30  # Check for menu every 30 steps
+            
+            # Game window
+            self.game_window_title = "Cities: Skylines II"
+            
+            # New attributes
+            self.in_menu = False
+            
+            # Game crash detection
+            self.game_crashed = False
+            self.game_window_missing_count = 0
+            self.max_window_missing_threshold = 5  # Number of consecutive checks before considering game crashed
+            self.last_crash_check_time = time.time()
+            self.crash_check_interval = 2.0  # Seconds between crash checks
+            self.waiting_for_game_restart = False
+            self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
+            self.last_game_restart_check = time.time()
         
-        # Use autonomous reward system
-        self.reward_system = AutonomousRewardSystem(self.config)
-        self.safeguards = PerformanceSafeguards(self.config)
-        
-        # Initialize menu handler for more advanced menu detection and recovery
-        self.menu_handler = MenuHandler(
-            screen_capture=self.screen_capture,
-            input_simulator=self.input_simulator,
-            visual_metrics=self.visual_estimator
-        )
-        
-        # Define action space
-        self.actions = self._setup_actions()
-        self.num_actions = len(self.actions)
-        
-        # State tracking
-        self.current_frame = None
-        self.steps_taken = 0
-        self.max_steps = kwargs.get('max_steps', 1000)
-        self.last_action_time = time.time()
-        self.min_action_delay = 0.1  # Minimum delay between actions
-        
-        # Game state tracking
-        self.paused = False
-        self.game_speed = 1
-        
-        # Performance tracking
-        self.fps_history = []
-        self.last_optimization_check = time.time()
-        self.optimization_interval = 60  # Check optimization every 60 seconds
-        
-        # Add menu action suppression
-        self.suppress_menu_actions = False
-        self.menu_action_suppression_steps = 0
-        self.max_menu_suppression_steps = 15  # How long to suppress menu actions after exiting a menu
-        
-        # Add adaptive frame skip
-        self.adaptive_frame_skip = True
-        self.min_frame_skip = 1
-        self.max_frame_skip = 6
-        self.current_frame_skip = getattr(self.config, 'frame_skip', 2)
-        self.activity_level = 0.0  # 0.0 = passive, 1.0 = very active
-        self.activity_history = []
-        self.activity_history_max_len = 30
-        
-        # For mock mode, create a dummy frame
-        if self.mock_mode:
-            # Create a simple 3-channel frame (320x240 RGB)
-            self.mock_frame = torch.ones((3, 240, 320), dtype=torch.float32)
-            # Add some random elements to make it more realistic
-            self.mock_frame = torch.rand_like(self.mock_frame)
-            # Inform the screen capture to use mock mode
-            self.screen_capture.use_mock = True
-        
-        # Menu handling
-        self.detect_menu_every_n_steps = 30  # Check for menu every 30 steps
-        
-        # Game window
-        self.game_window_title = "Cities: Skylines II"
-        
-        # New attributes
-        self.in_menu = False
-        
-        # Game crash detection
-        self.game_crashed = False
-        self.game_window_missing_count = 0
-        self.max_window_missing_threshold = 5  # Number of consecutive checks before considering game crashed
-        self.last_crash_check_time = time.time()
-        self.crash_check_interval = 2.0  # Seconds between crash checks
-        self.waiting_for_game_restart = False
-        self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
-        self.last_game_restart_check = time.time()
-    
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
         base_actions = {
@@ -665,7 +640,7 @@ class CitiesEnvironment:
             bool: True if a menu is detected, False otherwise
         """
         # If menu detection is disabled, always return False
-        if self.disable_menu_detection:
+        if hasattr(self, 'disable_menu_detection') and self.disable_menu_detection:
             return False
         
         # In mock mode, randomly simulate menu states (for testing)
@@ -681,7 +656,9 @@ class CitiesEnvironment:
         
         # Use menu handler if available
         if hasattr(self, 'menu_handler') and self.menu_handler is not None:
-            menu_detected, _, _ = self.menu_handler.detect_menu(current_frame)
+            menu_detected, menu_type, confidence = self.menu_handler.detect_menu(current_frame)
+            if menu_detected:
+                logger.info(f"Menu detected: {menu_type} with confidence {confidence:.2f}")
             return menu_detected
         
         # Fallback to visual estimator

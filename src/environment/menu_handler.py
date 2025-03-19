@@ -22,6 +22,9 @@ class MenuHandler:
         "notification": {"threshold": 0.9, "signature_regions": [(0.7, 0.1, 0.95, 0.3)]},
     }
     
+    # Gear icon position (normalized)
+    GEAR_ICON_POSITION = (0.95, 0.05)  # Top-right corner
+    
     def __init__(
         self,
         screen_capture: OptimizedScreenCapture,
@@ -70,6 +73,17 @@ class MenuHandler:
             "exit_button": (0.5, 0.7)
         }
         
+        # Action tracking for menu correlation
+        self.recent_actions = []
+        self.max_action_history = 10
+        self.last_esc_press_time = 0
+        self.last_gear_click_time = 0
+        self.menu_prone_actions = {
+            "esc_key": {"time": 0, "active": False},
+            "gear_click": {"time": 0, "active": False}
+        }
+        self.action_vigilance_timeout = 2.0  # Seconds to maintain vigilance after menu-prone action
+        
         logger.info("Menu handler initialized")
     
     def _load_menu_templates(self) -> Dict:
@@ -82,6 +96,31 @@ class MenuHandler:
         # For now, we'll return an empty dict and rely on visual change detection
         return {}
     
+    # Track actions that might trigger menus
+    def track_action(self, action_type: str) -> None:
+        """Track actions that might lead to menu screens.
+        
+        Args:
+            action_type: Type of action (e.g., "esc_key", "gear_click")
+        """
+        current_time = time.time()
+        self.recent_actions.append((action_type, current_time))
+        
+        # Trim history if needed
+        if len(self.recent_actions) > self.max_action_history:
+            self.recent_actions = self.recent_actions[-self.max_action_history:]
+        
+        # Mark specific actions for vigilance
+        if action_type == "esc_key":
+            self.menu_prone_actions["esc_key"]["time"] = current_time
+            self.menu_prone_actions["esc_key"]["active"] = True
+            self.last_esc_press_time = current_time
+            
+        elif action_type == "gear_click":
+            self.menu_prone_actions["gear_click"]["time"] = current_time
+            self.menu_prone_actions["gear_click"]["active"] = True
+            self.last_gear_click_time = current_time
+
     def detect_menu(self, current_frame: np.ndarray) -> Tuple[bool, Optional[str], float]:
         """Detect if the current frame shows a menu and which type.
         
@@ -101,31 +140,92 @@ class MenuHandler:
         
         self.last_menu_check_time = current_time
         
+        # Check if we recently performed a menu-prone action
+        increased_vigilance = False
+        for action_type, action_data in self.menu_prone_actions.items():
+            if action_data["active"] and current_time - action_data["time"] < self.action_vigilance_timeout:
+                increased_vigilance = True
+            else:
+                self.menu_prone_actions[action_type]["active"] = False
+                
         # Use visual metrics if available
         if self.visual_metrics:
             try:
-                # First try direct menu detection from visual metrics
-                is_menu = self.visual_metrics.detect_main_menu(current_frame)
-                if is_menu:
-                    self.in_menu = True
-                    self.menu_type = "unknown"
-                    self.menu_detection_confidence = 0.8
-                    logger.debug("Menu detected by direct visual metrics")
-                    return True, "unknown", 0.8
-                    
-                # Then try UI element detection approach
-                visual_change_score = self.visual_metrics.get_visual_change_score(current_frame)
-                ui_elements = self.visual_metrics.detect_ui_elements(current_frame)
+                # 1. Combined approach using multiple detection methods
+                detection_scores = {}
                 
-                # More aggressive detection: lower threshold for UI elements and visual change
-                if len(ui_elements) > 3 and visual_change_score < 0.3:
-                    # Try to identify the specific menu type
-                    for menu_type, properties in self.MENU_TYPES.items():
-                        threshold = properties["threshold"] * 0.8  # Lower the threshold by 20%
+                # A. Direct menu detection (template matching)
+                direct_menu_detected = self.visual_metrics.detect_main_menu(current_frame)
+                detection_scores["direct"] = 0.8 if direct_menu_detected else 0.0
+                
+                # B. UI element density analysis
+                ui_density = self.visual_metrics.calculate_ui_density(current_frame)
+                detection_scores["density"] = ui_density
+                
+                # C. Contrast pattern analysis
+                contrast_score = self.visual_metrics.detect_menu_contrast_pattern(current_frame)
+                detection_scores["contrast"] = contrast_score
+                
+                # D. Visual change score (game paused/menu appeared)
+                visual_change_score = self.visual_metrics.get_visual_change_score(current_frame)
+                detection_scores["change"] = max(0, 1.0 - visual_change_score * 5.0)  # Invert: lower change = higher score
+                
+                # E. UI element analysis
+                ui_elements = self.visual_metrics.detect_ui_elements(current_frame)
+                ui_score = min(1.0, len(ui_elements) / 10.0)  # Normalize, assuming 10+ elements is definitely a menu
+                detection_scores["ui_elements"] = ui_score
+                
+                # Add the recent action vigilance bonus (if applicable)
+                if increased_vigilance:
+                    detection_scores["action_vigilance"] = 0.3
+                    logger.debug("Increased menu detection vigilance due to recent menu-prone action")
+                else:
+                    detection_scores["action_vigilance"] = 0.0
+                
+                # Calculate weighted score
+                weighted_scores = {
+                    "direct": 0.3,            # Strong indicator if template match
+                    "density": 0.15,          # Good indicator of UI concentration
+                    "contrast": 0.15,         # Good indicator of menu-like appearance
+                    "change": 0.1,            # Weak indicator (game might just be idle)
+                    "ui_elements": 0.15,      # Medium indicator of UI presence
+                    "action_vigilance": 0.15  # Context from recent actions
+                }
+                
+                total_score = sum(detection_scores[k] * weighted_scores[k] for k in detection_scores)
+                
+                # Determine confidence thresholds
+                base_threshold = 0.4  # Default detection threshold
+                high_confidence_threshold = 0.6  # For confident detection
+                
+                # Adjust thresholds based on recent actions
+                if increased_vigilance:
+                    base_threshold *= 0.8  # Lower threshold (more sensitive) after ESC press or gear click
+                    
+                # Store detailed results for logging
+                detection_details = {
+                    "scores": detection_scores,
+                    "total": total_score,
+                    "threshold": base_threshold,
+                    "high_threshold": high_confidence_threshold,
+                    "vigilance_active": increased_vigilance
+                }
+                
+                # Make detection decision
+                if total_score > high_confidence_threshold:
+                    # High confidence menu detection
+                    result = True
+                    confidence = total_score
+                    
+                    # Try to identify menu type through signature regions
+                    menu_type = "unknown"
+                    best_type_score = 0
+                    
+                    for menu_type_name, properties in self.MENU_TYPES.items():
                         signature_regions = properties["signature_regions"]
+                        region_match_count = 0
                         
                         # Check signature regions for UI element density
-                        region_match_count = 0
                         for region in signature_regions:
                             x1, y1, x2, y2 = region
                             h, w = current_frame.shape[:2]
@@ -143,27 +243,39 @@ class MenuHandler:
                             if len(elements_in_region) >= 1:
                                 region_match_count += 1
                         
-                        # If any signature regions match, consider this as a potential menu type
-                        if region_match_count >= max(1, len(signature_regions) * 0.3):  # Match at least 30% of regions or 1
-                            confidence = min(1.0, 0.5 + len(ui_elements) / 20.0)  # Base confidence on UI element count
-                            if confidence > threshold:
-                                self.in_menu = True
-                                self.menu_type = menu_type
-                                self.menu_detection_confidence = confidence
-                                logger.debug(f"Menu detected: {menu_type} with confidence {confidence:.2f}")
-                                return True, menu_type, confidence
-                
-                # Fallback: generic menu detection based on visual change and UI count
-                if visual_change_score < 0.15 and len(ui_elements) > 2:  # More aggressive thresholds
+                        # Calculate type match score
+                        type_score = region_match_count / max(1, len(signature_regions))
+                        if type_score > best_type_score:
+                            best_type_score = type_score
+                            menu_type = menu_type_name
+                            
+                    logger.debug(f"Menu detected with high confidence: {menu_type} ({total_score:.2f})")
+                    
+                    self.in_menu = True
+                    self.menu_type = menu_type
+                    self.menu_detection_confidence = confidence
+                    return True, menu_type, confidence
+                    
+                elif total_score > base_threshold:
+                    # Lower confidence menu detection
+                    logger.debug(f"Menu detected with moderate confidence: unknown ({total_score:.2f})")
                     self.in_menu = True
                     self.menu_type = "unknown"
-                    self.menu_detection_confidence = 0.6
-                    logger.debug("Menu detected by fallback method")
-                    return True, "unknown", 0.6
+                    self.menu_detection_confidence = total_score
+                    return True, "unknown", total_score
+                
+                # No menu detected
+                logger.debug(f"No menu detected (score: {total_score:.2f}, threshold: {base_threshold:.2f})")
+                self.in_menu = False
+                self.menu_type = None
+                self.menu_detection_confidence = 0.0
+                return False, None, 0.0
+                    
             except Exception as e:
-                logger.warning(f"Error in menu detection: {e}")
+                logger.warning(f"Error in enhanced menu detection: {e}")
+                # Fall through to legacy detection methods
         
-        # Template matching fallback (if visual metrics not available)
+        # Legacy template matching fallback (if visual metrics not available)
         for menu_type, template in self.menu_templates.items():
             if template is not None:
                 # Simple template matching (would be implemented with actual images)

@@ -344,58 +344,91 @@ class InputSimulator:
                 pass
         
     def mouse_click(self, x: int, y: int, button: str = 'left', double: bool = False) -> bool:
-        """Perform mouse click at specified coordinates.
+        """Move mouse to specified coordinates and perform click.
         
         Args:
-            x (int): X coordinate
-            y (int): Y coordinate
-            button (str): 'left', 'right', or 'middle'
-            double (bool): Whether to perform double click
+            x: X coordinate
+            y: Y coordinate
+            button: Mouse button to click ('left', 'right', 'middle')
+            double: Whether to perform a double-click
             
         Returns:
-            bool: True if click was successful, False otherwise
+            True if successful, False otherwise
         """
-        # First ensure the game window is focused
-        if not self.ensure_game_window_focused():
-            print(f"Failed to focus game window before mouse click at ({x},{y})")
-            return False
-            
-        # Move to target position using our improved mouse_move
         try:
+            # First move to position
             self.mouse_move(x, y)
-            time.sleep(0.1)
+            time.sleep(0.05)  # Small delay
             
-            # Verify cursor position after move
-            current_x, current_y = win32api.GetCursorPos()
-            if abs(current_x - x) > 5 or abs(current_y - y) > 5:
-                print(f"Mouse position verification failed: requested ({x},{y}), got ({current_x},{current_y})")
-                # Try one more time
-                self.mouse_move(x, y)
-                time.sleep(0.1)
-                current_x, current_y = win32api.GetCursorPos()
-                if abs(current_x - x) > 5 or abs(current_y - y) > 5:
-                    print(f"Mouse position verification failed again, proceeding anyway")
+            # Check if we're clicking near the gear icon (top-right corner)
+            is_gear_click = False
+            if hasattr(self.screen_capture, 'menu_handler') and self.screen_capture.menu_handler:
+                width, height = self._get_screen_dimensions()
+                gear_x, gear_y = self.screen_capture.menu_handler.GEAR_ICON_POSITION
+                gear_pixel_x, gear_pixel_y = int(gear_x * width), int(gear_y * height)
+                
+                # Allow for some click radius around the gear icon (e.g., 50 pixels)
+                click_tolerance = 50
+                if (abs(x - gear_pixel_x) < click_tolerance and 
+                    abs(y - gear_pixel_y) < click_tolerance):
+                    is_gear_click = True
+                    logger.debug(f"Tracking gear icon click for menu detection: ({x}, {y}) near gear at ({gear_pixel_x}, {gear_pixel_y})")
+                    self.screen_capture.menu_handler.track_action("gear_click")
             
-            # Map button string to pynput Button
+            # Map button names to pynput buttons
             button_map = {
                 'left': Button.left,
                 'right': Button.right,
                 'middle': Button.middle
             }
-            btn = button_map.get(button, Button.left)
+            pynput_button = button_map.get(button.lower(), Button.left)
             
-            # Perform click(s)
-            self.mouse.click(btn, 1)
-            time.sleep(0.1)
+            # Try to click using direct Win32 calls
+            try:
+                if button.lower() == 'left':
+                    user32.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    time.sleep(0.05)
+                    user32.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                    
+                    if double:
+                        time.sleep(0.05)
+                        user32.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                        time.sleep(0.05)
+                        user32.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                elif button.lower() == 'right':
+                    user32.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+                    time.sleep(0.05)
+                    user32.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+                    
+                    if double:
+                        time.sleep(0.05)
+                        user32.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+                        time.sleep(0.05)
+                        user32.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+                elif button.lower() == 'middle':
+                    user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
+                    time.sleep(0.05)
+                    user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
+                    
+                    if double:
+                        time.sleep(0.05)
+                        user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
+                        time.sleep(0.05)
+                        user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
+                    
+                return True
+            except Exception as e:
+                logger.warning(f"Direct Win32 click failed: {e}, falling back to pynput")
             
-            if double:
-                time.sleep(0.1)
-                self.mouse.click(btn, 1)
-                time.sleep(0.1)
-                
-            return True
+            # Fallback to pynput
+            try:
+                self.mouse.click(pynput_button, 2 if double else 1)
+                return True
+            except Exception as e:
+                logger.error(f"Pynput click failed: {e}")
+                return False
         except Exception as e:
-            print(f"Error during mouse click at ({x},{y}): {e}")
+            logger.error(f"Error in mouse_click: {e}")
             return False
         
     def mouse_drag(self, start: Tuple[int, int], end: Tuple[int, int],
@@ -609,53 +642,68 @@ class InputSimulator:
         time.sleep(0.1)
         
     def key_press(self, key, duration=0.1, force_direct=False):
-        """Press a key on the keyboard.
+        """Press a key and hold for specified duration.
         
         Args:
-            key: Key to press (can be a string like 'a', 'enter', etc.)
-            duration: How long to hold the key down
-            force_direct: Force direct key press, even for escape key
-            
+            key: Key to press (string representation or pynput Key object)
+            duration: How long to hold the key in seconds
+            force_direct: Force using direct key press even for special keys
+        
         Returns:
-            bool: True if successful, False otherwise
+            True if successful, False otherwise
         """
         try:
-            # Special handling for escape key to avoid game window issues
-            if key.lower() == 'escape' and not force_direct:
-                logger.info("WARNING: Blocked ESC key press - using safe menu handling instead")
-                return self.safe_menu_handling()
+            # Convert to pynput Key if a string is provided
+            actual_key = self.key_map.get(key, key) if isinstance(key, str) else key
+            
+            # Track ESC key presses for menu detection
+            if (isinstance(key, str) and key.lower() == 'escape') or actual_key == Key.esc:
+                if hasattr(self.screen_capture, 'menu_handler') and self.screen_capture.menu_handler:
+                    logger.debug("Tracking ESC key press for menu detection")
+                    self.screen_capture.menu_handler.track_action("esc_key")
+            
+            # Try to press the key using pynput
+            try:
+                # Press key normally (pynput)
+                if not force_direct and isinstance(actual_key, (Key, str)):
+                    self.keyboard.press(actual_key)
+                    time.sleep(duration)
+                    self.keyboard.release(actual_key)
+                    return True
+            except Exception as e:
+                logger.warning(f"Error pressing key using pynput: {e}")
+            
+            # Fallback: try using pyautogui
+            try:
+                # Some special keys have different names in pyautogui
+                key_mapping = {
+                    'escape': 'esc',
+                    Key.esc: 'esc',
+                    'space': 'space',
+                    Key.space: 'space',
+                    'enter': 'enter',
+                    Key.enter: 'enter',
+                    # Add more mappings as needed
+                }
                 
-            if not self.ensure_game_window_focused():
-                logger.warning("Failed to focus game window, key press may not work")
+                # Try to get the mapped key name for pyautogui
+                pyautogui_key = key
+                if isinstance(key, str):
+                    pyautogui_key = key_mapping.get(key.lower(), key.lower())
+                elif isinstance(key, Key):
+                    pyautogui_key = key_mapping.get(key, str(key).replace('Key.', ''))
                 
-            # Convert string key to virtual key code
-            if isinstance(key, str):
-                key = key.lower()
-                if key in self.key_map:
-                    key_code = self.key_map[key]
-                else:
-                    key_code = ord(key.upper())
-            else:
-                key_code = key
-                
-            # Press key down
-            self.keyboard.press(key_code)
-            
-            # Wait for specified duration
-            time.sleep(duration)
-            
-            # Release key
-            self.keyboard.release(key_code)
-            
-            # Small delay to ensure key press is registered
-            time.sleep(0.05)
-            
-            return True
-            
+                pyautogui.keyDown(pyautogui_key)
+                time.sleep(duration)
+                pyautogui.keyUp(pyautogui_key)
+                return True
+            except Exception as e:
+                logger.error(f"Error pressing key using pyautogui fallback: {e}")
+                return False
         except Exception as e:
-            logger.error(f"Error during key press: {e}")
+            logger.error(f"Error in key_press: {e}")
             return False
-            
+        
     def safe_menu_handling(self, max_attempts=3, current_attempt=0):
         """Safe menu handling for cases where direct ESC press doesn't work.
         
