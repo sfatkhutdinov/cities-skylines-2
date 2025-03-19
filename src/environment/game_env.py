@@ -27,13 +27,14 @@ logger = logging.getLogger(__name__)
 class CitiesEnvironment:
     """Environment for interacting with Cities: Skylines 2."""
     
-    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, menu_screenshot_path: Optional[str] = None):
+    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, menu_screenshot_path: Optional[str] = None, **kwargs):
         """Initialize the environment.
         
         Args:
             config: Optional hardware configuration
             mock_mode: If True, use a mock environment for testing/training without the actual game
             menu_screenshot_path: Path to a reference screenshot of the menu screen
+            **kwargs: Additional keyword arguments
         """
         self.config = config or HardwareConfig()
         self.mock_mode = mock_mode
@@ -111,7 +112,7 @@ class CitiesEnvironment:
         # State tracking
         self.current_frame = None
         self.steps_taken = 0
-        self.max_steps = 1000
+        self.max_steps = kwargs.get('max_steps', 1000)
         self.last_action_time = time.time()
         self.min_action_delay = 0.1  # Minimum delay between actions
         
@@ -150,6 +151,15 @@ class CitiesEnvironment:
             self.mock_frame = torch.rand_like(self.mock_frame)
             # Inform the screen capture to use mock mode
             self.screen_capture.use_mock = True
+        
+        # Menu handling
+        self.detect_menu_every_n_steps = 30  # Check for menu every 30 steps
+        
+        # Game window
+        self.game_window_title = "Cities: Skylines II"
+        
+        # New attributes
+        self.in_menu = False
     
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
@@ -518,45 +528,23 @@ class CitiesEnvironment:
         
         return frame
     
-    def step(self, action_idx: int) -> Tuple[np.ndarray, float, bool, Dict]:
-        """Take a step in the environment.
+    def step(self, action_idx: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """Take an action in the environment.
         
         Args:
-            action_idx (int): Index of the action to take
+            action_idx: Index of the action to take
             
         Returns:
-            Tuple[np.ndarray, float, bool, Dict]: Next state, reward, done, info
+            Tuple[np.ndarray, float, bool, Dict[str, Any]]: 
+                - Next state
+                - Reward
+                - Done flag
+                - Additional info
         """
-        # Increment step counter
-        self.steps_taken += 1
+        info = {"menu_detected": False}
         
-        # Track for menu detection later
-        self.last_action_idx = action_idx
-        
-        # Mock mode implementation
-        if self.mock_mode:
-            # Generate a random new state (just noise)
-            next_state = torch.rand(3, 180, 320, device=self.device)
-            self.current_frame = next_state
-            
-            # Random reward between -0.1 and 0.5
-            reward = (torch.rand(1, device=self.device).item() * 0.6) - 0.1
-            
-            # Small chance of episode termination (1%)
-            done = torch.rand(1, device=self.device).item() < 0.01
-            
-            # Generate mock info
-            info = {
-                "menu_detected": False,
-                "action_success": True,
-                "mock": True
-            }
-            
-            return next_state, reward, done, info
-        
-        # Get action details from action space
-        if action_idx < 0 or action_idx >= len(self.actions):
-            logger.warning(f"Invalid action index: {action_idx}, using random action")
+        # If action_idx is None or invalid, choose a random action
+        if action_idx is None or action_idx < 0 or action_idx >= len(self.actions):
             action_idx = random.randint(0, len(self.actions) - 1)
             
         action_info = self.actions[action_idx]
@@ -578,8 +566,15 @@ class CitiesEnvironment:
                 self.menu_stuck_counter = 0
         
         # Execute the action and get success status
-        frame_before_action = self.screen_capture.get_latest_frame()
-        success = self._execute_action(action_info)
+        frame_before_action = self.screen_capture.capture_frame()
+        
+        # Special handling for menu-related actions
+        if self.in_menu and action_info.get("type") in ["mouse_move", "click_left"]:
+            # For menu navigation, use click_menu_button if possible
+            success = self._handle_menu_action(action_info)
+        else:
+            # Normal action execution
+            success = self._execute_action(action_info)
         
         # Wait briefly to let the game process the action and update the display
         time.sleep(0.1)
@@ -958,62 +953,89 @@ class CitiesEnvironment:
             return False
 
     def _get_screen_dimensions(self) -> Tuple[int, int]:
-        """Get the dimensions of the game screen.
+        """Get the screen dimensions for the main game window.
         
         Returns:
-            Tuple[int, int]: Width and height of the screen
+            Tuple[int, int]: Width and height of the main game window
         """
-        # Use screen capture client position if available
-        if hasattr(self, 'screen_capture') and self.screen_capture:
-            if hasattr(self.screen_capture, 'client_position') and self.screen_capture.client_position:
-                client_left, client_top, client_right, client_bottom = self.screen_capture.client_position
-                return (client_right - client_left, client_bottom - client_top)
+        # Try to use input simulator to get screen dimensions
+        if hasattr(self.input_simulator, 'get_screen_dimensions'):
+            dims = self.input_simulator.get_screen_dimensions()
+            if dims and dims[0] > 0 and dims[1] > 0:
+                return dims
         
-        # Try to use screen capture resolution
-        if hasattr(self, 'screen_capture') and self.screen_capture:
-            if hasattr(self.screen_capture, 'capture_resolution'):
-                return self.screen_capture.capture_resolution
+        # Fallback to capturing a frame and getting its dimensions
+        curr_frame = self.screen_capture.capture_frame()
         
-        # Fallback to system metrics
-        try:
-            return (win32api.GetSystemMetrics(0), win32api.GetSystemMetrics(1))
-        except Exception:
-            # Final fallback
-            return (1920, 1080)
+        if curr_frame is not None:
+            if isinstance(curr_frame, torch.Tensor):
+                # PyTorch tensor in CHW format
+                if len(curr_frame.shape) == 3 and curr_frame.shape[0] == 3:
+                    return curr_frame.shape[2], curr_frame.shape[1]
+                return curr_frame.shape[1], curr_frame.shape[0]
+            else:
+                # Numpy array in HWC format
+                return curr_frame.shape[1], curr_frame.shape[0]
+                
+        # Last resort fallback
+        return 1920, 1080
 
     def _compute_reward(self, action_info: Dict, action_idx: int, success: bool, menu_detected: bool) -> float:
-        """Compute reward based purely on visual changes without domain knowledge.
+        """Compute the reward for an action.
         
         Args:
-            action_info: Action details
+            action_info: Action information
             action_idx: Action index
-            success: Whether action execution was successful
-            menu_detected: Whether a menu was detected
+            success: Whether the action was successful
+            menu_detected: Whether a menu is detected
             
         Returns:
-            float: Computed reward
+            float: Reward value
         """
+        # Base reward for successful actions
+        reward = 0.0
+        
+        # Penalty for unsuccessful actions 
+        if not success:
+            reward -= 0.1
+            
+        # Severe penalty for being in a menu (we want to avoid menus)
+        if menu_detected:
+            reward -= 1.0
+            
         # Get frames before and after action
         prev_frame = getattr(self, 'prev_frame', None)
-        curr_frame = self.screen_capture.get_latest_frame()
+        curr_frame = self.screen_capture.capture_frame()
         
         # Store current frame for next reward computation
-        self.prev_frame = curr_frame.copy() if curr_frame is not None else None
+        if curr_frame is not None:
+            # Handle PyTorch tensors properly
+            if isinstance(curr_frame, torch.Tensor):
+                self.prev_frame = curr_frame.clone().detach()
+            else:
+                # For numpy arrays
+                self.prev_frame = curr_frame.copy() if curr_frame is not None else None
         
-        # Use autonomous reward system for computation
-        if prev_frame is not None and curr_frame is not None:
-            reward = self.reward_system.compute_reward(prev_frame, action_idx, curr_frame)
-        else:
-            # If we don't have frames, return small positive reward for successful actions
-            reward = 0.01 if success else -0.01
+        # If we have visual diversity reward system, use it
+        if hasattr(self, 'reward_system') and self.reward_system:
+            # Get additional reward from autonomous system
+            autonomous_reward = self.reward_system.compute_reward(
+                curr_frame, 
+                action_info.get("type", "unknown"),
+                success
+            )
+            reward += autonomous_reward
+            
+        # Scale reward - this is a hyperparameter you can tune
+        reward *= 0.1
             
         return reward
 
-    def _process_frame(self, frame: np.ndarray) -> torch.Tensor:
-        """Process a frame for the agent.
+    def _process_frame(self, frame) -> torch.Tensor:
+        """Process a frame for input to neural network.
         
         Args:
-            frame (np.ndarray): Raw BGR frame
+            frame: Raw frame
             
         Returns:
             torch.Tensor: Processed frame tensor
@@ -1022,19 +1044,37 @@ class CitiesEnvironment:
             # Return zeros if frame capture failed
             return torch.zeros((3, 180, 320), device=self.device)
             
-        # Convert BGR to RGB if needed
-        if frame.shape[2] == 3:  # If it has 3 channels, assume BGR (OpenCV default)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # If frame is already a PyTorch tensor, handle it differently
+        if isinstance(frame, torch.Tensor):
+            # Move to CPU for processing if needed
+            frame_cpu = frame.detach().cpu()
             
-        # Resize frame (if not already at target resolution)
-        if frame.shape[0] != 180 or frame.shape[1] != 320:
-            frame = cv2.resize(frame, (320, 180))
+            # Convert from CHW to HWC format if needed
+            if len(frame_cpu.shape) == 3 and frame_cpu.shape[0] == 3:
+                frame_np = frame_cpu.permute(1, 2, 0).numpy()
+            else:
+                frame_np = frame_cpu.numpy()
+                
+            # Ensure proper scaling (0-1 range)
+            if frame_np.max() > 1.0:
+                frame_np = frame_np / 255.0
+        else:
+            # Handle numpy array
+            frame_np = frame
             
-        # Normalize pixel values to [0,1]
-        frame = frame.astype(np.float32) / 255.0
+            # Convert BGR to RGB if needed
+            if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:  # If it has 3 channels, assume BGR (OpenCV default)
+                frame_np = cv2.cvtColor(frame_np, cv2.COLOR_BGR2RGB)
+                
+            # Resize frame (if not already at target resolution)
+            if frame_np.shape[0] != 180 or frame_np.shape[1] != 320:
+                frame_np = cv2.resize(frame_np, (320, 180))
+                
+            # Normalize pixel values to [0,1]
+            frame_np = frame_np.astype(np.float32) / 255.0
         
         # Convert to PyTorch tensor
-        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1)  # HWC to CHW
+        frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1)  # HWC to CHW
         
         # Move to device
         if frame_tensor.device != self.device:

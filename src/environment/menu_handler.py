@@ -203,7 +203,7 @@ class MenuHandler:
             time.sleep(0.5)
         
         # Check if we're still in a menu
-        current_frame = self.screen_capture.get_latest_frame()
+        current_frame = self.screen_capture.capture_frame()
         if current_frame is not None:
             self.detect_menu(current_frame)
             
@@ -263,7 +263,7 @@ class MenuHandler:
         stable_frames = 0
         
         while time.time() - start_time < timeout:
-            current_frame = self.screen_capture.get_latest_frame()
+            current_frame = self.screen_capture.capture_frame()
             if current_frame is None:
                 time.sleep(0.1)
                 continue
@@ -311,3 +311,44 @@ class MenuHandler:
         self.menu_detection_confidence = 0.0
         self.menu_recovery_attempts = 0
         self.last_menu_check_time = 0 
+
+    def _find_button_by_image(self, button_name: str) -> Optional[Tuple[int, int]]:
+        """Find a button by matching its image template.
+        
+        Args:
+            button_name: Button identifier
+            
+        Returns:
+            Optional[Tuple[int, int]]: Screen coordinates of the button if found, None otherwise
+        """
+        # Get button template
+        template = self._get_button_template(button_name)
+        if template is None:
+            return None
+            
+        # Capture current screen
+        current_frame = self.screen_capture.capture_frame()
+        if current_frame is None:
+            return None
+            
+        # Convert to numpy array if needed
+        if isinstance(current_frame, torch.Tensor):
+            current_frame = current_frame.cpu().numpy()
+            if current_frame.shape[0] == 3:  # CHW to HWC
+                current_frame = np.transpose(current_frame, (1, 2, 0))
+            if current_frame.max() <= 1.0:
+                current_frame = (current_frame * 255).astype(np.uint8)
+                
+        # Match template
+        if self.image_utils is None:
+            from src.utils.image_utils import ImageUtils
+            self.image_utils = ImageUtils()
+            
+        match_score, match_rect = self.image_utils.template_match(current_frame, template)
+        
+        if match_rect:
+            # Return center of matched region
+            x, y, w, h = match_rect
+            return (x + w // 2, y + h // 2)
+            
+        return None 
