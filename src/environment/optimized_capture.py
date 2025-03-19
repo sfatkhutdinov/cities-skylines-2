@@ -565,4 +565,37 @@ class OptimizedScreenCapture:
         # Clear CUDA memory if using GPU
         if hasattr(self.config, 'use_cuda') and self.config.use_cuda:
             logger.info("Clearing CUDA memory")
-            torch.cuda.empty_cache() 
+            torch.cuda.empty_cache()
+
+    def get_resolution(self) -> Tuple[int, int]:
+        """Get the current screen resolution.
+        
+        Returns:
+            Tuple[int, int]: Width and height of the screen
+        """
+        # If we have stored the game window position, use that
+        if hasattr(self, 'game_window_position') and self.game_window_position:
+            left, top, right, bottom = self.game_window_position
+            width = right - left
+            height = bottom - top
+            return width, height
+        
+        # If we have stored the client position, use that
+        if hasattr(self, 'client_position') and self.client_position:
+            client_left, client_top, client_right, client_bottom = self.client_position
+            width = client_right - client_left
+            height = client_bottom - client_top
+            return width, height
+        
+        # Fallback to capture resolution
+        if hasattr(self, 'capture_resolution'):
+            return self.capture_resolution
+        
+        # Ultimate fallback: try to get screen size from PIL
+        try:
+            img = ImageGrab.grab()
+            return img.width, img.height
+        except Exception as e:
+            logger.error(f"Failed to get screen resolution: {e}")
+            # Return a default resolution
+            return 1920, 1080 

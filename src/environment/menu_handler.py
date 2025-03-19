@@ -103,49 +103,65 @@ class MenuHandler:
         
         # Use visual metrics if available
         if self.visual_metrics:
-            visual_change_score = self.visual_metrics.get_visual_change_score(current_frame)
-            ui_elements = self.visual_metrics.detect_ui_elements(current_frame)
-            
-            # High UI element count often indicates a menu
-            if len(ui_elements) > 5 and visual_change_score < 0.2:
-                # Try to identify the specific menu type
-                for menu_type, properties in self.MENU_TYPES.items():
-                    threshold = properties["threshold"]
-                    signature_regions = properties["signature_regions"]
+            try:
+                # First try direct menu detection from visual metrics
+                is_menu = self.visual_metrics.detect_main_menu(current_frame)
+                if is_menu:
+                    self.in_menu = True
+                    self.menu_type = "unknown"
+                    self.menu_detection_confidence = 0.8
+                    logger.debug("Menu detected by direct visual metrics")
+                    return True, "unknown", 0.8
                     
-                    # Check signature regions for UI element density
-                    region_match_count = 0
-                    for region in signature_regions:
-                        x1, y1, x2, y2 = region
-                        h, w = current_frame.shape[:2]
-                        region_x1, region_y1 = int(x1 * w), int(y1 * h)
-                        region_x2, region_y2 = int(x2 * w), int(y2 * h)
+                # Then try UI element detection approach
+                visual_change_score = self.visual_metrics.get_visual_change_score(current_frame)
+                ui_elements = self.visual_metrics.detect_ui_elements(current_frame)
+                
+                # More aggressive detection: lower threshold for UI elements and visual change
+                if len(ui_elements) > 3 and visual_change_score < 0.3:
+                    # Try to identify the specific menu type
+                    for menu_type, properties in self.MENU_TYPES.items():
+                        threshold = properties["threshold"] * 0.8  # Lower the threshold by 20%
+                        signature_regions = properties["signature_regions"]
                         
-                        # Count UI elements in this region
-                        elements_in_region = [
-                            elem for elem in ui_elements
-                            if (elem[0] >= region_x1 and elem[0] <= region_x2 and
-                                elem[1] >= region_y1 and elem[1] <= region_y2)
-                        ]
+                        # Check signature regions for UI element density
+                        region_match_count = 0
+                        for region in signature_regions:
+                            x1, y1, x2, y2 = region
+                            h, w = current_frame.shape[:2]
+                            region_x1, region_y1 = int(x1 * w), int(y1 * h)
+                            region_x2, region_y2 = int(x2 * w), int(y2 * h)
+                            
+                            # Count UI elements in this region
+                            elements_in_region = [
+                                elem for elem in ui_elements
+                                if (elem[0] >= region_x1 and elem[0] <= region_x2 and
+                                    elem[1] >= region_y1 and elem[1] <= region_y2)
+                            ]
+                            
+                            # Be more lenient - accept even a single UI element in region
+                            if len(elements_in_region) >= 1:
+                                region_match_count += 1
                         
-                        if len(elements_in_region) >= 2:
-                            region_match_count += 1
-                    
-                    # If enough signature regions match, this is likely the menu type
-                    if region_match_count >= len(signature_regions) * 0.5:
-                        confidence = min(1.0, (visual_change_score + len(ui_elements) / 20) / 2)
-                        if confidence > threshold:
-                            self.in_menu = True
-                            self.menu_type = menu_type
-                            self.menu_detection_confidence = confidence
-                            return True, menu_type, confidence
-            
-            # Fallback: generic menu detection based on visual change
-            if visual_change_score < 0.1 and len(ui_elements) > 3:
-                self.in_menu = True
-                self.menu_type = "unknown"
-                self.menu_detection_confidence = 0.6
-                return True, "unknown", 0.6
+                        # If any signature regions match, consider this as a potential menu type
+                        if region_match_count >= max(1, len(signature_regions) * 0.3):  # Match at least 30% of regions or 1
+                            confidence = min(1.0, 0.5 + len(ui_elements) / 20.0)  # Base confidence on UI element count
+                            if confidence > threshold:
+                                self.in_menu = True
+                                self.menu_type = menu_type
+                                self.menu_detection_confidence = confidence
+                                logger.debug(f"Menu detected: {menu_type} with confidence {confidence:.2f}")
+                                return True, menu_type, confidence
+                
+                # Fallback: generic menu detection based on visual change and UI count
+                if visual_change_score < 0.15 and len(ui_elements) > 2:  # More aggressive thresholds
+                    self.in_menu = True
+                    self.menu_type = "unknown"
+                    self.menu_detection_confidence = 0.6
+                    logger.debug("Menu detected by fallback method")
+                    return True, "unknown", 0.6
+            except Exception as e:
+                logger.warning(f"Error in menu detection: {e}")
         
         # Template matching fallback (if visual metrics not available)
         for menu_type, template in self.menu_templates.items():
@@ -351,4 +367,16 @@ class MenuHandler:
             x, y, w, h = match_rect
             return (x + w // 2, y + h // 2)
             
-        return None 
+        return None
+
+    def force_menu_detection_result(self, is_menu: bool, menu_type: Optional[str] = None) -> None:
+        """Force a specific menu detection result for testing purposes.
+        
+        Args:
+            is_menu: Whether to treat the current state as a menu
+            menu_type: The type of menu to set (if is_menu is True)
+        """
+        self.in_menu = is_menu
+        self.menu_type = menu_type if is_menu else None
+        self.menu_detection_confidence = 0.9 if is_menu else 0.0
+        logger.info(f"Forced menu detection state: in_menu={is_menu}, type={menu_type}") 

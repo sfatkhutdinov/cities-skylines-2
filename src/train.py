@@ -705,7 +705,8 @@ def train():
     env = CitiesEnvironment(
         config=config,
         mock_mode=args.mock_env,
-        menu_screenshot_path=None  # Use default menu detection
+        menu_screenshot_path=None,  # Use default menu detection
+        disable_menu_detection=args.disable_menu_detection  # Pass disable_menu_detection parameter
     )
     
     # Get state and action dimensions from the environment

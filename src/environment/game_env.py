@@ -45,6 +45,9 @@ class CitiesEnvironment:
         self.menu_reference_path = menu_screenshot_path
         self.has_menu_reference = self.menu_reference_path is not None and os.path.exists(str(self.menu_reference_path))
         
+        # Process kwargs for additional options
+        self.disable_menu_detection = kwargs.get('disable_menu_detection', False)
+        
         # Initialize components
         self.input_simulator = InputSimulator()
         
@@ -661,24 +664,32 @@ class CitiesEnvironment:
         Returns:
             bool: True if a menu is detected, False otherwise
         """
+        # If menu detection is disabled, always return False
+        if self.disable_menu_detection:
+            return False
+        
         # In mock mode, randomly simulate menu states (for testing)
         if self.mock_mode:
             # Very low probability to be in a menu (5%)
             return random.random() < 0.05
-            
+        
         # Get current frame
         current_frame = self.screen_capture.capture_frame()
         if current_frame is None:
             logger.warning("Failed to capture frame for menu detection")
             return False
-            
+        
         # Use menu handler if available
         if hasattr(self, 'menu_handler') and self.menu_handler is not None:
             menu_detected, _, _ = self.menu_handler.detect_menu(current_frame)
             return menu_detected
-            
+        
         # Fallback to visual estimator
-        return self.visual_estimator.detect_main_menu(current_frame)
+        try:
+            return self.visual_estimator.detect_main_menu(current_frame)
+        except Exception as e:
+            logger.error(f"Error in menu detection: {e}")
+            return False
     
     def _handle_menu_recovery(self, retries: int = 2) -> bool:
         """Try to recover from being stuck in a menu.

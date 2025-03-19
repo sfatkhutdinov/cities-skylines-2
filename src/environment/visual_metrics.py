@@ -58,20 +58,46 @@ class VisualMetricsEstimator:
         """Initialize menu detection with reference image."""
         if menu_reference_path and os.path.exists(menu_reference_path):
             try:
+                # Load reference image
                 self.menu_reference = cv2.imread(menu_reference_path, cv2.IMREAD_GRAYSCALE)
+                
                 if self.menu_reference is not None:
                     logger.info(f"Loaded menu reference image from {menu_reference_path}")
+                    
+                    # Check if image is valid
+                    if self.menu_reference.size == 0 or self.menu_reference.max() == 0:
+                        logger.error("Menu reference image is blank or invalid")
+                        return self.setup_fallback_menu_detection()
+                    
                     # Pre-compute keypoints and descriptors
                     self.menu_kp, self.menu_desc = self.menu_matcher.detectAndCompute(self.menu_reference, None)
+                    
+                    if self.menu_kp is None or len(self.menu_kp) < 10 or self.menu_desc is None:
+                        logger.warning("Few or no keypoints detected in menu reference image")
+                        logger.info("Attempting to enhance reference image...")
+                        
+                        # Try to enhance the image with preprocessing
+                        enhanced_ref = self.menu_reference.copy()
+                        enhanced_ref = cv2.GaussianBlur(enhanced_ref, (3, 3), 0)
+                        enhanced_ref = cv2.equalizeHist(enhanced_ref)
+                        
+                        # Try detecting features on enhanced image
+                        self.menu_kp, self.menu_desc = self.menu_matcher.detectAndCompute(enhanced_ref, None)
+                        
+                        if self.menu_kp is None or len(self.menu_kp) < 10:
+                            logger.warning("Failed to detect features even after enhancement. Using fallback detection.")
+                            return self.setup_fallback_menu_detection()
+                    
                     self.menu_detection_initialized = True
+                    logger.info(f"Menu detection initialized with {len(self.menu_kp)} keypoints")
                     return True
                 else:
                     logger.warning(f"Failed to load menu reference image from {menu_reference_path}")
             except Exception as e:
                 logger.error(f"Error loading menu reference: {e}")
         
-        logger.warning("No valid menu reference image available")
-        return False
+        logger.warning("No valid menu reference image available, using fallback detection")
+        return self.setup_fallback_menu_detection()
     
     def setup_fallback_menu_detection(self):
         """Set up fallback menu detection based on color patterns and UI layout analysis.
@@ -157,6 +183,13 @@ class VisualMetricsEstimator:
         if frame_np is None or frame_np.size == 0 or frame_np.max() == 0:
             return False
             
+        # Ensure frame is uint8 for OpenCV operations
+        if frame_np.dtype != np.uint8:
+            if frame_np.max() <= 1.0:
+                frame_np = (frame_np * 255).astype(np.uint8)
+            else:
+                frame_np = frame_np.astype(np.uint8)
+        
         # First try color-based detection with the specific menu colors
         if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
             is_menu_by_color = self.detect_menu_by_colors(frame_np)
@@ -170,80 +203,123 @@ class VisualMetricsEstimator:
         else:
             gray = frame_np.astype(np.uint8)
             
-        # Detect edges for UI elements with lower thresholds for higher sensitivity
-        edges = cv2.Canny(gray, 30, 120)  # Lower thresholds to detect more edges
+        # Apply blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Try multiple edge detection approaches
+        edges1 = cv2.Canny(blurred, 30, 120)  # More sensitive
+        edges2 = cv2.Canny(blurred, 50, 150)  # More selective
+        
+        # Combine edges for more robust detection
+        edges = cv2.bitwise_or(edges1, edges2)
+        
+        # Dilate edges to connect nearby lines
+        kernel = np.ones((3, 3), np.uint8)
+        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
         
         # Calculate UI element coverage percentage
         ui_percentage = np.sum(edges > 0) / edges.size
-        self.ui_pattern_threshold = 0.01  # Further lowered threshold for more sensitivity
         
-        # Look for horizontal lines (common in UI) with reduced threshold
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=80, maxLineGap=15)
-        
-        horizontal_lines = 0
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-                if angle < 15 or angle > 165:  # More lenient angle for horizontal lines
-                    horizontal_lines += 1
-        
-        # Check for solid color areas (common in menus) using multiple thresholds
+        # Look for horizontal and vertical lines using both the original and dilated edges
+        horizontal_lines_count = 0
+        vertical_lines_count = 0
         large_rectangles = 0
-        for threshold in [150, 200]:  # Try multiple thresholds
-            _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        medium_rectangles = 0
+        
+        # Look for lines in the dilated edges
+        try:
+            lines = cv2.HoughLinesP(dilated_edges, 1, np.pi/180, threshold=50, minLineLength=40, maxLineGap=20)
+            
+            if lines is not None:
+                # Count horizontal and vertical lines
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    
+                    # Calculate angle
+                    if abs(x2 - x1) < 1:  # Avoid division by zero
+                        angle = 90.0
+                    else:
+                        angle = abs(np.arctan((y2 - y1) / (x2 - x1)) * 180 / np.pi)
+                        
+                    # Classify lines with more lenient angles
+                    if angle < 20:  # Horizontal-ish
+                        horizontal_lines_count += 1
+                    elif angle > 70:  # Vertical-ish
+                        vertical_lines_count += 1
+        except Exception as e:
+            logger.warning(f"Error detecting lines: {e}")
+        
+        # Find contours to detect UI rectangles
+        try:
+            contours, _ = cv2.findContours(dilated_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            height, width = gray.shape
             
             for contour in contours:
+                # Get bounding rect
                 x, y, w, h = cv2.boundingRect(contour)
-                area = w * h
-                if area > (gray.shape[0] * gray.shape[1] * 0.03):  # Reduced threshold to 3% of screen
-                    large_rectangles += 1
-                    
-        # Check for medium rectangles too (buttons, dialog boxes)
-        medium_rectangles = 0
-        _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            area = w * h
-            if area > (gray.shape[0] * gray.shape[1] * 0.01) and area < (gray.shape[0] * gray.shape[1] * 0.05):
-                # Areas between 1% and 5% of screen (typical for buttons)
-                medium_rectangles += 1
+                aspect_ratio = float(w) / max(h, 1)
                 
-        # Add text detection with higher sensitivity
-        text_proxy = 0
-        kernel = np.ones((5,5), np.uint8)
-        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
-        if lines is not None:
-            vertical_line_mask = np.zeros_like(edges)
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-                if 75 < angle < 105:  # More lenient angle for vertical lines
-                    cv2.line(vertical_line_mask, (x1, y1), (x2, y2), 255, 2)
-            
-            # Count potential text areas
-            text_proxy = np.sum(vertical_line_mask & dilated_edges) / np.sum(dilated_edges + 1e-8)
+                # Rectangle size relative to frame
+                rel_size = (w * h) / (width * height)
+                
+                # Classify rectangles
+                if rel_size > 0.1 and 0.5 < aspect_ratio < 2.0:  # Large rectangles common in menus
+                    large_rectangles += 1
+                elif 0.02 < rel_size < 0.1 and 0.5 < aspect_ratio < 2.0:  # Medium sized UI elements
+                    medium_rectangles += 1
+        except Exception as e:
+            logger.warning(f"Error detecting rectangles: {e}")
         
-        # Add center square check - many menus have content in the center of screen
+        # Text detection proxy (vertical lines intersecting with horizontal)
+        text_proxy = 0.0
+        if lines is not None:
+            try:
+                vertical_line_mask = np.zeros_like(edges)
+                horizontal_line_mask = np.zeros_like(edges)
+                
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                    if 75 < angle < 105:  # Vertical lines
+                        cv2.line(vertical_line_mask, (x1, y1), (x2, y2), 255, 2)
+                    elif angle < 15:  # Horizontal lines
+                        cv2.line(horizontal_line_mask, (x1, y1), (x2, y2), 255, 2)
+                
+                # Combine vertical and horizontal lines - intersections hint at structured UI
+                intersection_mask = cv2.bitwise_and(vertical_line_mask, horizontal_line_mask)
+                text_proxy = np.sum(intersection_mask > 0) / max(1, np.sum(dilated_edges > 0))
+            except Exception as e:
+                logger.warning(f"Error calculating text proxy: {e}")
+        
+        # Check center region - menus often have content centered
         height, width = gray.shape
         center_region = gray[height//4:3*height//4, width//4:3*width//4]
         center_edges = cv2.Canny(center_region, 30, 120)
         center_edge_density = np.sum(center_edges > 0) / center_edges.size
         
-        # Decision based on combined factors - much more aggressive detection
-        is_menu = (ui_percentage > self.ui_pattern_threshold) or \
-                  (horizontal_lines >= 2) or \
-                  (large_rectangles >= 1) or \
-                  (medium_rectangles >= 3) or \
-                  (text_proxy > 0.05) or \
-                  (center_edge_density > 0.03)
+        # Decision based on multiple factors - using weighted approach
+        factors = [
+            ui_percentage > 0.01,  # Very low threshold for edge density
+            horizontal_lines_count >= 2,  # At least some horizontal lines
+            vertical_lines_count >= 2,    # At least some vertical lines
+            large_rectangles >= 1,        # Large UI panels
+            medium_rectangles >= 2,       # UI elements
+            text_proxy > 0.02,            # Text-like patterns
+            center_edge_density > 0.02    # Content in center of screen
+        ]
         
-        # Log detection results
-        logger.debug(f"Menu detection stats: ui_pct={ui_percentage:.4f}, h_lines={horizontal_lines}, " 
-                    f"lg_rect={large_rectangles}, med_rect={medium_rectangles}, "
-                    f"text={text_proxy:.4f}, center_density={center_edge_density:.4f}, is_menu={is_menu}")
+        # Count how many factors indicate a menu
+        factor_count = sum(1 for factor in factors if factor)
+        
+        # Decision threshold - if at least 3 factors indicate a menu
+        is_menu = factor_count >= 3
+        
+        # Advanced logging for diagnostics
+        logger.debug(
+            f"Menu detection stats: ui_pct={ui_percentage:.4f}, h_lines={horizontal_lines_count}, "
+            f"v_lines={vertical_lines_count}, lg_rect={large_rectangles}, med_rect={medium_rectangles}, "
+            f"text={text_proxy:.4f}, center_density={center_edge_density:.4f}, factors={factor_count}, is_menu={is_menu}"
+        )
         
         return is_menu
         
@@ -349,20 +425,28 @@ class VisualMetricsEstimator:
             if kp_frame is None or desc_frame is None or len(kp_frame) < 10:
                 return False
                 
+            # Ensure menu descriptors exist
+            if self.menu_desc is None or len(self.menu_desc) == 0:
+                logger.warning("Menu reference descriptors not available")
+                return False
+                
             # Match against reference menu image
             matches = self.menu_flann.knnMatch(self.menu_desc, desc_frame, k=2)
             
             # Apply ratio test for good matches
             good_matches = []
-            for m, n in matches:
+            for match_pair in matches:
+                if len(match_pair) != 2:
+                    continue
+                m, n = match_pair
                 if m.distance < 0.75 * n.distance:
                     good_matches.append(m)
                     
             # Calculate match ratio
             match_ratio = len(good_matches) / max(1, len(self.menu_kp))
             
-            # Decision threshold - tuned for menus (need at least 15% matching keypoints)
-            return match_ratio > 0.15
+            # Decision threshold - reduced to 10% for better detection sensitivity
+            return match_ratio > 0.10
         except Exception as e:
             logger.warning(f"Error in SIFT template matching: {e}")
             
@@ -371,8 +455,9 @@ class VisualMetricsEstimator:
                 # Use simple template matching (less accurate but more robust)
                 result = cv2.matchTemplate(gray_frame, self.menu_reference, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(result)
-                return max_val > 0.6  # Threshold for menu detection
-            except Exception:
+                return max_val > 0.4  # Reduced threshold for better sensitivity
+            except Exception as e2:
+                logger.error(f"Template matching fallback also failed: {e2}")
                 return False
                 
     def _detect_menu_by_color(self, frame_np: np.ndarray) -> bool:
@@ -524,42 +609,51 @@ class VisualMetricsEstimator:
         # Threshold for detection
         return max_val > 0.6
     
-    def save_current_frame_as_menu_reference(self, frame: torch.Tensor, save_path: str) -> bool:
-        """Save current frame as a menu reference.
+    def save_current_frame_as_menu_reference(self, frame, save_path):
+        """Save the current frame as a menu reference image.
         
         Args:
-            frame (torch.Tensor): Current frame
-            save_path (str): Path to save the reference image
+            frame: Current frame to save as reference
+            save_path: Path to save the reference image
             
         Returns:
-            bool: Success flag
+            bool: True if successfully saved, False otherwise
         """
         try:
-            # Convert to numpy
+            # Convert frame to proper format
             if isinstance(frame, torch.Tensor):
                 frame_np = frame.detach().cpu().numpy()
-                if len(frame_np.shape) == 3:  # CHW format
-                    frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
-            else:
-                frame_np = frame
                 
-            # Convert to grayscale if needed
-            if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
-                frame_gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+                # Convert from PyTorch's CHW format to HWC
+                if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:
+                    frame_np = frame_np.transpose(1, 2, 0)
+                    
+                # Scale to 0-255 if needed
+                if frame_np.max() <= 1.0:
+                    frame_np = (frame_np * 255).astype(np.uint8)
             else:
-                frame_gray = frame_np
+                frame_np = frame.astype(np.uint8) if frame.dtype != np.uint8 else frame
             
-            # Save the grayscale image
-            cv2.imwrite(save_path, frame_gray)
+            # Convert to grayscale
+            if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
+                gray_frame = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+            else:
+                gray_frame = frame_np
             
-            # Update the reference
-            self.menu_reference = frame_gray
-            self.menu_kp, self.menu_desc = self.menu_matcher.detectAndCompute(self.menu_reference, None)
+            # Save the image
+            cv2.imwrite(save_path, gray_frame)
             
-            logger.info(f"Saved menu reference to {save_path}")
+            # Update our reference
+            self.menu_reference = gray_frame
+            
+            # Compute keypoints and descriptors
+            self.menu_kp, self.menu_desc = self.menu_matcher.detectAndCompute(gray_frame, None)
+            self.menu_detection_initialized = True
+            
+            logger.info(f"Successfully saved menu reference to {save_path} with {len(self.menu_kp)} keypoints")
             return True
         except Exception as e:
-            logger.error(f"Error saving menu reference: {e}")
+            logger.error(f"Failed to save menu reference: {e}")
             return False
             
     def update_model(self, frame: torch.Tensor, reward: float):
@@ -881,5 +975,51 @@ class VisualMetricsEstimator:
         if not hasattr(self, 'image_utils'):
             self.image_utils = ImageUtils()
             
-        # Use image utils to detect UI elements
-        return self.image_utils.detect_ui_elements(frame_np) 
+        # Enhanced UI detection
+        ui_elements = []
+        
+        try:
+            # First try using image utils
+            standard_elements = self.image_utils.detect_ui_elements(frame_np)
+            ui_elements.extend(standard_elements)
+            
+            # Add additional detection method for more robust detection
+            if len(frame_np.shape) == 3:
+                gray = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = frame_np
+                
+            # Try multiple thresholds to catch different UI elements
+            for threshold in [150, 200, 220]:
+                _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+                contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                for contour in contours:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    # Filter by reasonable UI element size
+                    if w > 5 and h > 5 and w < frame_np.shape[1] // 2 and h < frame_np.shape[0] // 2:
+                        ui_elements.append((x, y, w, h))
+            
+            # Also try edge detection to find UI borders
+            edges = cv2.Canny(gray, 30, 150)
+            # Dilate edges to connect nearby lines
+            kernel = np.ones((3, 3), np.uint8)
+            dilated = cv2.dilate(edges, kernel, iterations=1)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                # Only add large contours that might be UI panels
+                if w > 20 and h > 20 and w < frame_np.shape[1] * 0.8 and h < frame_np.shape[0] * 0.8:
+                    ui_elements.append((x, y, w, h))
+            
+            # Remove duplicates
+            unique_elements = []
+            for elem in ui_elements:
+                if elem not in unique_elements:
+                    unique_elements.append(elem)
+            
+            return unique_elements
+        except Exception as e:
+            logger.error(f"Error detecting UI elements: {e}")
+            return [] 
