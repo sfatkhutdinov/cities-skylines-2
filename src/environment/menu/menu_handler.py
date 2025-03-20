@@ -1,17 +1,17 @@
 """
-Menu handler for Cities: Skylines 2 environment.
+Menu handler for Cities: Skylines 2.
 
 This module integrates the various menu related components.
 """
 
 import logging
 import time
-from typing import Dict, List, Tuple, Optional, Union, Any
+from typing import Dict, List, Tuple, Optional, Any
 
-from ..optimized_capture import OptimizedScreenCapture
-from ..visual_metrics import VisualMetricsEstimator
-from ..input.keyboard import KeyboardInput
-from ..input.mouse import MouseInput
+from src.environment.core.observation import ObservationManager
+from src.environment.core.performance import PerformanceMonitor
+from src.environment.input.keyboard import KeyboardController
+from src.environment.input.mouse import MouseController
 
 from .detector import MenuDetector
 from .navigator import MenuNavigator
@@ -25,62 +25,65 @@ class MenuHandler:
     
     def __init__(
         self,
-        screen_capture: OptimizedScreenCapture,
+        observation_manager: ObservationManager,
         input_simulator = None,  # For backward compatibility
-        visual_metrics: Optional[VisualMetricsEstimator] = None,
+        performance_monitor: Optional[PerformanceMonitor] = None,
         templates_dir: str = "menu_templates"
     ):
         """Initialize the menu handler.
         
         Args:
-            screen_capture: Screen capture module
-            input_simulator: Legacy input simulator (for backward compatibility)
-            visual_metrics: Visual metrics estimator
-            templates_dir: Directory to store menu templates
+            observation_manager: Observation manager for screen capture
+            input_simulator: Optional input simulator for backward compatibility
+            performance_monitor: Optional performance monitor for metrics
+            templates_dir: Directory containing menu templates
         """
-        self.screen_capture = screen_capture
-        self.visual_metrics = visual_metrics
+        self.observation_manager = observation_manager
+        self.performance_monitor = performance_monitor
         
-        # For backward compatibility
-        self.input_simulator = input_simulator
-        
-        # Extract or create input components
-        if input_simulator is not None and hasattr(input_simulator, 'keyboard'):
-            self.keyboard_input = input_simulator.keyboard
-            self.mouse_input = input_simulator.mouse
+        # Set up keyboard and mouse controllers
+        if input_simulator is not None:
+            if hasattr(input_simulator, 'keyboard') and hasattr(input_simulator, 'mouse'):
+                self.keyboard = input_simulator.keyboard
+                self.mouse = input_simulator.mouse
+            else:
+                self.keyboard = KeyboardController()
+                self.mouse = MouseController()
         else:
-            logger.info("Creating new keyboard and mouse input instances")
-            self.keyboard_input = KeyboardInput()
-            self.mouse_input = MouseInput()
+            self.keyboard = KeyboardController()
+            self.mouse = MouseController()
+            
+        # Create template manager
+        self.template_manager = MenuTemplateManager(templates_dir)
         
-        # Initialize template manager
-        self.template_manager = MenuTemplateManager(templates_dir=templates_dir)
-        
-        # Initialize detector
+        # Create detector
         self.detector = MenuDetector(
-            screen_capture=screen_capture,
-            visual_metrics=visual_metrics
+            observation_manager=self.observation_manager,
+            performance_monitor=self.performance_monitor
         )
         
-        # Initialize navigator
+        # Create navigator
         self.navigator = MenuNavigator(
-            screen_capture=screen_capture,
-            keyboard_input=self.keyboard_input,
-            mouse_input=self.mouse_input,
+            observation_manager=self.observation_manager,
+            keyboard_controller=self.keyboard,
+            mouse_controller=self.mouse,
             menu_detector=self.detector
         )
         
-        # Initialize recovery
+        # Create recovery
         self.recovery = MenuRecovery(
             menu_detector=self.detector,
             menu_navigator=self.navigator,
-            keyboard_input=self.keyboard_input,
-            mouse_input=self.mouse_input
+            keyboard_controller=self.keyboard,
+            mouse_controller=self.mouse
         )
         
-        # Menu handler state
-        self.menu_recovery_attempts = 0
-        self.max_recovery_attempts = 3
+        # Menu handling state
+        self.menu_handling_enabled = True
+        self.last_menu_check = 0
+        self.menu_check_interval = 1.0  # seconds
+        self.menu_detection_counter = 0
+        self.action_history = []
         
         logger.info("Menu handler initialized")
     
@@ -235,7 +238,7 @@ class MenuHandler:
             Whether the template was learned successfully
         """
         # Capture current frame
-        current_frame = self.screen_capture.capture_frame()
+        current_frame = self.observation_manager.capture_frame()
         if current_frame is None:
             logger.warning("Failed to capture frame for template learning")
             return False

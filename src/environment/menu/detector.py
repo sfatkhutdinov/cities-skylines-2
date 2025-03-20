@@ -1,19 +1,20 @@
 """
-Menu detection for Cities: Skylines 2 environment.
+Menu detector for Cities: Skylines 2.
 
-This module provides functionality for detecting menus in the game.
+This module handles the detection of in-game menus.
 """
 
 import logging
 import time
 import numpy as np
 import cv2
-from typing import Tuple, List, Dict, Optional, Union
+from typing import Dict, List, Tuple, Optional, Any
 import torch
+import os
 
-from ..optimized_capture import OptimizedScreenCapture
-from ..visual_metrics import VisualMetricsEstimator
-from ...utils.image_utils import ImageUtils
+from src.utils.image_utils import ImageUtils
+from src.environment.core.observation import ObservationManager
+from ..core.performance import PerformanceMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +41,17 @@ class MenuDetector:
     
     def __init__(
         self,
-        screen_capture: OptimizedScreenCapture,
-        visual_metrics: Optional[VisualMetricsEstimator] = None,
+        observation_manager: ObservationManager,
+        performance_monitor: Optional[PerformanceMonitor] = None,
     ):
         """Initialize menu detector.
         
         Args:
-            screen_capture: Screen capture module
-            visual_metrics: Optional VisualMetricsEstimator instance for menu detection
+            observation_manager: Observation management module
+            performance_monitor: Optional performance monitoring module
         """
-        self.screen_capture = screen_capture
-        self.visual_metrics = visual_metrics
+        self.observation_manager = observation_manager
+        self.performance_monitor = performance_monitor
         self.image_utils = ImageUtils()
         
         # Menu state
@@ -132,9 +133,9 @@ class MenuDetector:
             return False, None, 0.0
         
         # Use visual metrics if available
-        if self.visual_metrics is not None and hasattr(self.visual_metrics, 'detect_menu'):
+        if self.performance_monitor is not None and hasattr(self.performance_monitor, 'detect_menu'):
             try:
-                menu_detected, menu_type, confidence = self.visual_metrics.detect_menu(current_frame)
+                menu_detected, menu_type, confidence = self.performance_monitor.detect_menu(current_frame)
                 
                 # Apply dynamic threshold adjustment based on history
                 adjusted_confidence = confidence - self.detection_threshold_adjustment
@@ -218,7 +219,7 @@ class MenuDetector:
         
         try:
             # Capture current frame
-            current_frame = self.screen_capture.capture_frame()
+            current_frame = self.observation_manager.capture_frame()
             if current_frame is None:
                 logger.warning("Failed to capture frame for menu detection")
                 return self.in_menu  # Return previous state

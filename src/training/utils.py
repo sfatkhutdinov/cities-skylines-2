@@ -8,13 +8,18 @@ import torch
 import os
 import logging
 import argparse
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import time
 from pathlib import Path
+import sys
 
-from ..config.hardware_config import HardwareConfig
-from ..agent.ppo_agent import PPOAgent
-from ..environment.game_env import CitiesEnvironment
+# Fix path for imports
+sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+
+from src.config.hardware_config import HardwareConfig
+from src.config.config_loader import ConfigLoader
+from src.agent.core import PPOAgent
+from src.environment.core import Environment
 
 logger = logging.getLogger(__name__)
 
@@ -26,22 +31,26 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description="Train reinforcement learning agent")
     
+    # Config file options
+    parser.add_argument("--config", type=str, help="Path to configuration file")
+    parser.add_argument("--save_config", type=str, help="Save current configuration to file")
+    
     # Training parameters
-    parser.add_argument("--num_episodes", type=int, default=1000, help="Number of episodes to train for")
-    parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for updates")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
-    parser.add_argument("--clip_param", type=float, default=0.2, help="PPO clipping parameter")
+    parser.add_argument("--num_episodes", type=int, help="Number of episodes to train for")
+    parser.add_argument("--max_steps", type=int, help="Maximum steps per episode")
+    parser.add_argument("--batch_size", type=int, help="Batch size for updates")
+    parser.add_argument("--learning_rate", type=float, help="Learning rate")
+    parser.add_argument("--gamma", type=float, help="Discount factor")
+    parser.add_argument("--gae_lambda", type=float, help="GAE lambda parameter")
+    parser.add_argument("--clip_param", type=float, help="PPO clipping parameter")
     
     # Checkpointing and resumption
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--checkpoint_freq", type=int, default=100, help="Episodes between checkpoints")
-    parser.add_argument("--autosave_interval", type=int, default=15, help="Minutes between auto-saves")
-    parser.add_argument("--backup_checkpoints", type=int, default=5, help="Number of backup checkpoints to keep")
-    parser.add_argument("--max_checkpoints", type=int, default=10, help="Max regular checkpoints to keep")
-    parser.add_argument("--max_disk_usage_gb", type=float, default=5.0, help="Maximum disk usage in GB for logs and checkpoints")
+    parser.add_argument("--checkpoint_dir", type=str, help="Directory to save checkpoints")
+    parser.add_argument("--checkpoint_freq", type=int, help="Episodes between checkpoints")
+    parser.add_argument("--autosave_interval", type=int, help="Minutes between auto-saves (0 to disable)")
+    parser.add_argument("--backup_checkpoints", type=int, help="Number of backup checkpoints to keep")
+    parser.add_argument("--max_checkpoints", type=int, help="Max regular checkpoints to keep")
+    parser.add_argument("--max_disk_usage_gb", type=float, help="Maximum disk usage in GB for logs and checkpoints")
     parser.add_argument("--fresh_start", action="store_true", help="Force starting training from scratch, ignoring existing checkpoints")
     parser.add_argument("--use_best", action="store_true", help="Resume training from best checkpoint instead of latest")
     
@@ -51,122 +60,179 @@ def parse_args():
     
     # Monitoring and logging
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
-    parser.add_argument("--wandb_project", type=str, default="cities-skylines-rl", help="Weights & Biases project name")
+    parser.add_argument("--wandb_project", type=str, help="Weights & Biases project name")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--render", action="store_true", help="Render environment during training")
+    parser.add_argument("--log_dir", type=str, help="Directory for logs")
     
     # Hardware acceleration
     parser.add_argument("--force_cpu", action="store_true", help="Force CPU usage even if GPU is available")
     parser.add_argument("--fp16", action="store_true", help="Use mixed precision (FP16) if available")
+    parser.add_argument("--cpu_threads", type=int, help="Number of CPU threads to use (0 for all)")
     
     return parser.parse_args()
 
-def setup_hardware_config(args):
-    """Set up hardware configuration based on arguments.
+def setup_config(args) -> ConfigLoader:
+    """Set up configuration from args and config file.
     
     Args:
         args: Parsed arguments
+        
+    Returns:
+        ConfigLoader: Configuration loader
+    """
+    # Create config loader from file or defaults
+    config_loader = ConfigLoader(args.config)
+    
+    # Convert args to dictionary and merge with config
+    args_dict = args_to_dict(args)
+    config_loader.merge_with_args(args_dict)
+    
+    # Validate config
+    errors = config_loader.validate_config()
+    if errors:
+        for error in errors:
+            logger.error(f"Configuration error: {error}")
+        logger.warning("Using default values for invalid configuration entries")
+    
+    # Save config if requested
+    if args.save_config:
+        if config_loader.save(args.save_config):
+            logger.info(f"Configuration saved to {args.save_config}")
+        else:
+            logger.error(f"Failed to save configuration to {args.save_config}")
+    
+    return config_loader
+
+def setup_hardware_config(args, config_loader: Optional[ConfigLoader] = None):
+    """Set up hardware configuration based on arguments and config.
+    
+    Args:
+        args: Parsed arguments
+        config_loader: Optional configuration loader
         
     Returns:
         Hardware configuration
     """
-    config = HardwareConfig()
+    if config_loader is not None:
+        # Use configuration from config loader
+        config = config_loader.get_hardware_config()
+        
+        # Override with CLI arguments if specified
+        args_dict = args_to_dict(args)
+        if args.force_cpu:
+            config.force_cpu = True
+        if args.fp16:
+            config.use_fp16 = True
+        if args.batch_size:
+            config.batch_size = args.batch_size
+        if args.learning_rate:
+            config.learning_rate = args.learning_rate
+    else:
+        # Fallback to old method if no config loader
+        config = HardwareConfig()
+        
+        # Configure hardware settings
+        if args.force_cpu:
+            config.force_cpu = True
+        
+        if args.fp16:
+            config.use_fp16 = True
+            
+        if args.batch_size:
+            config.batch_size = args.batch_size
+            
+        if args.learning_rate:
+            config.learning_rate = args.learning_rate
     
-    # Configure hardware settings
-    if args.force_cpu:
-        config.device = "cpu"
-    
-    if args.fp16:
-        config.use_fp16 = True
-    
-    # Validate configuration
-    if config.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA requested but not available, falling back to CPU")
-        config.device = "cpu"
-    
-    # Log configuration
-    logger.info(f"Using device: {config.device}")
-    if config.device == "cuda":
-        logger.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        logger.info(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-    
-    if config.use_fp16:
-        logger.info("Using mixed precision (FP16)")
+    # Log hardware configuration
+    logger.info(f"Hardware configuration: device={config.get_device()}, "
+               f"batch_size={config.batch_size}, fp16={config.use_fp16}")
     
     return config
 
-def setup_environment(config, args):
-    """Set up the environment based on configuration and arguments.
+def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None):
+    """Set up the environment based on arguments.
     
     Args:
         config: Hardware configuration
         args: Parsed arguments
+        config_loader: Optional configuration loader
         
     Returns:
         Environment instance
     """
-    # Find menu reference path
-    menu_reference_path = None
-    if os.path.exists("menu_reference.png"):
-        menu_reference_path = os.path.abspath("menu_reference.png")
-        logger.info(f"Using menu reference: {menu_reference_path}")
+    from src.environment.core import Environment
+    from src.environment.mock_environment import MockEnvironment
+    from src.environment.core.error_recovery import ErrorRecovery
     
-    # Create environment
-    env = CitiesEnvironment(
+    env_config = {}
+    if config_loader:
+        env_config = config_loader.get_section('environment')
+    
+    # Use mock environment if requested
+    if args.mock_env:
+        logger.info("Using mock environment for testing")
+        mock_env_params = {
+            'frame_height': env_config.get('frame_height', 240),
+            'frame_width': env_config.get('frame_width', 320),
+            'max_steps': args.max_steps if args.max_steps else env_config.get('max_steps', 1000),
+            'crash_probability': env_config.get('crash_probability', 0.005),
+            'freeze_probability': env_config.get('freeze_probability', 0.01),
+            'menu_probability': env_config.get('menu_probability', 0.02)
+        }
+        return MockEnvironment(config=config, **mock_env_params)
+    
+    # Create real environment
+    logger.info("Setting up real game environment")
+    env = Environment(
         config=config,
-        mock_mode=args.mock_env,
-        menu_screenshot_path=menu_reference_path,
         disable_menu_detection=args.disable_menu_detection,
-        max_steps=args.max_steps
+        **env_config
     )
     
     return env
 
-def setup_agent(config, env, args):
-    """Set up the agent based on configuration and arguments.
+def setup_agent(config, env, args, config_loader: Optional[ConfigLoader] = None):
+    """Set up the agent based on arguments.
     
     Args:
         config: Hardware configuration
         env: Environment instance
         args: Parsed arguments
+        config_loader: Optional configuration loader
         
     Returns:
         Agent instance
     """
-    # Get environment properties
-    if hasattr(env, 'observation_shape'):
-        observation_shape = env.observation_shape
-    else:
-        test_state = env.reset()
-        observation_shape = test_state.shape
-    
-    if hasattr(env, 'num_actions'):
-        num_actions = env.num_actions
-    else:
-        num_actions = env.action_space.n if hasattr(env, 'action_space') else 10
+    model_config = {}
+    if config_loader:
+        model_config = config_loader.get_section('model')
     
     # Create agent
     agent = PPOAgent(
-        state_dim=observation_shape,
-        action_dim=num_actions,
-        lr=args.learning_rate,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_param=args.clip_param,
-        batch_size=args.batch_size,
-        device=config.get_device(),
-        dtype=config.get_dtype()
+        env.observation_space,
+        env.action_space,
+        config,
+        **model_config
     )
+    
+    agent.to(config.get_device())
+    logger.info(f"Agent initialized on {config.get_device()}")
+    
+    # Log agent configuration
+    logger.info(f"Agent configuration: {agent}")
     
     return agent
 
 def args_to_dict(args):
-    """Convert argparse Namespace to dictionary.
+    """Convert arguments to dictionary.
     
     Args:
-        args: Argparse Namespace
+        args: Parsed arguments
         
     Returns:
         Dictionary of arguments
     """
-    return {k: v for k, v in vars(args).items()} 
+    # Convert argparse Namespace to dictionary
+    return {k: v for k, v in vars(args).items() if v is not None}

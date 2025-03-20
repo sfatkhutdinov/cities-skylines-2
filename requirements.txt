@@ -23,9 +23,21 @@ cloudpickle>=3.1.0
 wandb>=0.19.0  # for experiment tracking
 tensorboard>=2.19.0
 matplotlib>=3.7.0  # for plotting
+plotly>=5.20.0  # for interactive plots
+streamlit>=1.35.0  # for dashboard
 
-# Performance monitoring
+# Dashboard and visualization
+streamlit>=1.35.0
+plotly>=5.20.0
+seaborn>=0.13.0
+
+# Benchmarking and performance
 psutil>=7.0.0  # system resource monitoring
+tqdm>=4.66.0  # for progress bars
+
+# Hyperparameter tuning
+pandas>=2.2.0
+scikit-learn>=1.5.0  # for analysis of hyperparameter importance
 
 # Utilities
 pydantic>=2.10.0

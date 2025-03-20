@@ -1,7 +1,10 @@
 """
-Cities: Skylines 2 Autonomous Agent
+Cities: Skylines 2 Reinforcement Learning Agent
+
+This package contains modules for training an agent to play Cities: Skylines 2.
 """
 
-from .environment import CitiesEnvironment
+from .environment import Environment
 from .agent import PPOAgent
-from .config import HardwareConfig 
+
+__all__ = ["Environment", "PPOAgent"] 

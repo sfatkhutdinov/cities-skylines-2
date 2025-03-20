@@ -1,9 +1,9 @@
 """
-Environment package for Cities: Skylines 2 agent.
-"""
+Environment module for Cities Skylines 2 agent.
 
-# Backward compatibility alias
-from src.environment.game_env import CitiesEnvironment
+This module provides interfaces for interacting with the game environment,
+including both the real game environment and a mock environment for testing.
+"""
 
 # New modular structure
 from src.environment.core import Environment
@@ -13,14 +13,12 @@ from src.environment.core import ActionSpace
 from src.environment.core import PerformanceMonitor
 
 # Import components from modularized sections
-from src.environment.input import InputSimulator, KeyboardController, MouseController
+from src.environment.input import InputSimulator, KeyboardController, MouseController, ActionExecutor, InputTracker
 from src.environment.menu import MenuHandler, MenuDetector, MenuNavigator, MenuRecovery, MenuTemplateManager
 from src.environment.rewards import AutonomousRewardSystem, VisualChangeAnalyzer, WorldModelCNN
+from src.environment.mock_environment import MockEnvironment
 
 __all__ = [
-    # Legacy classes
-    'CitiesEnvironment',
-    
     # Core environment
     'Environment',
     'GameState',
@@ -32,6 +30,8 @@ __all__ = [
     'InputSimulator',
     'KeyboardController',
     'MouseController',
+    'ActionExecutor',
+    'InputTracker',
     
     # Menu components
     'MenuHandler',
@@ -43,5 +43,8 @@ __all__ = [
     # Reward components
     'AutonomousRewardSystem',
     'VisualChangeAnalyzer',
-    'WorldModelCNN'
+    'WorldModelCNN',
+    
+    # Mock environment
+    'MockEnvironment',
 ] 

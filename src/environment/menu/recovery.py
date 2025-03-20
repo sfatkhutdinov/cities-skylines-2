@@ -1,18 +1,20 @@
 """
-Menu recovery for Cities: Skylines 2 environment.
+Menu recovery for Cities: Skylines 2.
 
-This module provides functionality for recovering from stuck menu situations.
+This module handles recovery from problematic menu states.
 """
 
 import logging
 import time
 import random
-from typing import Dict, List, Tuple, Optional, Union, Any
+import numpy as np
+import cv2
+from typing import Dict, List, Tuple, Optional, Any
 
 from .detector import MenuDetector
 from .navigator import MenuNavigator
-from ..input.keyboard import KeyboardInput
-from ..input.mouse import MouseInput
+from src.environment.input.keyboard import KeyboardController
+from src.environment.input.mouse import MouseController
 
 logger = logging.getLogger(__name__)
 
@@ -23,21 +25,21 @@ class MenuRecovery:
         self,
         menu_detector: MenuDetector,
         menu_navigator: MenuNavigator,
-        keyboard_input: KeyboardInput,
-        mouse_input: MouseInput
+        keyboard_controller: KeyboardController,
+        mouse_controller: MouseController
     ):
         """Initialize menu recovery.
         
         Args:
             menu_detector: Menu detector module
             menu_navigator: Menu navigator module
-            keyboard_input: Keyboard input module
-            mouse_input: Mouse input module
+            keyboard_controller: Keyboard input module
+            mouse_controller: Mouse input module
         """
         self.menu_detector = menu_detector
         self.menu_navigator = menu_navigator
-        self.keyboard_input = keyboard_input
-        self.mouse_input = mouse_input
+        self.keyboard_controller = keyboard_controller
+        self.mouse_controller = mouse_controller
         
         # Recovery state
         self.recovery_attempts = 0
@@ -134,7 +136,7 @@ class MenuRecovery:
         
         # Escape key sometimes works for menus
         logger.info("Trying escape key")
-        self.keyboard_input.press_key("escape")
+        self.keyboard_controller.press_key("escape")
         time.sleep(0.5)
         
         # Check if we're out of the menu
@@ -144,7 +146,7 @@ class MenuRecovery:
             
         # Try clicking in corners (sometimes closes dialogs)
         logger.info("Trying corner clicks")
-        screen_width, screen_height = self.mouse_input.get_screen_dimensions()
+        screen_width, screen_height = self.mouse_controller.get_screen_dimensions()
         corners = [
             (screen_width - 10, 10),  # Top right
             (10, 10),                 # Top left
@@ -153,9 +155,9 @@ class MenuRecovery:
         ]
         
         for x, y in corners:
-            self.mouse_input.move_to(x, y)
+            self.mouse_controller.move_to(x, y)
             time.sleep(0.1)
-            self.mouse_input.click()
+            self.mouse_controller.click()
             time.sleep(0.3)
             
             # Check if we're out of the menu
@@ -182,12 +184,12 @@ class MenuRecovery:
         if self.recovery_escalation_level == 1:
             # Try rapidly clicking in the center of the screen
             logger.info("Trying rapid center clicks")
-            screen_width, screen_height = self.mouse_input.get_screen_dimensions()
+            screen_width, screen_height = self.mouse_controller.get_screen_dimensions()
             center_x, center_y = screen_width // 2, screen_height // 2
             
             for _ in range(5):
-                self.mouse_input.move_to(center_x, center_y)
-                self.mouse_input.click()
+                self.mouse_controller.move_to(center_x, center_y)
+                self.mouse_controller.click()
                 time.sleep(0.1)
                 
                 # Check if we're out of the menu
@@ -200,7 +202,7 @@ class MenuRecovery:
             keys = ["enter", "space", "escape", "tab"]
             
             for key in keys:
-                self.keyboard_input.press_key(key)
+                self.keyboard_controller.press_key(key)
                 time.sleep(0.3)
                 
                 # Check if we're out of the menu
@@ -211,7 +213,7 @@ class MenuRecovery:
         elif self.recovery_escalation_level == 2:
             # Try clicking in a grid pattern across the screen
             logger.info("Trying grid pattern clicks")
-            screen_width, screen_height = self.mouse_input.get_screen_dimensions()
+            screen_width, screen_height = self.mouse_controller.get_screen_dimensions()
             
             grid_size = 5
             for x_idx in range(grid_size):
@@ -219,9 +221,9 @@ class MenuRecovery:
                     x = int((x_idx + 0.5) * screen_width / grid_size)
                     y = int((y_idx + 0.5) * screen_height / grid_size)
                     
-                    self.mouse_input.move_to(x, y)
+                    self.mouse_controller.move_to(x, y)
                     time.sleep(0.1)
-                    self.mouse_input.click()
+                    self.mouse_controller.click()
                     time.sleep(0.2)
                     
                     # Check if we're out of the menu
@@ -238,11 +240,11 @@ class MenuRecovery:
             ]
             
             for mod_key, key in combinations:
-                self.keyboard_input.press_key(mod_key, hold=True)
+                self.keyboard_controller.press_key(mod_key, hold=True)
                 time.sleep(0.1)
-                self.keyboard_input.press_key(key)
+                self.keyboard_controller.press_key(key)
                 time.sleep(0.1)
-                self.keyboard_input.release_key(mod_key)
+                self.keyboard_controller.release_key(mod_key)
                 time.sleep(0.5)
                 
                 # Check if we're out of the menu
@@ -260,7 +262,7 @@ class MenuRecovery:
                 for key in ["escape", "enter", "space"]:
                     # Press key multiple times rapidly
                     for _ in range(5):
-                        self.keyboard_input.press_key(key)
+                        self.keyboard_controller.press_key(key)
                         time.sleep(0.1)
                     
                     # Check if we're out of the menu
@@ -270,20 +272,20 @@ class MenuRecovery:
                 
                 # As a last resort, try to click and drag in random directions
                 logger.warning("Trying random mouse movements")
-                screen_width, screen_height = self.mouse_input.get_screen_dimensions()
+                screen_width, screen_height = self.mouse_controller.get_screen_dimensions()
                 
                 start_x, start_y = screen_width // 2, screen_height // 2
-                self.mouse_input.move_to(start_x, start_y)
-                self.mouse_input.press_button()
+                self.mouse_controller.move_to(start_x, start_y)
+                self.mouse_controller.press_button()
                 
                 # Make random movements
                 for _ in range(10):
                     end_x = random.randint(0, screen_width)
                     end_y = random.randint(0, screen_height)
-                    self.mouse_input.move_to(end_x, end_y)
+                    self.mouse_controller.move_to(end_x, end_y)
                     time.sleep(0.1)
                 
-                self.mouse_input.release_button()
+                self.mouse_controller.release_button()
                 time.sleep(0.5)
                 
                 # Check if we're out of the menu
@@ -293,11 +295,11 @@ class MenuRecovery:
                 
                 # Absolute last resort
                 logger.critical("All recovery methods failed, attempting Alt+F4")
-                self.keyboard_input.press_key("alt", hold=True)
+                self.keyboard_controller.press_key("alt", hold=True)
                 time.sleep(0.1)
-                self.keyboard_input.press_key("f4")
+                self.keyboard_controller.press_key("f4")
                 time.sleep(0.1)
-                self.keyboard_input.release_key("alt")
+                self.keyboard_controller.release_key("alt")
                 
                 # This may close the game, but at least we're not stuck
             else:

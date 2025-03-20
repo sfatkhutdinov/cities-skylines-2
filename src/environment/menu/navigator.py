@@ -1,18 +1,19 @@
 """
-Menu navigation for Cities: Skylines 2 environment.
+Menu navigator for Cities: Skylines 2.
 
-This module provides functionality for navigating in-game menus.
+This module handles navigation within in-game menus.
 """
 
 import logging
 import time
-from typing import Dict, List, Tuple, Optional, Union, Any
 import numpy as np
+import cv2
+from typing import Dict, List, Tuple, Optional, Any
 
-from ..input.keyboard import KeyboardInput
-from ..input.mouse import MouseInput
+from src.environment.input.keyboard import KeyboardController
+from src.environment.input.mouse import MouseController
 from .detector import MenuDetector
-from ..optimized_capture import OptimizedScreenCapture
+from src.environment.core.observation import ObservationManager
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,9 @@ class MenuNavigator:
     
     def __init__(
         self,
-        screen_capture: OptimizedScreenCapture,
-        keyboard_input: KeyboardInput,
-        mouse_input: MouseInput,
+        observation_manager: ObservationManager,
+        keyboard_controller: KeyboardController,
+        mouse_controller: MouseController,
         menu_detector: MenuDetector,
         custom_button_positions: Optional[Dict[str, Tuple[float, float]]] = None,
         custom_menu_exit_paths: Optional[Dict[str, List[str]]] = None
@@ -57,16 +58,16 @@ class MenuNavigator:
         """Initialize menu navigator.
         
         Args:
-            screen_capture: Screen capture module
-            keyboard_input: Keyboard input module
-            mouse_input: Mouse input module
+            observation_manager: Observation manager for screen dimensions
+            keyboard_controller: Keyboard input module
+            mouse_controller: Mouse input module
             menu_detector: Menu detector module
             custom_button_positions: Optional custom button positions
             custom_menu_exit_paths: Optional custom menu exit paths
         """
-        self.screen_capture = screen_capture
-        self.keyboard_input = keyboard_input
-        self.mouse_input = mouse_input
+        self.observation_manager = observation_manager
+        self.keyboard_controller = keyboard_controller
+        self.mouse_controller = mouse_controller
         self.menu_detector = menu_detector
         
         # Copy the default button positions and update with any custom ones
@@ -106,7 +107,7 @@ class MenuNavigator:
         norm_x, norm_y = self.button_positions[button_name]
         
         # Get screen dimensions from screen_capture
-        screen_width, screen_height = self.screen_capture.get_screen_dimensions()
+        screen_width, screen_height = self.observation_manager.get_screen_dimensions()
         
         # Calculate pixel coordinates
         pixel_x = int(norm_x * screen_width)
@@ -122,9 +123,9 @@ class MenuNavigator:
         # Perform the click
         try:
             logger.info(f"Clicking button: {button_name} at ({pixel_x}, {pixel_y})")
-            self.mouse_input.move_to(pixel_x, pixel_y)
+            self.mouse_controller.move_to(pixel_x, pixel_y)
             time.sleep(0.1)  # Small delay to ensure move completes
-            self.mouse_input.click()
+            self.mouse_controller.click()
             self.last_click_time = time.time()
             return True
         except Exception as e:
@@ -207,7 +208,7 @@ class MenuNavigator:
             
             # Try escape key
             logger.info("Trying escape key")
-            self.keyboard_input.press_key("escape")
+            self.keyboard_controller.press_key("escape")
             time.sleep(0.5)
             
             # Check if we exited

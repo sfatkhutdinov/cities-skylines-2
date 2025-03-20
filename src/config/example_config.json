@@ -1,0 +1,70 @@
+{
+    "hardware": {
+        "use_gpu": true,
+        "use_cpu": false,
+        "use_mixed_precision": true,
+        "batch_size": 64,
+        "learning_rate": 0.0003,
+        "cpu_threads": 4,
+        "memory_limit": 8192
+    },
+    "environment": {
+        "frame_height": 240,
+        "frame_width": 320,
+        "max_steps": 1000,
+        "disable_menu_detection": false,
+        "game_path": "C:/Program Files/Steam/steamapps/common/Cities Skylines II/Cities2.exe",
+        "process_name": "Cities2",
+        "mock_settings": {
+            "crash_probability": 0.005,
+            "freeze_probability": 0.01,
+            "menu_probability": 0.02
+        },
+        "restart_attempts": 3,
+        "restart_timeout": 120
+    },
+    "model": {
+        "hidden_size": 256,
+        "num_layers": 3,
+        "activation": "relu",
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "clip_range": 0.2,
+        "max_grad_norm": 0.5,
+        "update_frequency": 512
+    },
+    "training": {
+        "num_episodes": 1000,
+        "max_steps": 1000,
+        "checkpoint_dir": "checkpoints",
+        "checkpoint_freq": 100,
+        "backup_checkpoints": 5,
+        "max_checkpoints": 10,
+        "autosave_interval": 15,
+        "max_disk_usage_gb": 5.0,
+        "use_wandb": false,
+        "wandb_project": "cities-skylines-rl",
+        "render": false,
+        "use_lr_scheduler": true,
+        "lr_step_size": 100,
+        "lr_gamma": 0.9
+    },
+    "logging": {
+        "log_dir": "logs",
+        "verbose": true,
+        "log_level": "INFO",
+        "log_to_console": true,
+        "log_hardware_metrics": true
+    },
+    "performance": {
+        "throttle_fps": 30,
+        "adaptive_batch_size": true,
+        "min_batch_size": 32,
+        "max_batch_size": 256,
+        "target_gpu_utilization": 0.8,
+        "target_memory_utilization": 0.8,
+        "max_cpu_percent": 90,
+        "max_gpu_percent": 95,
+        "max_memory_percent": 90
+    }
+} 

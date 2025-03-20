@@ -24,18 +24,33 @@ logger = logging.getLogger(__name__)
 class PPOAgent:
     """Proximal Policy Optimization agent for Cities: Skylines 2."""
     
-    def __init__(self, state_dim: tuple, action_dim: int, config: Optional[HardwareConfig] = None):
+    def __init__(
+        self, 
+        state_dim: tuple, 
+        action_dim: int, 
+        config: Optional[HardwareConfig] = None,
+        use_amp: bool = False
+    ):
         """Initialize the PPO agent.
         
         Args:
             state_dim: Dimensions of the state space (C, H, W)
             action_dim: Number of possible actions
             config: Hardware configuration
+            use_amp: Whether to use automatic mixed precision (FP16)
         """
         # Basic setup
         self.config = config or HardwareConfig()
         self.device = self.config.get_device()
         self.dtype = self.config.get_dtype()
+        
+        # Mixed precision setup
+        self.use_amp = use_amp and torch.cuda.is_available()
+        if self.use_amp:
+            logger.info("Using automatic mixed precision (FP16)")
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
         
         # State and action dimensions
         self.state_dim = state_dim
@@ -71,27 +86,37 @@ class PPOAgent:
         
         logger.info(f"Initialized PPO agent with state_dim={state_dim}, action_dim={action_dim}, device={self.device}")
     
-    def select_action(self, state: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def select_action(self, state, log_prob=None, value=None, deterministic: bool = False):
         """Select an action based on the current state.
         
         Args:
             state: Current observation
+            log_prob: Optional log probability of previous action (for continuation)
+            value: Optional value estimate (for continuation)
             deterministic: Whether to select action deterministically
             
         Returns:
-            Tuple containing:
-                - Selected action
-                - Info dictionary with additional data
+            Tuple containing (action, log_prob, value)
         """
         # Convert state to tensor if needed
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=self.dtype, device=self.device)
         
+        # Ensure state has correct shape
+        if len(state.shape) == 3:  # Add batch dimension if needed
+            state = state.unsqueeze(0)
+        
         # Store last state for continued episodes
         self.last_state = state
         
-        # Select action using policy
-        action, log_prob, info = self.policy.select_action(state, deterministic)
+        # Use automatic mixed precision for forward pass if enabled
+        if self.use_amp and self.training and torch.is_grad_enabled():
+            with torch.cuda.amp.autocast():
+                # Select action using policy
+                action, log_prob, info = self.policy.select_action(state, deterministic)
+        else:
+            # Select action using policy
+            action, log_prob, info = self.policy.select_action(state, deterministic)
         
         # Extract value from info
         value = info['value']
@@ -99,8 +124,8 @@ class PPOAgent:
         # Track steps
         self.steps_taken += 1
         
-        # Return action and info
-        return action, {'log_prob': log_prob, 'value': value, 'entropy': info['entropy']}
+        # Return action, log_prob, and value
+        return action.cpu().numpy().item(), log_prob, value
     
     def store_experience(self, state: torch.Tensor, 
                         action: torch.Tensor, 
@@ -133,45 +158,180 @@ class PPOAgent:
         if done:
             self.episodes_completed += 1
     
-    def update(self) -> Dict[str, float]:
+    def update(self, experiences: List) -> Dict[str, float]:
         """Update policy and value function.
         
+        Args:
+            experiences: List of experience tuples (state, action, reward, next_state, done, log_prob, value)
+            
         Returns:
             Dict with update statistics
         """
         if not self.training:
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+            return {'actor_loss': 0.0, 'critic_loss': 0.0, 'entropy': 0.0}
+            
+        # Process experiences
+        for exp in experiences:
+            state, action, reward, next_state, done, log_prob, value = exp
+            
+            # Store experience
+            info = {'log_prob': log_prob, 'value': value}
+            self.store_experience(state, action, reward, next_state, done, info)
             
         # Check if enough experiences are stored
         if self.memory.size() < self.updater.batch_size:
             logger.warning(f"Not enough experiences for update: {self.memory.size()} < {self.updater.batch_size}")
-            return {'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+            return {'actor_loss': 0.0, 'critic_loss': 0.0, 'entropy': 0.0}
             
-        # Compute returns and advantages if not already computed
-        self.memory.compute_returns_and_advantages(self.gamma, self.gae_lambda)
+        # Compute returns and advantages
+        self.memory.compute_returns(self.gamma, self.gae_lambda)
         
-        # Update policy and value function
-        update_stats = self.updater.update(self.memory)
-        
+        # If using mixed precision, update with gradient scaling
+        if self.use_amp:
+            # Update with mixed precision
+            with torch.cuda.amp.autocast():
+                # Run standard update through updater but with mixed precision
+                update_stats = self._update_with_amp()
+        else:
+            # Standard update
+            update_stats = self.updater.update(self.memory)
+            
         # Clear memory after update
         self.memory.clear()
         
-        # Update menu penalties
-        self.policy.decay_penalties()
-        
         return update_stats
     
+    def _update_with_amp(self) -> Dict[str, float]:
+        """Perform update with automatic mixed precision.
+        
+        Returns:
+            Dict with update statistics
+        """
+        # Initialize stats
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        num_updates = 0
+        
+        # Custom update loop similar to updater.update but with AMP
+        for epoch in range(self.updater.ppo_epochs):
+            # Get batch iterator
+            batch_iter = self.memory.get_batch_iterator(self.updater.batch_size, shuffle=True)
+            
+            # Process each batch
+            for batch in batch_iter:
+                # Extract batch data
+                states, actions, old_log_probs, returns, advantages, old_values = batch
+                
+                # Forward pass with autocast
+                with torch.cuda.amp.autocast():
+                    # Get action distributions and values
+                    action_dists, values = self.network(states)
+                    
+                    # Calculate new log probs
+                    new_log_probs = action_dists.log_prob(actions)
+                    
+                    # Calculate policy loss (clipped PPO objective)
+                    ratio = torch.exp(new_log_probs - old_log_probs)
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.updater.clip_param, 1.0 + self.updater.clip_param) * advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Calculate value loss (clipped)
+                    value_pred_clipped = old_values + torch.clamp(values - old_values, -self.updater.clip_param, self.updater.clip_param)
+                    value_loss_unclipped = (values - returns) ** 2
+                    value_loss_clipped = (value_pred_clipped - returns) ** 2
+                    value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+                    
+                    # Calculate entropy bonus
+                    entropy = action_dists.entropy().mean()
+                    
+                    # Calculate total loss
+                    loss = policy_loss + self.updater.value_coef * value_loss - self.updater.entropy_coef * entropy
+                
+                # Zero gradients
+                self.updater.optimizer.zero_grad()
+                
+                # Backward pass with scaler
+                self.scaler.scale(loss).backward()
+                
+                # Clip gradients using scaler
+                self.scaler.unscale_(self.updater.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.updater.max_grad_norm)
+                
+                # Step optimizer with scaler
+                self.scaler.step(self.updater.optimizer)
+                
+                # Update scaler
+                self.scaler.update()
+                
+                # Update stats
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+                num_updates += 1
+        
+        # Calculate average stats
+        if num_updates > 0:
+            avg_policy_loss = total_policy_loss / num_updates
+            avg_value_loss = total_value_loss / num_updates
+            avg_entropy = total_entropy / num_updates
+        else:
+            avg_policy_loss = 0.0
+            avg_value_loss = 0.0
+            avg_entropy = 0.0
+        
+        return {
+            'actor_loss': avg_policy_loss,
+            'critic_loss': avg_value_loss,
+            'entropy': avg_entropy
+        }
+            
     def set_training(self, training: bool) -> None:
         """Set agent to training or evaluation mode.
         
         Args:
-            training: Whether to enable training mode
+            training: Whether agent should be in training mode
         """
         self.training = training
+        
+        # Set network mode
         if training:
             self.network.train()
         else:
             self.network.eval()
+            
+        logger.debug(f"Set agent to {'training' if training else 'evaluation'} mode")
+    
+    def train(self) -> None:
+        """Set agent to training mode."""
+        self.set_training(True)
+    
+    def eval(self) -> None:
+        """Set agent to evaluation mode."""
+        self.set_training(False)
+    
+    def to(self, device: Union[str, torch.device]) -> 'PPOAgent':
+        """Move agent to specified device.
+        
+        Args:
+            device: Device to move agent to
+            
+        Returns:
+            Self for chaining
+        """
+        self.device = torch.device(device)
+        
+        # Move network to device
+        self.network.to(self.device)
+        
+        # Update components with new device
+        self.policy.device = self.device
+        self.value_function.device = self.device
+        self.memory.device = self.device
+        self.updater.device = self.device
+        
+        return self
     
     def register_menu_action(self, action_idx: int, penalty: float = 0.5) -> None:
         """Register an action as a menu action to be penalized.
