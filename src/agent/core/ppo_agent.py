@@ -471,20 +471,38 @@ class PPOAgent:
         """Get agent statistics.
         
         Returns:
-            Dict with agent statistics
+            Dict[str, Any]: Dictionary of statistics
         """
         return {
             'steps_taken': self.steps_taken,
             'episodes_completed': self.episodes_completed,
-            'learning_rate': self.updater.get_learning_rate(),
-            'memory_size': self.memory.size(),
-            **self.memory.get_episode_stats()
+            'memory_size': len(self.memory) if hasattr(self.memory, '__len__') else 0,
+            'device': str(self.device)
         }
     
     def parameters(self):
-        """Get model parameters for optimization.
+        """Get network parameters for optimization.
         
         Returns:
-            Model parameters
+            Parameters of the neural network
         """
-        return self.network.parameters() 
+        return self.network.parameters()
+        
+    def state_dict(self) -> Dict[str, Any]:
+        """Get state dictionary for checkpointing.
+        
+        Returns:
+            Dict[str, Any]: State dictionary
+        """
+        return {
+            'network': self.network.state_dict(),
+            'policy': self.policy.state_dict(),
+            'value_function': self.value_function.state_dict(),
+            'updater': self.updater.state_dict(),
+            'gamma': self.gamma,
+            'gae_lambda': self.gae_lambda,
+            'state_dim': self.state_dim,
+            'action_dim': self.action_dim,
+            'steps_taken': self.steps_taken,
+            'episodes_completed': self.episodes_completed
+        } 

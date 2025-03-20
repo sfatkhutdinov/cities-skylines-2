@@ -248,11 +248,50 @@ class CheckpointManager:
         Returns:
             Whether to perform an autosave
         """
-        minutes_since_autosave = (time.time() - self.last_autosave_time) / 60
-        if minutes_since_autosave >= self.autosave_interval:
-            self.last_autosave_time = time.time()
-            return True
-        return False
+        if self.autosave_interval <= 0:
+            return False
+            
+        elapsed = time.time() - self.last_autosave_time
+        return elapsed >= self.autosave_interval * 60  # Convert minutes to seconds
+    
+    def get_checkpoint_path(self, episode: int) -> Optional[Path]:
+        """Get the path to a checkpoint for a specific episode.
+        
+        Args:
+            episode: Episode number to find checkpoint for
+            
+        Returns:
+            Path to checkpoint or None if not found
+        """
+        if not self.checkpoint_dir.exists() or not self.checkpoint_dir.is_dir():
+            return None
+            
+        # Try exact match first
+        exact_match = list(self.checkpoint_dir.glob(f"checkpoint_{episode}_*.pt"))
+        if exact_match:
+            return exact_match[0]
+            
+        # Try finding closest episode number if exact match not found
+        checkpoint_files = list(self.checkpoint_dir.glob("checkpoint_*.pt"))
+        if not checkpoint_files:
+            return None
+            
+        # Parse episode numbers
+        episodes = []
+        for cp_file in checkpoint_files:
+            try:
+                ep = int(cp_file.stem.split('_')[1])
+                episodes.append((ep, cp_file))
+            except (IndexError, ValueError):
+                continue
+                
+        if not episodes:
+            return None
+            
+        # Find closest episode number
+        closest_ep, closest_file = min(episodes, key=lambda x: abs(x[0] - episode))
+        logger.debug(f"Found closest checkpoint at episode {closest_ep}: {closest_file}")
+        return closest_file
     
     def _cleanup_old_checkpoints(self):
         """Remove old checkpoints to prevent disk space issues."""
