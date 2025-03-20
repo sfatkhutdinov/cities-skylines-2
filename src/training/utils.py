@@ -170,6 +170,37 @@ def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None
     if config_loader:
         env_config = config_loader.get_section('environment')
     
+    # Create a wrapper class for HardwareConfig that adds a 'get' method
+    class ConfigWrapper:
+        def __init__(self, hardware_config, env_config):
+            self.hardware_config = hardware_config
+            self.env_config = env_config
+            
+            # Create a dictionary mapping section names to their contents
+            self.sections = {
+                'hardware': hardware_config.to_dict(),
+                'capture': env_config.get('capture', {}),
+                'metrics': env_config.get('metrics', {}),
+                'input': env_config.get('input', {}),
+                'detection': env_config.get('detection', {})
+            }
+        
+        def get(self, section, default=None):
+            """Get a configuration section by name.
+            
+            Args:
+                section: Section name
+                default: Default value if section is not found
+                
+            Returns:
+                Section contents or default value
+            """
+            return self.sections.get(section, default)
+            
+        # Forward all other hardware config methods
+        def __getattr__(self, name):
+            return getattr(self.hardware_config, name)
+    
     # Use mock environment if requested
     if args.mock_env:
         logger.info("Using mock environment for testing")
@@ -181,12 +212,17 @@ def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None
             'freeze_probability': env_config.get('freeze_probability', 0.01),
             'menu_probability': env_config.get('menu_probability', 0.02)
         }
-        return MockEnvironment(config=config, **mock_env_params)
+        wrapped_config = ConfigWrapper(config, env_config)
+        return MockEnvironment(config=wrapped_config, **mock_env_params)
     
     # Create real environment
     logger.info("Setting up real game environment")
+    
+    # Create a wrapped config that has both HardwareConfig methods and a 'get' method
+    wrapped_config = ConfigWrapper(config, env_config)
+    
     env = Environment(
-        config=config,
+        config=wrapped_config,
         disable_menu_detection=args.disable_menu_detection,
         **env_config
     )

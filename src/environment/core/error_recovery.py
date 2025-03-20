@@ -114,68 +114,145 @@ class ErrorRecovery:
         
         return False
     
-    def restart_game(self) -> bool:
-        """Attempt to restart the game.
+    def focus_game_window(self) -> bool:
+        """Explicitly focus the game window.
         
         Returns:
-            bool: True if restart successful, False otherwise
+            bool: True if successful, False otherwise
         """
-        # Check if we've exceeded the maximum restart attempts
-        if self.restart_attempts >= self.max_restart_attempts:
-            logger.error(f"Maximum restart attempts ({self.max_restart_attempts}) exceeded")
+        # Try to import Windows-specific libraries
+        try:
+            import win32gui
+            import win32con
+        except ImportError:
+            logger.warning("Win32 libraries not available for window focusing")
             return False
+            
+        try:
+            # Find the game window
+            hwnd = win32gui.FindWindow(None, self.process_name)
+            if hwnd == 0:
+                # Try partial match if exact name not found
+                def callback(hwnd, windows):
+                    window_title = win32gui.GetWindowText(hwnd)
+                    if self.process_name in window_title or "Cities: Skylines II" in window_title:
+                        windows.append(hwnd)
+                    return True
+                    
+                windows = []
+                win32gui.EnumWindows(callback, windows)
+                
+                if windows:
+                    hwnd = windows[0]
+            
+            if hwnd == 0:
+                logger.warning(f"Game window '{self.process_name}' not found")
+                return False
+                
+            # Check if window is minimized
+            if win32gui.IsIconic(hwnd):
+                # Show the window if it's minimized
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                
+            # Check if window is already in foreground
+            foreground_hwnd = win32gui.GetForegroundWindow()
+            if foreground_hwnd == hwnd:
+                logger.debug("Game window is already in focus")
+                return True
+                
+            # Set window as foreground window
+            result = win32gui.SetForegroundWindow(hwnd)
+            
+            # Try setting focus too as a fallback
+            try:
+                win32gui.SetFocus(hwnd)
+            except Exception:
+                pass
+                
+            logger.info(f"Set game window to foreground manually (result: {result})")
+            
+            # Give OS time to process the focus change
+            time.sleep(0.5)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to focus game window: {e}")
+            return False
+    
+    def restart_game(self) -> bool:
+        """Restart the game process.
         
-        # Increment restart counters
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if self.restart_attempts >= self.max_restart_attempts:
+            logger.error(f"Maximum restart attempts ({self.max_restart_attempts}) reached")
+            return False
+            
         self.restart_attempts += 1
         self.total_restarts += 1
         self.last_restart_time = time.time()
         
-        # Log restart attempt
+        # Track error
+        self.error_history.append({
+            'timestamp': self.last_restart_time,
+            'type': 'restart',
+            'attempt': self.restart_attempts
+        })
+            
         logger.warning(f"Attempting to restart game (attempt {self.restart_attempts}/{self.max_restart_attempts})")
         
-        # Call pre-restart callback if defined
-        if self.pre_restart_callback:
-            try:
-                self.pre_restart_callback()
-            except Exception as e:
-                logger.error(f"Error in pre-restart callback: {e}")
-        
-        # Kill any existing game processes
-        self._kill_game_processes()
-        
-        # Start the game
-        success = self._start_game()
-        
-        if success:
-            # Reset freeze counter
-            self.freeze_count = 0
-            self.last_observation = None
-            self.restart_attempts = 0  # Reset on successful restart
+        try:
+            # Call pre-restart callback if registered
+            if hasattr(self, 'pre_restart_callback') and self.pre_restart_callback:
+                try:
+                    self.pre_restart_callback()
+                except Exception as e:
+                    logger.error(f"Error in pre-restart callback: {e}")
             
-            # Call post-restart callback if defined
-            if self.post_restart_callback:
+            # Kill any existing game processes
+            self._kill_game_processes()
+            
+            # Start the game
+            if not self._start_game():
+                logger.error("Failed to start game")
+                return False
+                
+            # Wait for the game to initialize
+            logger.info(f"Waiting for game to initialize (timeout: {self.timeout_seconds}s)")
+            start_time = time.time()
+            
+            # Give game time to start
+            time.sleep(10)
+            
+            # Try to find and focus the game window
+            self.focus_game_window()
+            
+            # Wait a bit more for game to be fully initialized
+            time.sleep(5)
+            
+            # Check if game is running
+            if not self.check_game_running():
+                logger.error("Game failed to start")
+                return False
+                
+            # Call post-restart callback if registered
+            if hasattr(self, 'post_restart_callback') and self.post_restart_callback:
                 try:
                     self.post_restart_callback()
                 except Exception as e:
                     logger.error(f"Error in post-restart callback: {e}")
-                    
-            # Record successful restart
-            self.error_history.append({
-                'time': time.time(),
-                'type': 'restart',
-                'success': True,
-                'attempts': self.restart_attempts
-            })
-        else:
-            # Record failed restart
-            self.error_history.append({
-                'time': time.time(),
-                'type': 'restart',
-                'success': False,
-                'attempts': self.restart_attempts
-            })
-        
-        return success
+            
+            # Reset restart attempts on successful restart
+            self.restart_attempts = 0
+            logger.info("Game successfully restarted")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during game restart: {e}")
+            return False
     
     def handle_menu_detection(self) -> bool:
         """Handle menu detection and navigation.

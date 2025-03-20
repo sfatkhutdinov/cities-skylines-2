@@ -210,4 +210,12 @@ class ActionSpace:
             return f"Set game speed to {speed_name.get(speed, f'{speed:.1f}')}"
             
         else:
-            return f"Unknown action type: {action_type}" 
+            return f"Unknown action type: {action_type}"
+
+    def get_num_actions(self) -> int:
+        """Get the number of possible actions.
+        
+        Returns:
+            int: Number of actions
+        """
+        return self.num_actions 

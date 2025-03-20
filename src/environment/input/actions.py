@@ -458,15 +458,11 @@ class InputSimulator:
         """
         # Create keyboard controller
         from .keyboard import KeyboardController
-        self.keyboard_controller = KeyboardController(
-            config=input_config.get('keyboard', {})
-        )
+        self.keyboard_controller = KeyboardController()
         
         # Create mouse controller
         from .mouse import MouseController
-        self.mouse_controller = MouseController(
-            config=input_config.get('mouse', {})
-        )
+        self.mouse_controller = MouseController()
         
         # Create action executor
         self.action_executor = ActionExecutor(

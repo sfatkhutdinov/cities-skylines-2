@@ -22,7 +22,7 @@ from src.environment.core.error_recovery import ErrorRecovery
 # Import from other modules that we've already modularized
 from src.environment.rewards.reward_system import AutonomousRewardSystem
 from src.environment.menu.menu_handler import MenuHandler
-from src.environment.input.actions import ActionExecutor
+from src.environment.input.actions import InputSimulator
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class Environment:
         
         # Initialize the core components
         self.observation_manager = ObservationManager(config=self.config, mock_mode=mock_mode)
-        self.action_space = ActionSpace(observation_manager=self.observation_manager)
+        self._action_space_manager = ActionSpace(observation_manager=self.observation_manager)
         self.game_state = GameState()
         self.performance_monitor = PerformanceMonitor(config=self.config)
         
@@ -71,19 +71,22 @@ class Environment:
         self.visual_metrics = self.observation_manager.visual_metrics
         
         # Initialize the input system
-        self.action_executor = ActionExecutor(
-            screen_capture=self.screen_capture,
-            config=self.config
-        )
+        input_simulator = InputSimulator(config=self.config)
+        
+        # Get action executor from input simulator
+        self.action_executor = input_simulator.get_action_executor()
         
         # Initialize menu handler if not disabled
         self.menu_handler = None
         if not disable_menu_detection:
+            # If menu_screenshot_path is None, use a default path
+            templates_dir = menu_screenshot_path or "menu_templates"
+            
             self.menu_handler = MenuHandler(
-                screen_capture=self.screen_capture,
-                input_simulator=self.action_executor.input_simulator,
-                visual_metrics=self.visual_metrics,
-                menu_screenshot_path=menu_screenshot_path
+                observation_manager=self.observation_manager,
+                input_simulator=input_simulator,
+                performance_monitor=self.performance_monitor,
+                templates_dir=templates_dir
             )
             # Link menu handler to other components
             self.screen_capture.menu_handler = self.menu_handler
@@ -92,7 +95,7 @@ class Environment:
         self.error_recovery = ErrorRecovery(
             process_name=self.process_name,
             game_path=self.game_path,
-            input_simulator=self.action_executor.input_simulator if hasattr(self.action_executor, 'input_simulator') else None,
+            input_simulator=input_simulator,
             max_restart_attempts=kwargs.get('restart_attempts', 3),
             timeout_seconds=kwargs.get('restart_timeout', 120)
         )
@@ -120,7 +123,37 @@ class Environment:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5  # Maximum number of consecutive errors before giving up
         
+        # Create OpenAI gym-compatible observation and action spaces
+        from gymnasium.spaces import Box, Discrete
+        self._observation_space = Box(
+            low=0, high=255, 
+            shape=self.observation_manager.get_observation_shape(), 
+            dtype=np.uint8
+        )
+        
+        # Use a different name for the action space property 
+        # to avoid conflict with the ActionSpace instance
+        self._gym_action_space = Discrete(self._action_space_manager.get_num_actions())
+        
         logger.info("Environment initialized successfully.")
+    
+    @property
+    def observation_space(self):
+        """Get the observation space for use with RL algorithms.
+        
+        Returns:
+            gym.spaces.Box: Observation space
+        """
+        return self._observation_space
+    
+    @property
+    def action_space(self):
+        """Get the action space for use with RL algorithms.
+        
+        Returns:
+            gym.spaces.Discrete: Action space
+        """
+        return self._gym_action_space
     
     def reset(self) -> torch.Tensor:
         """Reset the environment and return the initial observation.
@@ -162,7 +195,7 @@ class Environment:
             Tuple: (observation, reward, done, info)
         """
         # Get action info from action space
-        action_info = self.action_space.get_action(action_idx)
+        action_info = self._action_space_manager.get_action(action_idx)
         
         # Update step counter
         self.steps_taken += 1
@@ -180,6 +213,9 @@ class Environment:
                 'action': action_idx
             }
             return observation, reward, done, info
+        
+        # Ensure game window is focused before interacting with it
+        self._ensure_window_focused()
         
         # Check if we're in a menu
         menu_detected = False
@@ -428,4 +464,10 @@ class Environment:
                 time.sleep(2)
                 
         logger.error(f"Game did not become responsive within {timeout} seconds")
-        raise TimeoutError(f"Game startup timeout after {timeout} seconds") 
+        raise TimeoutError(f"Game startup timeout after {timeout} seconds")
+
+    def _ensure_window_focused(self):
+        """Ensure the game window is focused before taking actions."""
+        if not self.mock_mode and hasattr(self.screen_capture, 'focus_game_window'):
+            return self.screen_capture.focus_game_window()
+        return True 

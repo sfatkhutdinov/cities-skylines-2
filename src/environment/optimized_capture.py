@@ -126,8 +126,13 @@ class OptimizedScreenCapture:
                 
                 self.client_position = (left_screen, top_screen, right_screen, bottom_screen)
                 logger.info(f"Found game window: {self.client_position}")
+                
+                # Focus the window
+                self.game_hwnd = hwnd
+                self.focus_game_window()
             else:
                 logger.warning(f"Game window '{self.window_title}' not found")
+                self.game_hwnd = None
                 # Fallback to primary monitor
                 monitor = self.sct.monitors[1]  # Primary monitor
                 self.client_position = (
@@ -138,6 +143,7 @@ class OptimizedScreenCapture:
                 
         except Exception as e:
             logger.error(f"Error finding game window: {e}")
+            self.game_hwnd = None
             # Fallback to primary monitor
             monitor = self.sct.monitors[1]  # Primary monitor
             self.client_position = (
@@ -145,6 +151,44 @@ class OptimizedScreenCapture:
                 monitor["left"] + monitor["width"],
                 monitor["top"] + monitor["height"]
             )
+    
+    def focus_game_window(self):
+        """Bring the game window to the foreground."""
+        if not WIN32_AVAILABLE or not hasattr(self, 'game_hwnd') or self.game_hwnd is None:
+            logger.warning("Cannot focus game window - window handle not available")
+            return False
+            
+        try:
+            # Check if window is minimized
+            if win32gui.IsIconic(self.game_hwnd):
+                # Show the window if it's minimized
+                win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                
+            # Check if window is already in foreground
+            foreground_hwnd = win32gui.GetForegroundWindow()
+            if foreground_hwnd == self.game_hwnd:
+                logger.debug("Game window is already in focus")
+                return True
+                
+            # Set window as foreground window
+            result = win32gui.SetForegroundWindow(self.game_hwnd)
+            
+            # Try setting focus too as a fallback
+            try:
+                win32gui.SetFocus(self.game_hwnd)
+            except Exception:
+                pass
+                
+            logger.info(f"Set game window to foreground (result: {result})")
+            
+            # Give OS time to process the focus change
+            time.sleep(0.5)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to focus game window: {e}")
+            return False
     
     def capture_frame(self) -> Optional[np.ndarray]:
         """Capture a frame from the screen.
@@ -162,6 +206,13 @@ class OptimizedScreenCapture:
             return None
             
         try:
+            # Ensure game window is in focus before capturing
+            if hasattr(self, 'game_hwnd') and self.game_hwnd and WIN32_AVAILABLE:
+                foreground_hwnd = win32gui.GetForegroundWindow()
+                if foreground_hwnd != self.game_hwnd:
+                    logger.warning("Game window not in focus, attempting to refocus")
+                    self.focus_game_window()
+            
             # Throttle capture rate to target FPS
             current_time = time.time()
             elapsed = current_time - self.last_capture_time

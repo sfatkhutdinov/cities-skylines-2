@@ -49,10 +49,12 @@ class ObservationManager:
         # Frame history
         self.frame_history = deque(maxlen=frame_history_length)
         
-        # Frame processing parameters
-        self.target_resolution = (84, 84)  # Standard resolution for CNNs in RL
+        # Default target resolution for processed frames
+        self.target_resolution = (84, 84)  # Width, height
+        
+        # Processing options
+        self.grayscale = True
         self.normalize = True
-        self.grayscale = False
         
         # Capture timing
         self.last_capture_time = time.time()
@@ -203,4 +205,13 @@ class ObservationManager:
         """Clean up resources."""
         if hasattr(self, 'screen_capture') and self.screen_capture:
             self.screen_capture.close()
-        self.frame_history.clear() 
+        self.frame_history.clear()
+    
+    def get_observation_shape(self) -> Tuple[int, int, int]:
+        """Get the shape of observations.
+        
+        Returns:
+            Tuple[int, int, int]: Shape of observations (channels, height, width)
+        """
+        channels = 1 if self.grayscale else 3
+        return (channels, self.target_resolution[1], self.target_resolution[0]) 
