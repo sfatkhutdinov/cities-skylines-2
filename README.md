@@ -15,9 +15,10 @@ The project uses a deep reinforcement learning approach with the following compo
 - **Environment (src/environment/game_env.py)**: Captures game state through screen capture, processes observations, and manages interactions with the game.
 - **Agent (src/agent/ppo_agent.py)**: Implements the PPO (Proximal Policy Optimization) reinforcement learning algorithm.
 - **Model (src/model/optimized_network.py)**: Neural network architecture for policy and value functions.
-- **Input Simulation (src/environment/input_simulator.py)**: Simulates keyboard and mouse inputs to control the game.
-- **Reward System (src/environment/autonomous_reward_system.py)**: Computes rewards based solely on visual changes in the environment.
-- **Menu Handler (src/environment/menu_handler.py)**: Detects and handles in-game menus automatically.
+- **Menu Management (src/environment/menu/)**: Detects and handles in-game menus automatically.
+- **Input Simulation (src/environment/input/)**: Simulates keyboard and mouse inputs to control the game.
+- **Reward System (src/environment/rewards/)**: Computes rewards based solely on visual changes in the environment.
+- **Training Module (src/training/)**: Manages the training process, checkpoints, and signal handling.
 
 ### Training Infrastructure
 
@@ -122,10 +123,19 @@ This agent strictly adheres to the following principles:
 ├── logs/              # Training logs
 ├── src/
 │   ├── agent/         # Reinforcement learning implementation
+│   │   └── core/      # Core agent functionality
 │   ├── config/        # Configuration settings
 │   ├── environment/   # Game environment and interaction
+│   │   ├── core/      # Core environment functionality
+│   │   ├── input/     # Input simulation (keyboard, mouse, actions)
+│   │   ├── menu/      # Menu detection and handling
+│   │   └── rewards/   # Reward computation and analysis
 │   ├── model/         # Neural network architecture
-│   ├── utils/         # Helper utilities
+│   ├── training/      # Training infrastructure
+│   │   ├── checkpointing.py  # Checkpoint management
+│   │   ├── signal_handlers.py # Signal handling for graceful shutdown
+│   │   ├── trainer.py  # Training loop implementation
+│   │   └── utils.py    # Training utilities
 │   └── train.py       # Main training script
 ├── venv/              # Virtual environment
 ├── requirements.txt   # Project dependencies
