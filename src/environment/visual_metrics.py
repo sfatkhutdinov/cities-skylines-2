@@ -190,6 +190,12 @@ class VisualMetricsEstimator:
             else:
                 frame_np = frame_np.astype(np.uint8)
         
+        # Check for version string in bottom left (reliable menu indicator)
+        version_string_detected = self.detect_version_string(frame_np)
+        if version_string_detected:
+            logger.debug("Menu detected by version string in bottom left")
+            return True
+            
         # First try color-based detection with the specific menu colors
         if len(frame_np.shape) == 3 and frame_np.shape[2] == 3:
             is_menu_by_color = self.detect_menu_by_colors(frame_np)
@@ -323,87 +329,60 @@ class VisualMetricsEstimator:
         
         return is_menu
         
-    def detect_main_menu(self, frame: torch.Tensor) -> bool:
-        """Detect if the game is showing a menu.
+    def detect_main_menu(self, frame: np.ndarray) -> bool:
+        """Detect if the frame shows the main menu.
         
         Args:
-            frame (torch.Tensor): Current frame
+            frame: Input frame
             
         Returns:
-            bool: True if menu detected, False otherwise
+            bool: True if main menu detected
         """
-        # Validate input
-        if frame is None:
-            return False
-            
-        # Convert frame to numpy for OpenCV processing
-        if isinstance(frame, torch.Tensor):
-            # Move to CPU and convert to numpy array
-            frame_np = frame.detach().cpu().numpy()
-            
-            # Convert from PyTorch's CHW format to HWC format for OpenCV
-            if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:
-                frame_np = frame_np.transpose(1, 2, 0)  # CHW to HWC
-                
-            # Ensure proper scale (0-255 for OpenCV)
-            if frame_np.max() <= 1.0:
-                frame_np = (frame_np * 255).astype(np.uint8)
-        else:
-            frame_np = frame
-            
-        # Ensure frame is valid
-        if frame_np is None or len(frame_np.shape) < 2:
-            logger.warning("Invalid frame for menu detection")
-            return False
-            
-        # Try primary method (template matching if available)
-        if self.menu_reference is not None and self.menu_detection_initialized:
-            try:
-                # Use template matching for most reliable detection
-                return self._detect_menu_template_matching(frame_np)
-            except Exception as e:
-                logger.warning(f"Error in template matching menu detection: {e}")
-                # Fall through to secondary methods
-        
-        # Secondary methods (combined approach)
         try:
-            # Use multiple detection methods and combine results for robustness
-            methods_results = []
-            
-            # Method 1: Color distribution heuristics
-            color_result = self._detect_menu_by_color(frame_np)
-            methods_results.append(color_result)
-            
-            # Method 2: Edge detection for UI elements
-            edge_result = self._detect_menu_by_edges(frame_np)
-            methods_results.append(edge_result)
-            
-            # Method 3: Feature-based detection (if enabled)
-            if hasattr(self, 'resume_button_template') and self.resume_button_template is not None:
-                button_result = self._detect_resume_button(frame_np)
-                methods_results.append(button_result)
-                
-            # Decision based on multiple methods - more weight to reliable methods
-            if color_result and edge_result:  # Both primary methods agree
-                return True
-            if button_result:  # Direct button detection is highly reliable
-                return True
-            if sum(methods_results) >= 2:  # At least 2 methods agree
-                return True
-                
-            return False
-        except Exception as e:
-            logger.error(f"Error in combined menu detection: {e}")
-            
-            # Last resort fallback: simple color histogram analysis
-            try:
-                return self._detect_menu_fallback(frame_np)
-            except Exception:
-                # Ultimate fallback - conservative (don't falsely detect menus)
+            # Ensure frame is in proper format
+            if frame is None or frame.size == 0:
                 return False
-                
-    def _detect_menu_template_matching(self, frame_np: np.ndarray) -> bool:
-        """Detect menu using template matching with reference screenshot.
+            
+            # Convert to numpy if it's a tensor
+            if hasattr(frame, 'cpu') and hasattr(frame, 'numpy'):
+                frame = frame.detach().cpu().numpy()
+            
+            # Convert float32 (0-1) to uint8 (0-255) if needed
+            if frame.dtype == np.float32:
+                frame = (frame * 255).astype(np.uint8)
+            
+            # Ensure frame has proper shape
+            if len(frame.shape) != 3 or frame.shape[2] != 3:
+                if len(frame.shape) == 3:
+                    # Handle channels first format
+                    if frame.shape[0] == 3:
+                        frame = frame.transpose(1, 2, 0)
+                    else:
+                        logger.error(f"Error in main menu detection: Invalid shape {frame.shape}")
+                        return False
+                else:
+                    logger.error(f"Error in main menu detection: Invalid dimension {len(frame.shape)}")
+                    return False
+            
+            # Use the menu detector if initialized
+            if self.menu_detection_initialized:
+                if hasattr(self, 'menu_flann') and self.menu_desc is not None:
+                    # Convert to grayscale for feature matching
+                    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                    return self._match_menu_features(gray)
+                else:
+                    # Use fallback detection methods
+                    return self.detect_menu_fallback(frame)
+            else:
+                # Initialize menu detection on first use
+                self.setup_fallback_menu_detection()
+                return self.detect_menu_fallback(frame)
+        except Exception as e:
+            logger.error(f"Error in main menu detection: {e}")
+            return False
+        
+    def _match_menu_features(self, frame_np: np.ndarray) -> bool:
+        """Detect menu using feature matching with reference screenshot.
         
         Args:
             frame_np (np.ndarray): Current frame as numpy array
@@ -460,7 +439,7 @@ class VisualMetricsEstimator:
                 logger.error(f"Template matching fallback also failed: {e2}")
                 return False
                 
-    def _detect_menu_by_color(self, frame_np: np.ndarray) -> bool:
+    def detect_menu_by_colors(self, frame_np: np.ndarray) -> bool:
         """Detect potential menu screens by analyzing general UI patterns.
         
         Instead of using specific color values from CS2, this method looks for general
@@ -680,265 +659,26 @@ class VisualMetricsEstimator:
         # The actual rewards come from the autonomous reward system
         return 0.01 
 
-    def detect_menu_by_colors(self, frame_np: np.ndarray) -> bool:
-        """Detect potential menu screens by analyzing general UI patterns.
-        
-        Instead of using specific color values from CS2, this method looks for general
-        UI patterns that might indicate a menu:
-        - Large areas of uniform color (menu backgrounds)
-        - High contrast text regions
-        - Regular grid/alignment patterns
+    def get_visual_change_score(self, frame: np.ndarray) -> float:
+        """Get visual change score for a frame.
         
         Args:
-            frame_np (np.ndarray): Input frame as numpy array in HWC format
+            frame: Input frame
             
         Returns:
-            bool: True if menu-like UI detected, False otherwise
+            float: Visual change score (higher = more change)
         """
         try:
-            # Ensure frame is in BGR format for OpenCV
-            frame_bgr = frame_np.astype(np.uint8)
-            if frame_bgr.shape[2] != 3:
-                return False
-                
-            # Convert to grayscale for analysis
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            if self.visual_change_analyzer is None:
+                return 0.0
             
-            # 1. Check for large areas of uniform color (common in menus)
-            # Apply slight blur to remove noise
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Calculate standard deviation in regions - low std dev = uniform areas
-            regions_y, regions_x = 4, 4
-            height, width = gray.shape
-            region_h, region_w = height // regions_y, width // regions_x
-            
-            uniform_regions = 0
-            for y in range(regions_y):
-                for x in range(regions_x):
-                    region = blurred[y*region_h:(y+1)*region_h, x*region_w:(x+1)*region_w]
-                    std_dev = np.std(region)
-                    if std_dev < 20:  # Low standard deviation = uniform color
-                        uniform_regions += 1
-            
-            # 2. Look for text-like high contrast regions
-            # Apply edge detection
-            edges = cv2.Canny(gray, 50, 150)
-            edge_density = np.sum(edges > 0) / (height * width)
-            
-            # 3. Check for aligned elements (common in menus)
-            # Detect horizontal and vertical lines
-            horizontal_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=width//5, maxLineGap=20)
-            vertical_lines = cv2.HoughLinesP(edges, 1, np.pi/2, 50, minLineLength=height//5, maxLineGap=20)
-            
-            has_aligned_elements = (horizontal_lines is not None and len(horizontal_lines) > 2) or \
-                                  (vertical_lines is not None and len(vertical_lines) > 2)
-            
-            # Combine features to detect menu-like patterns
-            uniform_ratio = uniform_regions / (regions_x * regions_y)
-            is_menu_like = (uniform_ratio > 0.3 and edge_density > 0.05) or \
-                          (uniform_ratio > 0.2 and has_aligned_elements)
-            
-            return is_menu_like
-            
+            # Calculate visual change score using the analyzer
+            # The VisualChangeAnalyzer may compare with previous frames
+            return self.visual_change_analyzer.get_change_score(frame)
         except Exception as e:
-            logger.error(f"Error in menu color detection: {e}")
-            return False
-
-    def find_resume_game_button(self, frame_np: np.ndarray) -> Tuple[bool, Tuple[int, int]]:
-        """Find the 'RESUME GAME' button in the frame using multiple detection methods.
-        
-        Args:
-            frame_np (np.ndarray): Input frame as numpy array in HWC format
-            
-        Returns:
-            Tuple[bool, Tuple[int, int]]: Success flag and button coordinates (x, y)
-        """
-        try:
-            if frame_np is None or frame_np.size == 0:
-                return False, (0, 0)
-                
-            # Ensure frame is in proper format for processing
-            frame = frame_np.astype(np.uint8)
-            height, width = frame.shape[:2]
-            
-            # 1. Method: Look for white text in the expected button region
-            # Convert to grayscale for text detection
-            if len(frame.shape) == 3:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = frame
-                
-            # Define regions where "RESUME GAME" might appear (multiple candidates)
-            candidate_regions = [
-                # Center region - most common location
-                (int(width*0.35), int(height*0.3), int(width*0.65), int(height*0.5)),
-                # Lower center region - alternative location
-                (int(width*0.35), int(height*0.5), int(width*0.65), int(height*0.7)),
-                # Upper center region - another possibility
-                (int(width*0.35), int(height*0.2), int(width*0.65), int(height*0.4))
-            ]
-            
-            # Check each candidate region
-            for x1, y1, x2, y2 in candidate_regions:
-                region = gray[y1:y2, x1:x2]
-                if region.size == 0:
-                    continue
-                    
-                # Apply binary thresholding to isolate white text
-                _, binary = cv2.threshold(region, 200, 255, cv2.THRESH_BINARY)
-                
-                # Filter components by size to find text-like regions
-                nlabels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-                
-                # Find horizontally aligned components that might form text
-                text_candidates = []
-                for i in range(1, nlabels):  # Skip background (0)
-                    x, y, w, h, area = stats[i]
-                    if 10 < w < 150 and 10 < h < 50 and area > 100:
-                        text_candidates.append((x, y, w, h, centroids[i]))
-                
-                # Horizontal grouping of components to identify text lines
-                if len(text_candidates) >= 3:  # Need multiple components for a text
-                    # Sort by y-coordinate to group by lines
-                    text_candidates.sort(key=lambda c: c[1])
-                    
-                    # Group components that are roughly on the same line (y-coordinate)
-                    y_threshold = 10  # Max vertical distance for same line
-                    lines = []
-                    current_line = [text_candidates[0]]
-                    
-                    for i in range(1, len(text_candidates)):
-                        if abs(text_candidates[i][1] - current_line[0][1]) < y_threshold:
-                            current_line.append(text_candidates[i])
-                        else:
-                            if len(current_line) >= 2:  # Line with at least 2 components
-                                lines.append(current_line)
-                            current_line = [text_candidates[i]]
-                    
-                    if len(current_line) >= 2:
-                        lines.append(current_line)
-                    
-                    # Examine lines that might contain "RESUME GAME"
-                    for line in lines:
-                        # Sort by x-coordinate to get left-to-right order
-                        line.sort(key=lambda c: c[0])
-                        
-                        # Calculate line width and length - "RESUME GAME" is relatively wide
-                        line_width = line[-1][0] + line[-1][2] - line[0][0]
-                        if line_width > 100:  # Minimum width for "RESUME GAME"
-                            # Calculate center of this line
-                            center_x = line[0][0] + line_width // 2
-                            center_y = int(sum(c[1] for c in line) / len(line))
-                            
-                            # Adjust coordinates to original frame
-                            button_x = x1 + center_x
-                            button_y = y1 + center_y
-                            
-                            logger.info(f"Potential 'RESUME GAME' button detected at ({button_x}, {button_y})")
-                            return True, (button_x, button_y)
-            
-            # 2. Method: Look for button-like shapes in the frame
-            # Use edge detection to find button shapes
-            edges = cv2.Canny(gray, 50, 150)
-            dilated_edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-            
-            # Find contours that might be buttons
-            contours, _ = cv2.findContours(dilated_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Filter contours to find button-like shapes
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                
-                # Check if the shape has reasonable button-like dimensions
-                if 100 < w < 300 and 20 < h < 60:
-                    # Calculate aspect ratio - buttons typically have specific aspect ratio
-                    aspect_ratio = w / h
-                    if 3 < aspect_ratio < 10:  # Buttons typically wider than tall
-                        # Now check if this area contains white text
-                        button_region = gray[y:y+h, x:x+w]
-                        _, button_binary = cv2.threshold(button_region, 200, 255, cv2.THRESH_BINARY)
-                        white_ratio = np.sum(button_binary > 0) / button_binary.size
-                        
-                        # Buttons with white text will have a certain percentage of white pixels
-                        if 0.1 < white_ratio < 0.5:
-                            button_x = x + w // 2
-                            button_y = y + h // 2
-                            logger.info(f"Button-like shape detected at ({button_x}, {button_y})")
-                            return True, (button_x, button_y)
-            
-            # 3. Method: Use common known positions for the "RESUME GAME" button
-            # These are common positions based on multiple screenshots/resolutions
-            common_positions = [
-                (int(width * 0.45), int(height * 0.387)),   # From screenshot
-                (int(width * 0.5), int(height * 0.4)),      # Center position
-                (int(width * 0.5), int(height * 0.35)),     # Slightly higher
-                (int(width * 0.5), int(height * 0.45))      # Slightly lower
-            ]
-            
-            # Check each common position for indicators of a button
-            for x, y in common_positions:
-                # Define a small region around the position
-                region_size = 30
-                x1 = max(0, x - region_size)
-                y1 = max(0, y - region_size)
-                x2 = min(width, x + region_size)
-                y2 = min(height, y + region_size)
-                
-                region = gray[y1:y2, x1:x2]
-                if region.size == 0:
-                    continue
-                
-                # Apply binary thresholding
-                _, binary = cv2.threshold(region, 180, 255, cv2.THRESH_BINARY)
-                white_ratio = np.sum(binary > 0) / binary.size
-                
-                # If there's a reasonable amount of white (text) in this region
-                if 0.1 < white_ratio < 0.5:
-                    logger.info(f"Potential button at common position ({x}, {y})")
-                    return True, (x, y)
-            
-            # If all methods fail, return the most likely position (center of upper half)
-            logger.warning("Could not detect 'RESUME GAME' button, using fallback position")
-            return False, (width // 2, height // 3)
-            
-        except Exception as e:
-            logger.error(f"Error finding 'RESUME GAME' button: {e}")
-            return False, (0, 0) 
-
-    def get_visual_change_score(self, current_frame: np.ndarray) -> float:
-        """Get visual change score between current frame and previous frame.
-        
-        Args:
-            current_frame: Current frame
-            
-        Returns:
-            float: Visual change score (0.0 to 1.0)
-        """
-        if current_frame is None:
+            logger.error(f"Error calculating visual change score: {e}")
             return 0.0
-            
-        # Convert PyTorch tensor to numpy if needed
-        if isinstance(current_frame, torch.Tensor):
-            current_frame_np = current_frame.detach().cpu().numpy()
-            # Convert from PyTorch's CHW format to HWC format if needed
-            if len(current_frame_np.shape) == 3 and current_frame_np.shape[0] == 3:
-                current_frame_np = current_frame_np.transpose(1, 2, 0)
-        else:
-            current_frame_np = current_frame
-            
-        if not hasattr(self, 'previous_frame') or self.previous_frame is None:
-            self.previous_frame = current_frame_np.copy()
-            return 0.0
-            
-        # Use visual change analyzer to get the score
-        score = self.visual_change_analyzer.get_visual_change_score(self.previous_frame, current_frame_np)
-        
-        # Update previous frame
-        self.previous_frame = current_frame_np.copy()
-        
-        return score
-        
+
     def detect_ui_elements(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """Detect UI elements in a frame.
         
@@ -1168,3 +908,58 @@ class VisualMetricsEstimator:
         diff_score = np.mean(diff) / 255.0
         
         return diff_score 
+
+    def detect_version_string(self, frame: np.ndarray) -> bool:
+        """Detect version string in the bottom-left corner of the screen.
+        This is a reliable indicator for menu screens.
+        
+        Args:
+            frame: Input frame
+            
+        Returns:
+            bool: True if version string detected
+        """
+        try:
+            # First ensure frame is valid
+            if frame is None or frame.size == 0:
+                return False
+            
+            # Convert float32 (0-1) to uint8 (0-255) if needed
+            if frame.dtype == np.float32:
+                frame = (frame * 255).astype(np.uint8)
+            
+            # Ensure frame has proper shape before processing
+            if len(frame.shape) != 3 or frame.shape[2] != 3:
+                if len(frame.shape) == 3:
+                    # Reshape incorrectly shaped 3D arrays
+                    height, width, depth = frame.shape
+                    if depth != 3:
+                        if height == 3:  # Likely a CHW format
+                            frame = frame.transpose(1, 2, 0)
+                        else:
+                            # Can't process this frame properly
+                            return False
+                else:
+                    # Can't process this frame properly
+                    return False
+            
+            # Extract bottom-left region (where version string usually appears)
+            height, width = frame.shape[:2]
+            bottom_left = frame[height-30:height, 0:int(width*0.3)]
+            
+            # Convert to grayscale
+            if bottom_left.shape[2] >= 3:
+                gray = cv2.cvtColor(bottom_left, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = bottom_left
+            
+            # Apply threshold to find text
+            _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+            
+            # Check for characteristic patterns of text
+            # Version string typically has high contrast ratio in small region
+            white_ratio = np.sum(thresh > 200) / thresh.size
+            return white_ratio > 0.01 and white_ratio < 0.2  # Version strings have some white text but not too much
+        except Exception as e:
+            logger.error(f"Error detecting version string: {e}")
+            return False 

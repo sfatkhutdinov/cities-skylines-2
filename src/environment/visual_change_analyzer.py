@@ -289,3 +289,55 @@ class VisualChangeAnalyzer:
             self.pattern_memory = []
             self.outcomes_memory = []
             return False 
+
+    def get_change_score(self, frame: np.ndarray) -> float:
+        """Get change score for the current frame.
+        Compares with internally stored previous frames to detect visual change.
+        
+        Args:
+            frame: Current frame
+            
+        Returns:
+            float: Change score (higher = more change)
+        """
+        # Make sure frame is in correct format
+        if frame is None:
+            return 0.0
+        
+        # Convert to numpy if it's a tensor
+        if hasattr(frame, 'cpu') and hasattr(frame, 'numpy'):
+            frame = frame.detach().cpu().numpy()
+        
+        # Ensure we have a previous frame for comparison
+        if not hasattr(self, 'previous_frame') or self.previous_frame is None:
+            # Store first frame and return no change
+            self.previous_frame = self._preprocess_pattern(frame)
+            return 0.0
+        
+        # Calculate change between current and previous frame
+        try:
+            # Preprocess current frame
+            current = self._preprocess_pattern(frame)
+            if current is None:
+                return 0.0
+            
+            # Calculate visual change using direct method
+            change_score = self.get_visual_change_score(self.previous_frame, current)
+            
+            # Update previous frame
+            self.previous_frame = current
+            
+            return change_score
+        except Exception as e:
+            logger.error(f"Error in get_change_score: {e}")
+            return 0.0
+        
+    def get_recent_change_score(self) -> float:
+        """Get the most recent change score.
+        
+        Returns:
+            float: Most recent change score
+        """
+        if hasattr(self, 'last_change_score'):
+            return self.last_change_score
+        return 0.0 

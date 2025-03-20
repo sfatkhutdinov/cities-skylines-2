@@ -21,7 +21,8 @@ class HardwareConfig:
         frame_stack: int = 1,
         frame_skip: int = 2,
         use_fp16: bool = False,
-        cpu_threads: int = 0  # 0 means use all available
+        cpu_threads: int = 0,  # 0 means use all available
+        force_cpu: bool = False
     ):
         """Initialize hardware configuration.
         
@@ -34,6 +35,7 @@ class HardwareConfig:
             frame_skip (int): Number of frames to skip between actions
             use_fp16 (bool): Whether to use half precision (FP16)
             cpu_threads (int): Number of CPU threads to use (0 = all available)
+            force_cpu (bool): Whether to force CPU usage
         """
         self.batch_size = batch_size
         self.learning_rate = learning_rate
@@ -43,6 +45,7 @@ class HardwareConfig:
         self.frame_skip = max(1, frame_skip)
         self.use_fp16 = use_fp16 and self._supports_fp16()
         self.cpu_threads = cpu_threads
+        self.force_cpu = force_cpu
         
         # RL-specific parameters
         self.gamma = 0.99
@@ -75,7 +78,7 @@ class HardwareConfig:
         if self._device_str == "auto":
             # Auto-detect optimal device
             if torch.cuda.is_available():
-                device = torch.device("cuda")
+                device = torch.device("cuda:0")
                 logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
             else:
                 device = torch.device("cpu")
@@ -115,12 +118,16 @@ class HardwareConfig:
             return False
     
     def get_device(self) -> torch.device:
-        """Get the device to use for training.
+        """Get the appropriate device for computation.
         
         Returns:
-            torch.device: Device to use
+            torch.device: Device to use for computation
         """
-        return self._device
+        if torch.cuda.is_available() and not self.force_cpu:
+            # Always use cuda:0 for consistency
+            return torch.device('cuda:0')
+        else:
+            return torch.device('cpu')
     
     def get_dtype(self) -> torch.dtype:
         """Get the data type to use for training.
@@ -173,7 +180,8 @@ class HardwareConfig:
             frame_stack=config_dict.get("frame_stack", 1),
             frame_skip=config_dict.get("frame_skip", 2),
             use_fp16=config_dict.get("use_fp16", False),
-            cpu_threads=config_dict.get("cpu_threads", 0)
+            cpu_threads=config_dict.get("cpu_threads", 0),
+            force_cpu=config_dict.get("force_cpu", False)
         )
         
         # Set additional parameters

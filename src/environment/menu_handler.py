@@ -1,7 +1,9 @@
 import logging
 import time
 import numpy as np
+import cv2
 from typing import Tuple, List, Dict, Optional, Union
+import torch
 
 from .input_simulator import InputSimulator
 from .optimized_capture import OptimizedScreenCapture
@@ -154,6 +156,10 @@ class MenuHandler:
         """
         # Skip detection if too soon since last check
         current_time = time.time()
+        
+        # Reduce the check interval to be more responsive to manual menu opening
+        self.menu_check_interval = 0.1  # Reduced from 0.5 to 0.1 seconds
+        
         if current_time - self.last_menu_check_time < self.menu_check_interval:
             return self.in_menu, self.menu_type, self.menu_detection_confidence
             
@@ -171,13 +177,25 @@ class MenuHandler:
             logger.debug(f"Forcing menu detection result: {forced_result}, {forced_type}, {forced_confidence}")
             return forced_result, forced_type, forced_confidence
         
-        # Check for menu exit cooldown period
-        # If we recently exited a menu, don't immediately detect a new one
-        # This prevents rapid menu toggling which can confuse the agent
-        if (not self.in_menu and 
-            current_time - self.last_menu_exit_time < self.menu_exit_cooldown):
+        # When user manually opens a menu, the cooldown should be bypassed
+        # so reduce the threshold for the menu exit cooldown
+        menu_exit_cooldown_check = (not self.in_menu and 
+                         current_time - self.last_menu_exit_time < self.menu_exit_cooldown / 2)
+        
+        if menu_exit_cooldown_check:
             logger.debug(f"In menu exit cooldown period (remaining: {self.menu_exit_cooldown - (current_time - self.last_menu_exit_time):.1f}s)")
-            return False, None, 0.0
+            
+            # Even if in cooldown, do a minimal check for sudden visual changes 
+            # that might indicate a manually opened menu
+            if hasattr(self.visual_metrics, 'visual_change_analyzer'):
+                change_score = self.visual_metrics.visual_change_analyzer.get_recent_change_score()
+                if change_score > 0.3:  # If significant visual change detected
+                    logger.info(f"Significant visual change detected ({change_score:.2f}), checking for menu despite cooldown")
+                    # Continue with detection despite cooldown
+                else:
+                    return False, None, 0.0
+            else:
+                return False, None, 0.0
             
         # Check if input suggests we're in a menu-prone state
         increased_vigilance = self._check_menu_prone_actions()
@@ -189,26 +207,46 @@ class MenuHandler:
                 detection_scores = {}
                 
                 # A. Direct menu detection (template matching)
-                direct_menu_detected = self.visual_metrics.detect_main_menu(current_frame)
-                detection_scores["direct"] = 0.8 if direct_menu_detected else 0.0
+                try:
+                    direct_menu_detected = self.visual_metrics.detect_main_menu(current_frame)
+                    detection_scores["direct"] = 0.8 if direct_menu_detected else 0.0
+                except Exception as e:
+                    logger.error(f"Error in direct menu detection: {e}")
+                    detection_scores["direct"] = 0.0
                 
                 # B. UI element density analysis
-                ui_density = self.visual_metrics.calculate_ui_density(current_frame)
-                detection_scores["density"] = ui_density
+                try:
+                    ui_density = self.visual_metrics.calculate_ui_density(current_frame)
+                    detection_scores["density"] = ui_density
+                except Exception as e:
+                    logger.error(f"Error in UI density analysis: {e}")
+                    detection_scores["density"] = 0.0
                 
                 # C. Contrast pattern analysis
-                contrast_score = self.visual_metrics.detect_menu_contrast_pattern(current_frame)
-                detection_scores["contrast"] = contrast_score
+                try:
+                    contrast_score = self.visual_metrics.detect_menu_contrast_pattern(current_frame)
+                    detection_scores["contrast"] = contrast_score
+                except Exception as e:
+                    logger.error(f"Error in contrast pattern analysis: {e}")
+                    detection_scores["contrast"] = 0.0
                 
                 # D. Visual change score (game paused/menu appeared)
-                visual_change_score = self.visual_metrics.get_visual_change_score(current_frame)
-                detection_scores["change"] = max(0, 1.0 - visual_change_score * 5.0)  # Invert: lower change = higher score
+                try:
+                    visual_change_score = self.visual_metrics.get_visual_change_score(current_frame)
+                    # FIX: Handle PyTorch tensor conversion correctly
+                    if hasattr(visual_change_score, 'item'):
+                        visual_change_score = visual_change_score.item()
+                    # Invert: lower change = higher score
+                    detection_scores["change"] = max(0, 1.0 - visual_change_score * 5.0)  
+                except Exception as e:
+                    logger.error(f"Error in visual change score: {e}")
+                    detection_scores["change"] = 0.0
                 
-                # E. UI element analysis - FIX: Add error handling here
+                # E. UI element analysis
                 try:
                     ui_elements = self.visual_metrics.detect_ui_elements(current_frame)
                     if ui_elements is None:
-                        ui_elements = []  # Fix: initialize as empty list if None
+                        ui_elements = []
                     
                     # Filter out UI elements that are in normal game UI regions
                     filtered_ui_elements = self._filter_normal_ui_elements(ui_elements, current_frame.shape)
@@ -235,8 +273,34 @@ class MenuHandler:
                     detection_scores["ui_elements"] = 0.0
                     detection_scores["normal_ui_penalty"] = 0.0
                 
-                # F. Check if mouse freedom test indicated a menu
-                # Access game_env's mouse freedom test results if available
+                # F. Check for version string in bottom left (very reliable indicator)
+                try:
+                    if hasattr(self.visual_metrics, 'detect_version_string'):
+                        # Handle tensor conversion properly
+                        frame_np = current_frame
+                        if hasattr(current_frame, 'detach'):
+                            frame_np = current_frame.detach().cpu().numpy()
+                            if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:  # CHW format
+                                frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+                        
+                        # Ensure data is uint8 for OpenCV
+                        if frame_np.dtype != np.uint8:
+                            if frame_np.max() <= 1.0:
+                                frame_np = (frame_np * 255).astype(np.uint8)
+                            else:
+                                frame_np = frame_np.astype(np.uint8)
+                        
+                        version_string_detected = self.visual_metrics.detect_version_string(frame_np)
+                        detection_scores["version_string"] = 1.0 if version_string_detected else 0.0
+                        if version_string_detected:
+                            logger.debug("Version string detected in bottom left - strong indicator of menu")
+                    else:
+                        detection_scores["version_string"] = 0.0
+                except Exception as e:
+                    logger.error(f"Error checking for version string: {e}")
+                    detection_scores["version_string"] = 0.0
+                
+                # G. Check if mouse freedom test indicated a menu
                 if hasattr(self.input_simulator, 'game_env') and hasattr(self.input_simulator.game_env, 'likely_in_menu_from_mouse_test'):
                     mouse_test_menu = self.input_simulator.game_env.likely_in_menu_from_mouse_test
                     mouse_test_change = getattr(self.input_simulator.game_env, 'mouse_freedom_visual_change', 1.0)
@@ -247,6 +311,8 @@ class MenuHandler:
                         logger.debug(f"Mouse freedom test indicates menu (visual change: {mouse_test_change:.6f})")
                     else:
                         detection_scores["mouse_freedom"] = 0.0
+                else:
+                    detection_scores["mouse_freedom"] = 0.0
                 
                 # Add the recent action vigilance bonus (if applicable)
                 if increased_vigilance:
@@ -264,72 +330,91 @@ class MenuHandler:
                     "ui_elements": 0.9,
                     "action_vigilance": 0.6,
                     "mouse_freedom": 1.0,  # High weight because this is a very reliable signal
-                    "normal_ui_penalty": 0.5
+                    "normal_ui_penalty": 0.5,
+                    "version_string": 1.5   # Highest weight - version string is an extremely reliable indicator
                 }
                 
-                # Calculate weighted average
-                total_weight = sum(weights.get(k, 0.0) for k in detection_scores.keys())
-                if total_weight > 0:
-                    weighted_score = sum(detection_scores[k] * weights.get(k, 0.0) for k in detection_scores.keys()) / total_weight
-                else:
-                    weighted_score = 0.0
+                # Compute weighted score
+                weighted_sum = 0.0
+                weight_sum = 0.0
                 
-                # Dynamic threshold adjustment based on recent history
-                base_threshold = 0.45  # Increased default threshold to reduce false positives
-                adjusted_threshold = base_threshold + self.detection_threshold_adjustment
+                for key, weight in weights.items():
+                    if key in detection_scores:
+                        weighted_sum += detection_scores[key] * weight
+                        weight_sum += weight
                 
-                # For diagnostics
-                logger.debug(f"Menu detection weighted score: {weighted_score:.2f}, threshold: {adjusted_threshold:.2f}")
+                weighted_score = weighted_sum / max(1e-6, weight_sum)  # Avoid division by zero
                 
-                # Check for fullscreen menu characteristics
-                # Real menus usually cover most of the screen
-                fullscreen_menu_indicators = self._check_fullscreen_menu(current_frame)
+                # Check direct signal from visual analysis in specific regions
+                menu_type = None
+                menu_scores = {}
                 
-                # If we have strong evidence it's not a fullscreen menu, increase threshold
-                if not fullscreen_menu_indicators and weighted_score < 0.6:
-                    adjusted_threshold += 0.1
-                    logger.debug("Increasing threshold by 0.1 due to lack of fullscreen menu indicators")
+                # FIXED: Handle PyTorch tensor operations properly
+                # Properly evaluate menu region scores
+                try:
+                    for mtype, config in self.MENU_TYPES.items():
+                        thresh = config["threshold"]
+                        regions = config["signature_regions"]
+                        
+                        # Analyze each signature region for this menu type
+                        region_scores = []
+                        
+                        # Extract region features and scores
+                        for region in regions:
+                            x1, y1, x2, y2 = region
+                            h, w = current_frame.shape[:2]
+                            rx1, ry1 = int(x1 * w), int(y1 * h)
+                            rx2, ry2 = int(x2 * w), int(y2 * h)
+                            
+                            # Safety check for valid coordinates
+                            rx1 = max(0, min(rx1, w-1))
+                            ry1 = max(0, min(ry1, h-1))
+                            rx2 = max(rx1+1, min(rx2, w))
+                            ry2 = max(ry1+1, min(ry2, h))
+                            
+                            if rx2 <= rx1 or ry2 <= ry1:
+                                continue
+                                
+                            # Extract region and analyze
+                            try:
+                                region_data = current_frame[ry1:ry2, rx1:rx2]
+                                if region_data.size == 0:
+                                    continue
+                                    
+                                # Simple analysis - for example, calculating intensity stats
+                                if len(region_data.shape) == 3:  # Color image
+                                    # Use simple numpy operations instead of PyTorch
+                                    avg_intensity = np.mean(region_data)
+                                    std_intensity = np.std(region_data)
+                                    
+                                    # High contrast might indicate UI elements
+                                    score = min(1.0, std_intensity / 50.0)
+                                    region_scores.append(score)
+                            except Exception as e:
+                                logger.error(f"Error analyzing region for {mtype}: {e}")
+                                
+                        # Compute average score for this menu type
+                        if region_scores:
+                            avg_score = sum(region_scores) / len(region_scores)
+                            menu_scores[mtype] = avg_score
+                            
+                            # Check if this is potentially the highest scoring menu
+                            if avg_score > thresh and (menu_type is None or avg_score > menu_scores.get(menu_type, 0)):
+                                menu_type = mtype
+                except Exception as e:
+                    logger.error(f"Error in menu region analysis: {e}")
                 
-                # Decision threshold
-                menu_detected = weighted_score >= adjusted_threshold
+                # Determine final menu detection result
+                # Lower the threshold to be more sensitive to manually opened menus
+                detection_threshold = 0.35  # Reduced from 0.45 to 0.35
                 
-                # Update consecutive detections counter
-                if menu_detected and self.in_menu:
-                    self.consecutive_menu_detections += 1
-                    # If we keep detecting menus, gradually increase the threshold
-                    # This helps avoid getting stuck in detection loops
-                    if self.consecutive_menu_detections > 5:
-                        self.detection_threshold_adjustment = min(0.2, self.detection_threshold_adjustment + 0.02)
-                        logger.debug(f"Increased menu detection threshold adjustment to {self.detection_threshold_adjustment:.2f}")
-                elif not menu_detected and not self.in_menu:
-                    # If we consistently don't detect menus, gradually reset threshold
-                    self.detection_threshold_adjustment = max(0, self.detection_threshold_adjustment - 0.01)
-                    self.consecutive_menu_detections = 0
-                else:
-                    # Menu state changed - reset consecutive counter but keep threshold
-                    self.consecutive_menu_detections = 0
-                    
-                # If we just exited a menu, record the time
-                if self.in_menu and not menu_detected:
-                    self.last_menu_exit_time = current_time
-                    logger.info("Menu exit detected - starting cooldown period")
+                # Apply dynamic adjustment based on consecutive detections
+                detection_threshold += self.detection_threshold_adjustment
                 
-                # Determine menu type based on UI signature regions
-                menu_type = "unknown"
-                if menu_detected:
-                    # Get signature regions for different menu types
-                    menu_signatures = self._analyze_menu_regions(current_frame, ui_elements)
-                    if menu_signatures:
-                        # Use the type with highest confidence
-                        menu_type, _ = max(menu_signatures.items(), key=lambda x: x[1])
+                logger.debug(f"Menu detection weighted score: {weighted_score:.2f}, threshold: {detection_threshold:.2f}")
                 
-                # Log detailed scores for debugging
-                logger.debug(f"Menu detection scores: {detection_scores}, weighted: {weighted_score:.2f}")
-                
-                # Update menu state
-                self.in_menu = menu_detected
-                self.menu_type = menu_type if menu_detected else None
-                self.menu_detection_confidence = weighted_score
+                # Update menu state based on final detection
+                menu_detected = weighted_score > detection_threshold
                 
                 # Update menu stuck detection
                 was_in_menu = self.in_menu
@@ -338,17 +423,29 @@ class MenuHandler:
                 # Update menu state based on final detection
                 if menu_detected:
                     self.in_menu = True
-                    self.menu_type = menu_type
+                    self.menu_type = menu_type if menu_type is not None else "unknown"
                     self.menu_detection_confidence = weighted_score
                     
                     # Start tracking stuck time if we weren't in a menu before
                     if not was_in_menu:
                         self.menu_stuck_time = current_time
-                        logger.info(f"Entered menu: {menu_type}")
+                        logger.info(f"Entered menu: {self.menu_type}")
                     
                     # Check if we've been stuck in menus for too long
                     self.check_menu_stuck_status()
+                    
+                    # Increase consecutive detections counter
+                    self.consecutive_menu_detections += 1
+                    
+                    # Adjust detection threshold upward to require more evidence to exit menu state
+                    self.detection_threshold_adjustment = min(0.1, self.consecutive_menu_detections * 0.02)
                 else:
+                    # Reset consecutive detections counter
+                    self.consecutive_menu_detections = 0
+                    
+                    # Reset detection threshold adjustment
+                    self.detection_threshold_adjustment = 0.0
+                    
                     self.in_menu = False
                     self.menu_type = None
                     self.menu_detection_confidence = 0.0
@@ -361,30 +458,15 @@ class MenuHandler:
                         self.last_menu_exit_time = current_time
                         logger.info(f"Exited menu: {previous_menu_type}")
                 
-                return menu_detected, menu_type if menu_detected else None, weighted_score
+                return menu_detected, self.menu_type, weighted_score
                 
             except Exception as e:
                 logger.error(f"Error in menu detection: {e}")
-                # Fall through to fallback methods
+                # Return existing state on error
+                return self.in_menu, self.menu_type, self.menu_detection_confidence
         
-        # Legacy template matching fallback (if visual metrics not available)
-        for menu_type, template in self.menu_templates.items():
-            if template is not None:
-                # Simple template matching (would be implemented with actual images)
-                # match_score = self.image_utils.template_match(current_frame, template)
-                match_score = 0.0  # Placeholder
-                
-                if match_score > self.MENU_TYPES[menu_type]["threshold"]:
-                    self.in_menu = True
-                    self.menu_type = menu_type
-                    self.menu_detection_confidence = match_score
-                    return True, menu_type, match_score
-        
-        # No menu detected
-        self.in_menu = False
-        self.menu_type = None
-        self.menu_detection_confidence = 0.0
-        return False, None, 0.0
+        # If no visual metrics, just return current state
+        return self.in_menu, self.menu_type, self.menu_detection_confidence
     
     def recover_from_menu(self, max_attempts: int = 3) -> bool:
         """Attempt to exit any detected menu.
@@ -664,52 +746,140 @@ class MenuHandler:
         return increased_vigilance
         
     def _analyze_menu_regions(self, frame: np.ndarray, ui_elements: List) -> Dict[str, float]:
-        """Analyze regions of the frame to determine menu type.
+        """Analyze specific regions of the frame for menu elements.
         
         Args:
             frame: Current frame
             ui_elements: Detected UI elements
             
         Returns:
-            Dict[str, float]: Menu type to confidence mapping
+            Dict: Menu type -> confidence score
         """
-        if frame is None or not ui_elements:
+        # Convert frame to torch tensor if needed
+        if not isinstance(frame, torch.Tensor) and hasattr(torch, 'from_numpy'):
+            # Convert numpy array to PyTorch tensor for easier region processing
+            try:
+                # Handle different input types
+                if isinstance(frame, np.ndarray):
+                    if frame.dtype == np.uint8:
+                        # Normalize to 0-1 range for consistent processing
+                        frame_tensor = torch.from_numpy(frame).float() / 255.0
+                    else:
+                        frame_tensor = torch.from_numpy(frame).float()
+                        if frame_tensor.max() > 1.0:
+                            frame_tensor = frame_tensor / 255.0
+                else:
+                    # Can't convert to tensor, use numpy processing instead
+                    return self._analyze_menu_regions_numpy(frame, ui_elements)
+                    
+                # Ensure frame tensor is in proper format (H, W, C)
+                if len(frame_tensor.shape) == 3 and frame_tensor.shape[0] == 3:
+                    # Convert from (C, H, W) to (H, W, C)
+                    frame_tensor = frame_tensor.permute(1, 2, 0)
+            except Exception as e:
+                logger.error(f"Error converting frame to tensor: {e}")
+                return {}
+        else:
+            frame_tensor = frame
+        
+        scores = {}
+        height, width = frame_tensor.shape[:2] if len(frame_tensor.shape) >= 2 else (0, 0)
+        
+        if height == 0 or width == 0:
             return {}
-            
-        h, w = frame.shape[:2]
-        menu_scores = {}
         
-        # Check each menu type's signature regions
-        for menu_type_name, properties in self.MENU_TYPES.items():
-            signature_regions = properties.get("signature_regions", [])
-            if not signature_regions:
-                continue
+        # Analyze each menu type's signature regions
+        for menu_type, info in self.MENU_TYPES.items():
+            try:
+                signature_regions = info["signature_regions"]
+                region_scores = []
                 
-            region_match_count = 0
-            
-            # Check signature regions for UI element density
-            for region in signature_regions:
-                x1, y1, x2, y2 = region
-                region_x1, region_y1 = int(x1 * w), int(y1 * h)
-                region_x2, region_y2 = int(x2 * w), int(y2 * h)
+                for region_coords in signature_regions:
+                    # Convert normalized coordinates to actual pixel values
+                    x1, y1, x2, y2 = region_coords
+                    x1_px, y1_px = int(x1 * width), int(y1 * height)
+                    x2_px, y2_px = int(x2 * width), int(y2 * height)
+                    
+                    # Ensure coordinates are within bounds
+                    x1_px, y1_px = max(0, x1_px), max(0, y1_px)
+                    x2_px, y2_px = min(width, x2_px), min(height, y2_px)
+                    
+                    if x2_px <= x1_px or y2_px <= y1_px:
+                        continue
+                    
+                    # Extract region
+                    region = frame_tensor[y1_px:y2_px, x1_px:x2_px]
+                    
+                    # Calculate characteristics like mean color, contrast, edge density
+                    if isinstance(region, torch.Tensor):
+                        # Use proper torch syntax for mean calculation
+                        region_mean = torch.mean(region).item()
+                        if len(region.shape) == 3:
+                            # Get color channel means for RGB separation analysis
+                            channel_means = torch.mean(region, dim=(0, 1)).tolist()
+                        else:
+                            channel_means = [region_mean, region_mean, region_mean]
+                    else:
+                        # Fallback to numpy
+                        region_mean = np.mean(region)
+                        if len(region.shape) == 3:
+                            channel_means = np.mean(region, axis=(0, 1)).tolist()
+                        else:
+                            channel_means = [region_mean, region_mean, region_mean]
+                    
+                    # Calculate contrast (standard deviation of pixel values)
+                    if isinstance(region, torch.Tensor):
+                        contrast = torch.std(region).item()
+                    else:
+                        contrast = np.std(region)
+                    
+                    # Look for UI elements within this region
+                    elements_in_region = 0
+                    for element in ui_elements:
+                        ex, ey, ew, eh = element
+                        element_center_x = ex + ew/2
+                        element_center_y = ey + eh/2
+                        
+                        if (x1_px <= element_center_x <= x2_px and 
+                            y1_px <= element_center_y <= y2_px):
+                            elements_in_region += 1
+                    
+                    # Calculate region score based on various factors
+                    # Main menus usually have high contrast, specific colors,
+                    # and specific UI elements
+                    ui_density = elements_in_region / ((x2_px - x1_px) * (y2_px - y1_px)) * 1000
+                    
+                    # Different scoring for different menu types
+                    if menu_type == "main_menu":
+                        # Main menu usually has characteristic colors
+                        color_score = abs(channel_means[2] - channel_means[0]) * 2.0  # Blue-red difference
+                        score = contrast * 2.0 + color_score + ui_density
+                    elif menu_type == "pause_menu":
+                        # Pause menus often have higher contrast
+                        score = contrast * 3.0 + ui_density
+                    elif menu_type == "settings_menu":
+                        # Settings menus have many UI elements
+                        score = ui_density * 2.0 + contrast
+                    elif menu_type == "dialog":
+                        # Dialogs typically have a central rectangle with high contrast
+                        score = contrast * 4.0 + ui_density
+                    else:  # notification
+                        # Notifications have small, focused regions
+                        score = (contrast * 2.0 + ui_density) * 1.5
+                        
+                    region_scores.append(score)
                 
-                # Count UI elements in this region
-                elements_in_region = [
-                    elem for elem in ui_elements
-                    if (elem[0] >= region_x1 and elem[0] <= region_x2 and
-                        elem[1] >= region_y1 and elem[1] <= region_y2)
-                ]
+                # Use maximum score from regions
+                if region_scores:
+                    scores[menu_type] = max(min(1.0, s/10.0) for s in region_scores)  # Normalize to 0-1
+                else:
+                    scores[menu_type] = 0.0
                 
-                # Be more lenient - accept even a single UI element in region
-                if len(elements_in_region) >= 1:
-                    region_match_count += 1
-            
-            # Calculate type match score
-            if signature_regions:
-                type_score = region_match_count / len(signature_regions)
-                menu_scores[menu_type_name] = type_score
+            except Exception as e:
+                logger.error(f"Error analyzing region for {menu_type}: {e}")
+                scores[menu_type] = 0.0
         
-        return menu_scores
+        return scores
         
     def force_menu_detection_result(self, result: bool, menu_type: Optional[str] = None, confidence: float = 0.5):
         """Force a specific menu detection result (for testing).

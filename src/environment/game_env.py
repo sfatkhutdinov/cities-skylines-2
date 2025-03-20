@@ -62,14 +62,14 @@ class CitiesEnvironment:
             self.input_simulator.screen_capture = self.screen_capture
             
             # Initialize visual metrics estimator
-            self.visual_estimator = VisualMetricsEstimator(self.config)
+            self.visual_metrics = VisualMetricsEstimator(self.config)
             
             # Performance monitoring hooks into visual estimator
-            if hasattr(self.visual_estimator, "visual_change_analyzer"):
-                self.visual_change_analyzer = self.visual_estimator.visual_change_analyzer
+            if hasattr(self.visual_metrics, "visual_change_analyzer"):
+                self.visual_change_analyzer = self.visual_metrics.visual_change_analyzer
             else:
                 self.visual_change_analyzer = VisualChangeAnalyzer(self.config)
-                self.visual_estimator.visual_change_analyzer = self.visual_change_analyzer
+                self.visual_metrics.visual_change_analyzer = self.visual_change_analyzer
             
             # Load menu reference if provided
             self.has_menu_reference = False
@@ -79,19 +79,19 @@ class CitiesEnvironment:
             if menu_screenshot_path and os.path.exists(menu_screenshot_path):
                 logger.info(f"Using menu reference image: {menu_screenshot_path}")
                 self.has_menu_reference = True
-                self.visual_estimator.initialize_menu_detection(menu_screenshot_path)
+                self.visual_metrics.initialize_menu_detection(menu_screenshot_path)
                 self.menu_detection_initialized = True
             elif os.path.exists("menu_reference.png"):
                 # Try to use a default reference if available
                 self.menu_reference_path = os.path.abspath("menu_reference.png")
                 logger.info(f"Using default menu reference image found at {self.menu_reference_path}")
                 self.has_menu_reference = True
-                self.visual_estimator.initialize_menu_detection(self.menu_reference_path)
+                self.visual_metrics.initialize_menu_detection(self.menu_reference_path)
                 self.menu_detection_initialized = True
             else:
                 # No menu reference image, set up fallback menu detection
                 logger.info("No menu reference image available, setting up fallback menu detection")
-                self.visual_estimator.setup_fallback_menu_detection()
+                self.visual_metrics.setup_fallback_menu_detection()
             
             # Use autonomous reward system
             self.reward_system = AutonomousRewardSystem(self.config)
@@ -101,7 +101,7 @@ class CitiesEnvironment:
             self.menu_handler = MenuHandler(
                 screen_capture=self.screen_capture,
                 input_simulator=self.input_simulator,
-                visual_metrics=self.visual_estimator
+                visual_metrics=self.visual_metrics
             )
             
             # Set menu_handler reference in screen_capture for action tracking
@@ -321,7 +321,7 @@ class CitiesEnvironment:
             return False
             
         # Save as reference
-        success = self.visual_estimator.save_current_frame_as_menu_reference(frame, save_path)
+        success = self.visual_metrics.save_current_frame_as_menu_reference(frame, save_path)
         if success:
             self.menu_reference_path = save_path
             self.has_menu_reference = True
@@ -583,106 +583,109 @@ class CitiesEnvironment:
         return frame
     
     def step(self, action_idx: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """Take an action in the environment.
+        """Execute an action in the environment.
         
         Args:
-            action_idx: Index of the action to take
+            action_idx: Action index to execute
             
         Returns:
-            Tuple[np.ndarray, float, bool, Dict[str, Any]]: 
-                - Next state
-                - Reward
-                - Done flag
-                - Additional info
+            Tuple[np.ndarray, float, bool, Dict]: state, reward, done, info
         """
-        info = {"menu_detected": False, "game_crashed": False}
+        # First check for menus before taking action
+        self._check_for_menus()
         
-        # Check if the game has crashed before taking any action
-        self._check_game_running()
+        # Get action type
+        action_type = self.actions[action_idx].get("type", "")
         
-        # If game has crashed, return a special state
-        if self.game_crashed or self.waiting_for_game_restart:
-            logger.warning("Game crash detected during step, waiting for restart")
-            
-            # Check if game has restarted
-            if self._check_for_game_restart():
-                logger.info("Game has restarted, resuming training")
-                self.game_crashed = False
-                self.waiting_for_game_restart = False
-                self.game_window_missing_count = 0
-            else:
-                # Return placeholder state and info
-                mock_frame = self._get_mock_frame()
-                info["game_crashed"] = True
-                info["waiting_for_restart"] = True
-                
-                # Return minimal reward, don't count as episode end
-                return mock_frame, -0.1, False, info
-        
-        # If action_idx is None or invalid, choose a random action
-        if action_idx is None or action_idx < 0 or action_idx >= len(self.actions):
-            action_idx = random.randint(0, len(self.actions) - 1)
-            
-        action_info = self.actions[action_idx]
-        
-        # Check if we are in a menu and need to avoid certain actions
-        if self.steps_taken % self.detect_menu_every_n_steps == 0:
-            menu_detected = self.check_menu_state()
-            
-            if menu_detected:
-                logger.info("Menu detected during step()")
-                self.menu_stuck_counter += 1
-                
-                # If stuck in menu too long, try recovery
-                if self.menu_stuck_counter >= self.max_menu_stuck_steps:
-                    logger.warning(f"Stuck in menu for {self.menu_stuck_counter} steps, attempting recovery")
-                    self._handle_menu_recovery()
-                    self.menu_stuck_counter = 0
-            else:
-                self.menu_stuck_counter = 0
-        
-        # Execute the action and get success status
-        frame_before_action = self.screen_capture.capture_frame()
-        
-        # Special handling for menu-related actions
-        if self.in_menu and action_info.get("type") in ["mouse_move", "click_left"]:
-            # For menu navigation, use click_menu_button if possible
-            success = self._handle_menu_action(action_info)
-        else:
-            # Normal action execution
-            success = self._execute_action(action_info)
-        
-        # Wait briefly to let the game process the action and update the display
-        time.sleep(0.1)
-        
-        # Get the current state (screenshot)
-        frame_after_action = self.screen_capture.capture_frame()
-        
-        # Check if we're in a menu
-        menu_detected = self.check_menu_state()
-        
-        # Compute reward based on action result and visual change
-        reward = self._compute_reward(action_info, action_idx, success, menu_detected)
-        
-        # Get the current state and format for the agent
-        self.state = self._process_frame(frame_after_action)
-        
-        # Check if episode is done
+        # Initialize return values
+        reward = 0.0
         done = False
-        if self.steps_taken >= self.max_steps:
-            done = True
-            logger.info(f"Episode done after {self.steps_taken} steps")
+        info = {}
         
-        # Collect info
-        info = {
-            "action_type": action_info.get("type", "unknown"),
-            "success": success,
-            "menu_detected": menu_detected,
-            "menu_stuck_counter": self.menu_stuck_counter,
-            "frame_skip": self.current_frame_skip if hasattr(self, 'current_frame_skip') else 1
-        }
+        # Track action in menu handler (helps with menu detection)
+        # Certain actions like ESC can trigger menus
+        if action_type == "key" and self.actions[action_idx].get("key") == "escape":
+            self.menu_handler.track_action("esc_key")
+        elif action_type == "mouse" and self.actions[action_idx].get("action") == "click":
+            # Check if click is near settings/gear icon
+            mouse_x, mouse_y = self.input_simulator.get_mouse_position()
+            gear_x, gear_y = self.menu_handler.GEAR_ICON_POSITION
+            screen_w, screen_h = self._get_screen_dimensions()
+            gear_x_px, gear_y_px = int(gear_x * screen_w), int(gear_y * screen_h)
+            
+            # If click is within 50px of gear icon
+            if ((mouse_x - gear_x_px)**2 + (mouse_y - gear_y_px)**2) < 2500:  # 50px radius
+                self.menu_handler.track_action("gear_click")
         
-        return self.state, reward, done, info
+        # Execute action
+        if action_type == "mouse":
+            target_x, target_y = self.actions[action_idx].get("position", (0.5, 0.5))
+            if isinstance(target_x, tuple) and isinstance(target_y, tuple):
+                x, y = target_x
+            else:
+                # Fallback to normalized coordinates (0.0 to 1.0)
+                x = target_x if isinstance(target_x, (int, float)) else 0.5
+                y = target_y if isinstance(target_y, (int, float)) else 0.5
+            
+            logger.debug(f"Moving mouse to: ({x}, {y})")
+            self.input_simulator.mouse_move(x, y)
+            
+        elif action_type == "mouse_click":
+            button = self.actions[action_idx].get("button", "left")
+            double = self.actions[action_idx].get("double", False)
+            self.input_simulator.mouse_click(x, y, button=button, double=double)
+            
+        elif action_type == "key":
+            key = self.actions[action_idx].get("key", "")
+            if key:
+                self.input_simulator.key_press(key)
+                
+        elif action_type == "speed":
+            speed_value = self.actions[action_idx].get("speed", 1.0)
+            speed_level = 0 if speed_value <= 0.1 else 1 if speed_value <= 0.3 else 2 if speed_value <= 0.6 else 3 if speed_value <= 0.8 else 4
+            self._set_game_speed(speed_level)
+            
+        # Sleep briefly to allow action to take effect
+        time.sleep(0.05)
+        
+        # Get the current state
+        state = self._process_frame(self.screen_capture.capture_frame())
+        
+        # Calculate reward using autonomous reward system
+        reward = self._compute_reward(self.actions[action_idx], action_idx, True, self.check_menu_state())
+        
+        # Add penalty if in a menu and not attempting to exit
+        # Important: Always check for menus after executing an action
+        is_in_menu = self.check_menu_state()
+        if is_in_menu:
+            # We're in a menu - apply menu penalty and try to recover 
+            # unless the action was an attempt to exit (like ESC or clicking exit buttons)
+            is_exit_attempt = (action_type == "key" and self.actions[action_idx].get("key") == "escape") or \
+                              (action_type == "mouse" and self.actions[action_idx].get("action") == "click")  # Any click could be trying to exit
+                              
+            if not is_exit_attempt:
+                # Apply a penalty for not trying to exit the menu
+                reward -= 0.5
+                info["menu_penalty"] = True
+                
+            # Try to recover from menu
+            self._handle_menu_recovery()
+            
+            # Get fresh state after recovery attempt
+            state = self._process_frame(self.screen_capture.capture_frame())
+        
+        # Update the step counter
+        self.steps_taken += 1
+        
+        # Check if the episode is done
+        done = self.steps_taken >= self.max_steps
+        
+        # Add diagnostic information
+        info["step"] = self.steps_taken
+        info["action_type"] = action_type
+        info["in_menu"] = is_in_menu
+        
+        return state, reward, done, info
     
     def check_menu_state(self) -> bool:
         """Check if the game is currently in a menu state.
@@ -693,7 +696,7 @@ class CitiesEnvironment:
         # If menu detection is disabled, always return False
         if hasattr(self, 'disable_menu_detection') and self.disable_menu_detection:
             return False
-        
+            
         # In mock mode, randomly simulate menu states (for testing)
         if self.mock_mode:
             # Very low probability to be in a menu (5%)
@@ -704,6 +707,28 @@ class CitiesEnvironment:
         if current_frame is None:
             logger.warning("Failed to capture frame for menu detection")
             return False
+            
+        # First check for version string (most reliable indicator)
+        if hasattr(self, 'visual_metrics') and hasattr(self.visual_metrics, 'detect_version_string'):
+            try:
+                # Convert frame to numpy
+                frame_np = current_frame.cpu().numpy() if hasattr(current_frame, 'cpu') else current_frame
+                if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:  # CHW format
+                    frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+                
+                # Ensure frame is in uint8 format for OpenCV operations
+                if frame_np.dtype != np.uint8:
+                    if frame_np.max() <= 1.0:
+                        frame_np = (frame_np * 255).astype(np.uint8)
+                    else:
+                        frame_np = frame_np.astype(np.uint8)
+                    
+                version_string_detected = self.visual_metrics.detect_version_string(frame_np)
+                if version_string_detected:
+                    logger.info("Menu detected via version string - high confidence")
+                    return True
+            except Exception as e:
+                logger.error(f"Error in version string detection: {e}")
         
         # If we've been having trouble with menu detection, run a mouse freedom test
         # This is only done rarely to avoid disrupting gameplay
@@ -729,10 +754,10 @@ class CitiesEnvironment:
             if menu_detected:
                 logger.info(f"Menu detected: {menu_type} with confidence {confidence:.2f}")
             return menu_detected
-        
-        # Fallback to visual estimator
+            
+        # Fallback to visual metrics
         try:
-            return self.visual_estimator.detect_main_menu(current_frame)
+            return self.visual_metrics.detect_main_menu(current_frame)
         except Exception as e:
             logger.error(f"Error in menu detection: {e}")
             return False
@@ -756,245 +781,65 @@ class CitiesEnvironment:
         success = self.input_simulator.handle_menu_recovery(retries=retries)
         return success
     
-    def _execute_action(self, action_info: Dict) -> bool:
-        """Execute an action in the environment.
+    def _check_for_menus(self) -> bool:
+        """Force check for menus without waiting for cooldown.
         
-        This method takes a low-level action (keypress, mouse movement, click)
-        and executes it without any game-specific knowledge. The agent must learn
-        which actions achieve desired outcomes in the game.
-        
-        Args:
-            action_info (Dict): Dictionary containing action details
-            
         Returns:
-            bool: Whether the action was successfully executed
+            bool: True if menu was detected, False otherwise
         """
-        # Get the current time to enforce minimum delay between actions
-        current_time = time.time()
-        time_since_last_action = current_time - self.last_action_time
-        
-        # If action is being executed too soon, wait
-        if time_since_last_action < self.min_action_delay:
-            time.sleep(self.min_action_delay - time_since_last_action)
-        
-        # Update last action time
-        self.last_action_time = time.time()
-        
-        # In mock mode, just simulate success/failure with high success probability
-        if self.mock_mode:
-            # 95% chance of success in mock mode
-            return random.random() < 0.95
-        
-        # Detect action type and execute accordingly
+        # Skip menu detection if disabled
+        if hasattr(self, 'disable_menu_detection') and self.disable_menu_detection:
+            return False
+            
+        # Force menu detection to run (bypassing cooldown)
+        # This is needed to detect manually opened menus more quickly
         try:
-            action_type = action_info.get("type", "")
-            
-            if action_type == "key":
-                # Execute keyboard input
-                key = action_info.get("key", "")
-                
-                # Additional safety check for ESC key which can trigger menus
-                if key.lower() == "escape":
-                    # Before pressing ESC, check if it might open a menu
-                    menu_check_count = getattr(self, "menu_check_count", 0)
-                    if menu_check_count > 2:  # Don't trigger too many menu checks
-                        setattr(self, "menu_check_count", 0)
-                    else:
-                        setattr(self, "menu_check_count", menu_check_count + 1)
-                
-                # Hold key if specified
-                hold_duration = action_info.get("duration", 0.1)  # Default to short press
-                return self.input_simulator.key_press(key, duration=hold_duration)
-            
-            elif action_type == "mouse":
-                # Get action and execute appropriate mouse function
-                mouse_action = action_info.get("action", "")
-                
-                if mouse_action == "move":
-                    # Get position coordinates
-                    position = action_info.get("position", (0.5, 0.5))
-                    if isinstance(position, tuple) and len(position) == 2:
-                        screen_x, screen_y = position
-                    else:
-                        # Fallback to normalized coordinates (0.0 to 1.0)
-                        norm_x = action_info.get("x", 0.5)
-                        norm_y = action_info.get("y", 0.5)
-                        
-                        # Convert to screen coordinates
-                        width, height = self._get_screen_dimensions()
-                        screen_x = int(norm_x * width)
-                        screen_y = int(norm_y * height)
-                    
-                    # Log the move for debugging
-                    logger.debug(f"Moving mouse to: ({screen_x}, {screen_y})")
-                    
-                    # Execute move
-                    return self.input_simulator.mouse_move(screen_x, screen_y)
-                
-                elif mouse_action == "click":
-                    # Get button and double-click setting
-                    button = action_info.get("button", "left")
-                    double = action_info.get("double", False)
-                    
-                    # Get position if specified, otherwise use the current mouse position
-                    if "position" in action_info:
-                        position = action_info.get("position")
-                        if isinstance(position, tuple) and len(position) == 2:
-                            screen_x, screen_y = position
-                        else:
-                            # Fallback to center of screen
-                            width, height = self._get_screen_dimensions()
-                            screen_x, screen_y = width // 2, height // 2
-                    else:
-                        # Use current mouse position
-                        try:
-                            mouse_pos = self.input_simulator.get_mouse_position()
-                            if isinstance(mouse_pos, tuple) and len(mouse_pos) == 2:
-                                screen_x, screen_y = mouse_pos
-                            else:
-                                # Fallback to center of screen
-                                width, height = self._get_screen_dimensions()
-                                screen_x, screen_y = width // 2, height // 2
-                                logger.warning(f"Invalid mouse position format: {mouse_pos}, using center of screen")
-                        except Exception as e:
-                            # Fallback to center of screen
-                            width, height = self._get_screen_dimensions()
-                            screen_x, screen_y = width // 2, height // 2
-                            logger.warning(f"Could not get mouse position: {e}, using center of screen")
-                    
-                    # Execute click
-                    return self.input_simulator.mouse_click(screen_x, screen_y, button=button, double=double)
-                
-                elif mouse_action in ["down", "up"]:
-                    # Get button
-                    button = action_info.get("button", "left")
-                    
-                    # Execute press/release
-                    if mouse_action == "down":
-                        return self.input_simulator.mouse_down(button=button)
-                    else:  # up
-                        return self.input_simulator.mouse_up(button=button)
-                
-                elif mouse_action == "scroll":
-                    # Get direction and amount
-                    direction = action_info.get("direction", "down")
-                    amount = action_info.get("amount", 5)
-                    
-                    # Convert direction to sign for clicks
-                    clicks = amount if direction == "up" else -amount
-                    
-                    # Execute scroll
-                    return self.input_simulator.mouse_scroll(clicks)
-                
-                elif mouse_action == "drag":
-                    # Handle drag action with proper error checking
-                    width, height = self._get_screen_dimensions()
-                    
-                    # Get target normalized coordinates
-                    to_norm_x = action_info.get("to_x", 0.5)
-                    to_norm_y = action_info.get("to_y", 0.5)
-                    
-                    # Convert to screen coordinates
-                    to_screen_x = int(to_norm_x * width)
-                    to_screen_y = int(to_norm_y * height)
-                    
-                    # Get starting position with proper error handling
-                    try:
-                        mouse_pos = self.input_simulator.get_mouse_position()
-                        if isinstance(mouse_pos, tuple) and len(mouse_pos) == 2:
-                            from_screen_x, from_screen_y = mouse_pos
-                        else:
-                            # Default to center if not a valid tuple
-                            from_screen_x, from_screen_y = width // 2, height // 2
-                            logger.warning(f"Invalid mouse position format: {mouse_pos}, using center of screen as start")
-                    except Exception:
-                        # If can't get position, use center of screen
-                        from_screen_x, from_screen_y = width // 2, height // 2
-                        logger.warning("Failed to get mouse position, using center of screen as start")
-                    
-                    # Also check if start point is explicitly specified
-                    if "start" in action_info:
-                        start_pos = action_info.get("start")
-                        if isinstance(start_pos, tuple) and len(start_pos) == 2:
-                            from_screen_x, from_screen_y = start_pos
-                    
-                    # Execute drag
-                    return self.input_simulator.mouse_drag(
-                        start=(from_screen_x, from_screen_y), 
-                        end=(to_screen_x, to_screen_y)
-                    )
-            
-            elif action_type == "combined":
-                # Combined key + mouse actions
-                key = action_info.get("key", "")
-                mouse_action = action_info.get("mouse_action", "click")
-                button = action_info.get("button", "left")
-                
-                # Press key
-                self.input_simulator.key_down(key)
-                time.sleep(0.05)  # Brief delay
-                
-                success = False
-                # Perform mouse action
-                if mouse_action == "click":
-                    # Get current mouse position for click
-                    try:
-                        mouse_pos = self.input_simulator.get_mouse_position()
-                        if isinstance(mouse_pos, tuple) and len(mouse_pos) == 2:
-                            screen_x, screen_y = mouse_pos
-                            success = self.input_simulator.mouse_click(screen_x, screen_y, button=button)
-                        else:
-                            # Use center of screen if invalid format
-                            width, height = self._get_screen_dimensions()
-                            screen_x, screen_y = width // 2, height // 2
-                            success = self.input_simulator.mouse_click(screen_x, screen_y, button=button)
-                    except Exception as e:
-                        logger.error(f"Error getting mouse position for combined action: {e}")
-                        success = False
-                
-                # Release key
-                time.sleep(0.05)  # Brief delay
-                self.input_simulator.key_up(key)
-                
-                return success
-            
-            elif action_type == "wait":
-                # Simply wait for specified duration
-                duration = action_info.get("duration", 0.5)
-                time.sleep(duration)
-                return True
-            
-            elif action_type == "speed":
-                # Handle game speed action
-                speed_value = action_info.get("speed", 1.0)
-                
-                # Convert to speed level (0-4)
-                if speed_value <= 0.1:
-                    speed_level = 0
-                elif speed_value <= 0.3:
-                    speed_level = 1
-                elif speed_value <= 0.6:
-                    speed_level = 2
-                elif speed_value <= 0.8:
-                    speed_level = 3
-                else:
-                    speed_level = 4
-                
-                # Use the existing method to set game speed
-                if hasattr(self, '_set_game_speed'):
-                    self._set_game_speed(speed_level)
-                    return True
-                else:
-                    logger.warning("Speed control not available")
-                    return False
-            
-            else:
-                # Unknown action type
-                logger.warning(f"Unknown action type: {action_type}")
+            current_frame = self.screen_capture.capture_frame()
+            if current_frame is None:
                 return False
+            
+            # First try direct version string detection as it's most reliable
+            if hasattr(self, 'visual_metrics') and hasattr(self.visual_metrics, 'detect_version_string'):
+                try:
+                    # Convert frame to numpy for version string detection
+                    frame_np = current_frame.cpu().numpy() if hasattr(current_frame, 'cpu') else current_frame
+                    if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:  # CHW format
+                        frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+                    
+                    # Ensure frame is in uint8 format for OpenCV operations
+                    if frame_np.dtype != np.uint8:
+                        if frame_np.max() <= 1.0:
+                            frame_np = (frame_np * 255).astype(np.uint8)
+                        else:
+                            frame_np = frame_np.astype(np.uint8)
+                    
+                    version_string_detected = self.visual_metrics.detect_version_string(frame_np)
+                    if version_string_detected:
+                        logger.info("Menu detected via version string - high confidence indicator")
+                        return True
+                except Exception as e:
+                    logger.error(f"Error in version string detection: {e}")
+            
+            # Access the menu handler's detect_menu method directly
+            # To bypass cooldown, we need to temporarily save and restore the check time
+            if self.menu_handler:
+                last_check_time = self.menu_handler.last_menu_check_time
+                # Set to a time far in the past to force check
+                self.menu_handler.last_menu_check_time = 0
                 
+                in_menu, menu_type, confidence = self.menu_handler.detect_menu(current_frame)
+                
+                # Restore the original check time if no menu was found
+                if not in_menu:
+                    self.menu_handler.last_menu_check_time = last_check_time
+                    
+                if in_menu:
+                    logger.info(f"Detected {menu_type} menu (confidence: {confidence:.2f})")
+                    return True
+            
+            return False
         except Exception as e:
-            logger.error(f"Error executing action: {e}")
+            logger.error(f"Error checking for menus: {e}")
             return False
     
     def _update_performance_metrics(self):
@@ -1129,7 +974,7 @@ class CitiesEnvironment:
                 if initial_frame is not None and new_frame is not None:
                     # Calculate visual change
                     try:
-                        visual_change = self.visual_estimator.calculate_frame_difference(initial_frame, new_frame)
+                        visual_change = self.visual_metrics.calculate_frame_difference(initial_frame, new_frame)
                         visual_changes.append(visual_change)
                         logger.debug(f"Visual change after mouse move to ({x},{y}): {visual_change:.6f}")
                     except Exception as e:
@@ -1516,50 +1361,3 @@ class CitiesEnvironment:
             frame_tensor = frame_tensor.to(self.config.get_device())
         
         return frame_tensor
-
-    def _handle_menu_action(self, action_info: Dict) -> bool:
-        """Handle actions specifically when in menu mode.
-        
-        This is a specialized action handler for menu navigation.
-        
-        Args:
-            action_info (Dict): Dictionary containing action details
-            
-        Returns:
-            bool: Whether the action was successfully executed
-        """
-        try:
-            action_type = action_info.get("type", "")
-            
-            # Use menu handler if available
-            if hasattr(self, 'menu_handler') and self.menu_handler is not None:
-                # For mouse movement actions in menu
-                if action_type == "mouse" and action_info.get("action") == "move":
-                    position = action_info.get("position", (0.5, 0.5))
-                    if isinstance(position, tuple) and len(position) == 2:
-                        x, y = position
-                        return self.menu_handler.navigate_to_menu_position(x, y)
-                
-                # For click actions in menu
-                elif action_type == "mouse" and action_info.get("action") == "click":
-                    # Get position
-                    if "position" in action_info:
-                        position = action_info.get("position")
-                        if isinstance(position, tuple) and len(position) == 2:
-                            x, y = position
-                            return self.menu_handler.click_menu_position(x, y)
-                
-                # Handle key presses in menu
-                elif action_type == "key":
-                    key = action_info.get("key", "")
-                    if key.lower() == "escape":
-                        return self.menu_handler.exit_current_menu()
-                    elif key.lower() in ["enter", "return"]:
-                        return self.menu_handler.confirm_menu_selection()
-            
-            # Fallback to normal action execution
-            return self._execute_action(action_info)
-            
-        except Exception as e:
-            logger.error(f"Error handling menu action: {e}")
-            return False
