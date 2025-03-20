@@ -118,29 +118,39 @@ This agent strictly adheres to the following principles:
 
 ## 📊 Project Structure
 
-```
-├── checkpoints/       # Saved model checkpoints
-├── logs/              # Training logs
-├── src/
-│   ├── agent/         # Reinforcement learning implementation
-│   │   └── core/      # Core agent functionality
-│   ├── config/        # Configuration settings
-│   ├── environment/   # Game environment and interaction
-│   │   ├── core/      # Core environment functionality
-│   │   ├── input/     # Input simulation (keyboard, mouse, actions)
-│   │   ├── menu/      # Menu detection and handling
-│   │   └── rewards/   # Reward computation and analysis
-│   ├── model/         # Neural network architecture
-│   ├── training/      # Training infrastructure
-│   │   ├── checkpointing.py  # Checkpoint management
-│   │   ├── signal_handlers.py # Signal handling for graceful shutdown
-│   │   ├── trainer.py  # Training loop implementation
-│   │   └── utils.py    # Training utilities
-│   └── train.py       # Main training script
-├── venv/              # Virtual environment
-├── requirements.txt   # Project dependencies
-└── README.md          # This file
-```
+The project is organized into several key directories:
+
+- `checkpoints/` - Saved model checkpoints
+- `logs/` - Training logs
+- `src/` - Source code
+  - `agent/` - Reinforcement learning agent
+    - `core/` - Core agent functionality
+  - `config/` - Configuration settings
+  - `environment/` - Game environment interaction
+    - `core/` - Core environment functionality
+    - `input/` - Input simulation (keyboard, mouse, actions)
+      - `keyboard.py` - Keyboard input simulation
+      - `mouse.py` - Mouse input simulation
+      - `actions.py` - High-level actions
+      - `tracking.py` - Input tracking
+    - `menu/` - Menu detection and handling
+      - `detector.py` - Menu detection
+      - `navigator.py` - Menu navigation
+      - `recovery.py` - Menu recovery
+      - `templates.py` - Menu templates
+      - `menu_handler.py` - Menu handling integration
+    - `rewards/` - Reward computation system
+      - `reward_system.py` - Main reward system integration
+      - `metrics.py` - Reward-related metrics tracking
+      - `analyzers.py` - Visual change analysis
+      - `calibration.py` - Reward normalization and calibration
+      - `world_model.py` - Predictive world model for rewards
+  - `model/` - Neural network architecture
+  - `training/` - Training processes
+    - `checkpointing.py` - Model checkpointing
+    - `signal_handlers.py` - Signal handling for training
+    - `trainer.py` - Main training loop
+    - `utils.py` - Training utilities
 
 ## 🔄 Contribution
 
@@ -153,3 +163,15 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ---
 
 Developed with ❤️ for Cities: Skylines 2 
+
+## Modularization Progress
+
+The codebase has been modularized to improve maintainability and organization. 
+Current progress:
+
+- ✅ Training module modularization
+- ✅ Menu handling modularization
+- ✅ Input simulation modularization
+- ✅ Reward system modularization
+- ⬜ Core environment modularization
+- ⬜ Agent module modularization 
