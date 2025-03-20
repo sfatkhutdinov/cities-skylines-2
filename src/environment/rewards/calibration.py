@@ -608,4 +608,185 @@ class RewardCalibrationManager:
             if total_weight > 0:
                 weights = {k: v / total_weight for k, v in weights.items()}
                 
-        return weights 
+        return weights
+
+
+class RewardCalibrator:
+    """Calibrates and normalizes rewards for reinforcement learning.
+    
+    This class combines normalization, scaling, and shaping to produce
+    well-calibrated rewards for stable training.
+    """
+    
+    def __init__(self, 
+                config: Dict[str, Any] = None,
+                window_size: int = 1000,
+                use_running_normalization: bool = True,
+                use_percentile_scaling: bool = False,
+                clip_range: float = 5.0):
+        """Initialize reward calibrator.
+        
+        Args:
+            config: Configuration dictionary
+            window_size: Size of history window
+            use_running_normalization: Whether to normalize with running stats
+            use_percentile_scaling: Whether to use percentile-based scaling
+            clip_range: Range to clip rewards to
+        """
+        self.config = config or {}
+        self.calibration_config = self.config.get('reward_calibration', {})
+        
+        # Extract parameters from config or use defaults
+        self.window_size = self.calibration_config.get('window_size', window_size)
+        self.use_running_normalization = self.calibration_config.get(
+            'use_running_normalization', use_running_normalization)
+        self.use_percentile_scaling = self.calibration_config.get(
+            'use_percentile_scaling', use_percentile_scaling)
+        self.clip_range = self.calibration_config.get('clip_range', clip_range)
+        
+        # Initialize components
+        self.normalizer = RewardNormalizer(window_size=self.window_size, 
+                                          clip_range=self.clip_range)
+        self.scaler = RewardScaler(window_size=self.window_size)
+        self.shaper = RewardShaper()
+        
+        # Statistics
+        self.raw_rewards = []
+        self.processed_rewards = []
+        self.max_history = 10000
+        
+        logger.info("Initialized reward calibrator")
+        
+    def process_reward(self, 
+                      reward: float, 
+                      potential: float = None,
+                      prev_potential: float = None,
+                      state_hash: str = None,
+                      time_step: int = 0) -> float:
+        """Process a raw reward to produce calibrated reward.
+        
+        Args:
+            reward: Raw reward value
+            potential: Current state potential for shaping (optional)
+            prev_potential: Previous state potential (optional)
+            state_hash: Hash of current state (optional)
+            time_step: Current time step (optional)
+            
+        Returns:
+            float: Calibrated reward
+        """
+        # Store raw reward
+        self.raw_rewards.append(reward)
+        if len(self.raw_rewards) > self.max_history:
+            self.raw_rewards.pop(0)
+            
+        # Apply processing pipeline
+        processed = reward
+        
+        # 1. Apply shaping if potentials provided
+        if potential is not None and prev_potential is not None:
+            shaping = self.shaper.potential_based_shaping(
+                prev_potential, potential)
+            processed += shaping
+            
+        # 2. Apply contextual shaping if state hash provided
+        if state_hash is not None:
+            processed = self.shaper.shape_reward(
+                processed, state_hash, time_step)
+            
+        # 3. Apply normalization if enabled
+        if self.use_running_normalization:
+            processed = self.normalizer.normalize(processed)
+            
+        # 4. Apply scaling if enabled
+        if self.use_percentile_scaling:
+            processed = self.scaler.percentile_scale(processed)
+        else:
+            processed = self.scaler.scale(processed)
+            
+        # Store processed reward
+        self.processed_rewards.append(processed)
+        if len(self.processed_rewards) > self.max_history:
+            self.processed_rewards.pop(0)
+            
+        return processed
+        
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics about raw and processed rewards.
+        
+        Returns:
+            dict: Statistics about rewards
+        """
+        stats = {}
+        
+        # Raw reward stats
+        if self.raw_rewards:
+            stats['raw'] = {
+                'mean': float(np.mean(self.raw_rewards)),
+                'std': float(np.std(self.raw_rewards)),
+                'min': float(np.min(self.raw_rewards)),
+                'max': float(np.max(self.raw_rewards)),
+                'median': float(np.median(self.raw_rewards)),
+                'count': len(self.raw_rewards)
+            }
+            
+        # Processed reward stats
+        if self.processed_rewards:
+            stats['processed'] = {
+                'mean': float(np.mean(self.processed_rewards)),
+                'std': float(np.std(self.processed_rewards)),
+                'min': float(np.min(self.processed_rewards)),
+                'max': float(np.max(self.processed_rewards)),
+                'median': float(np.median(self.processed_rewards)),
+                'count': len(self.processed_rewards)
+            }
+            
+        return stats
+        
+    def reset(self) -> None:
+        """Reset calibrator state."""
+        self.raw_rewards = []
+        self.processed_rewards = []
+        self.shaper.reset()
+        
+    def save_state(self, path: str) -> None:
+        """Save calibrator state to disk.
+        
+        Args:
+            path: Base path for saving components
+        """
+        try:
+            # Create directory
+            os.makedirs(path, exist_ok=True)
+            
+            # Save individual components
+            self.normalizer.save_state(os.path.join(path, "normalizer.pkl"))
+            self.scaler.save_state(os.path.join(path, "scaler.pkl"))
+            
+            # Save overall statistics
+            stats = self.get_stats()
+            with open(os.path.join(path, "calibrator_stats.json"), 'w') as f:
+                json.dump(stats, f, indent=2)
+                
+            logger.info(f"Saved reward calibrator state to {path}")
+        except Exception as e:
+            logger.error(f"Error saving reward calibrator state: {e}")
+            
+    def load_state(self, path: str) -> None:
+        """Load calibrator state from disk.
+        
+        Args:
+            path: Base path for loading components
+        """
+        try:
+            if not os.path.exists(path):
+                logger.warning(f"Reward calibrator state directory not found: {path}")
+                return
+                
+            # Load individual components
+            self.normalizer.load_state(os.path.join(path, "normalizer.pkl"))
+            self.scaler.load_state(os.path.join(path, "scaler.pkl"))
+            
+            logger.info(f"Loaded reward calibrator state from {path}")
+        except Exception as e:
+            logger.error(f"Error loading reward calibrator state: {e}") 

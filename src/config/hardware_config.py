@@ -44,6 +44,8 @@ class HardwareConfig:
         self.frame_stack = max(1, frame_stack)
         self.frame_skip = max(1, frame_skip)
         self.use_fp16 = use_fp16 and self._supports_fp16()
+        # Alias for use_fp16 for compatibility
+        self.use_mixed_precision = self.use_fp16
         self.cpu_threads = cpu_threads
         self.force_cpu = force_cpu
         

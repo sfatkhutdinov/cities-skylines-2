@@ -68,6 +68,7 @@ class PPOAgent:
         # Agent parameters
         self.gamma = 0.99
         self.gae_lambda = 0.95
+        self.update_frequency = 32  # Update policy every 32 steps
         
         # Apply parameters from config if available
         if config:
@@ -478,4 +479,12 @@ class PPOAgent:
             'learning_rate': self.updater.get_learning_rate(),
             'memory_size': self.memory.size(),
             **self.memory.get_episode_stats()
-        } 
+        }
+    
+    def parameters(self):
+        """Get model parameters for optimization.
+        
+        Returns:
+            Model parameters
+        """
+        return self.network.parameters() 

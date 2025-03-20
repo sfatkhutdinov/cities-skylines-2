@@ -203,4 +203,31 @@ class HardwareMonitor:
         if 'disk_io' in stats and stats['disk_io'] > 100:  # More than 100 MB/s
             return "High disk I/O detected; consider reducing checkpoint frequency or log verbosity"
             
-        return None 
+        return None
+
+    def get_metrics(self) -> Dict[str, float]:
+        """Get the latest hardware metrics.
+        
+        Returns:
+            Dict[str, float]: Hardware metrics
+        """
+        # Get current statistics
+        current_stats = self.get_current_stats()
+        
+        # Add any derived metrics
+        metrics = current_stats.copy()
+        
+        # Calculate average FPS if frame times available
+        if self.frame_times:
+            metrics['avg_fps'] = 1.0 / (sum(self.frame_times) / len(self.frame_times))
+        
+        # Calculate averages for recent history (last 5 entries)
+        history = self.get_stats_history(last_n=5)
+        for key, values in history.items():
+            if values:
+                metrics[f'avg_{key}'] = sum(values) / len(values)
+        
+        # Add uptime in minutes
+        metrics['uptime_minutes'] = (time.time() - self._start_time) / 60.0
+        
+        return metrics 

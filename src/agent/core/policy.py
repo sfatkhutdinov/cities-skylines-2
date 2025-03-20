@@ -87,7 +87,13 @@ class Policy:
             action = torch.multinomial(action_probs, 1)
         
         # Get log probability of the chosen action
-        log_prob = torch.log(action_probs[action.item()].clamp(min=1e-10))
+        if action_probs.dim() > 1:
+            # Batched input
+            batch_indices = torch.arange(action_probs.size(0), device=action_probs.device)
+            log_prob = torch.log(action_probs[batch_indices, action.squeeze()].clamp(min=1e-10))
+        else:
+            # Single sample
+            log_prob = torch.log(action_probs[action.item()].clamp(min=1e-10))
         
         # Make sure log_prob is a tensor with proper dimensions
         if not isinstance(log_prob, torch.Tensor):

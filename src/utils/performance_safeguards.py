@@ -426,4 +426,131 @@ class PerformanceSafeguards:
             'optimization_count': self.optimization_count,
             'emergency_mode': self.emergency_mode,
             'batch_size': self.current_batch_size
-        } 
+        }
+        
+    def reset(self):
+        """Reset performance monitoring state between episodes."""
+        self.previous_check = time.time()
+        self.emergency_mode = False
+        # Empty histories to track fresh data
+        self.cpu_history.clear()
+        self.memory_history.clear()
+        self.gpu_history.clear()
+        self.disk_io_history.clear()
+        self.fps_history.clear()
+        # Restore batch size if it was reduced
+        if self.current_batch_size < self.initial_batch_size:
+            self.current_batch_size = self.initial_batch_size
+            logger.info(f"Reset batch size to initial value: {self.initial_batch_size}")
+        # Run garbage collection to clear any lingering references
+        gc.collect()
+        if self.has_gpu:
+            torch.cuda.empty_cache()
+        logger.debug("Reset performance safeguards state")
+
+    def check_limits(self):
+        """Check if resource limits are being approached and apply optimizations if needed.
+        
+        Returns:
+            Dict with status of any actions taken
+        """
+        # Use check_resources to get current resource usage
+        resources = self.check_resources()
+        
+        # Early exit if no resource data available
+        if not resources:
+            return {}
+        
+        # Check if resources are above thresholds and apply optimizations
+        if (resources.get('cpu_percent', 0) > self.cpu_threshold or
+            resources.get('memory_percent', 0) > self.memory_threshold or
+            resources.get('gpu_percent', 0) > self.gpu_threshold):
+            
+            # Apply optimizations
+            self.optimize_resources()
+            
+            return {
+                'optimizations_applied': True,
+                'current_batch_size': self.current_batch_size,
+                'emergency_mode': self.emergency_mode
+            }
+        
+        # Check if we can restore normal operation
+        if self.emergency_mode:
+            restored = self.restore_normal_operation()
+            if restored:
+                return {
+                    'normal_operation_restored': True,
+                    'current_batch_size': self.current_batch_size
+                }
+        
+        return {'optimizations_applied': False}
+
+    def get_throttle_time(self) -> float:
+        """Get time to throttle execution based on resource usage.
+        
+        Returns:
+            float: Sleep time in seconds (0 means no throttling needed)
+        """
+        # Don't throttle if not in emergency mode
+        if not self.emergency_mode:
+            return 0.0
+        
+        # Check current resource usage
+        resources = self.check_resources()
+        
+        # If resources are critical, add throttling
+        if (resources.get('memory_percent', 0) > self.critical_threshold * 100 or
+            resources.get('gpu_percent', 0) > self.critical_threshold * 100):
+            # Severe throttling (100ms sleep)
+            return 0.1
+        elif (resources.get('memory_percent', 0) > self.warning_threshold * 100 or
+              resources.get('gpu_percent', 0) > self.warning_threshold * 100):
+            # Moderate throttling (20ms sleep)
+            return 0.02
+        
+        # No throttling needed
+        return 0.0
+        
+    def update_metrics(self, metrics: Dict[str, Any]) -> None:
+        """Update internal state with hardware metrics from the hardware monitor.
+        
+        Args:
+            metrics (Dict[str, Any]): Hardware metrics from HardwareMonitor.get_metrics()
+        """
+        # Update CPU usage if available
+        if 'cpu_usage' in metrics:
+            self.cpu_history.append(metrics['cpu_usage'])
+            if len(self.cpu_history) > self.history_size:
+                self.cpu_history.pop(0)
+        
+        # Update memory usage if available
+        if 'memory_usage' in metrics:
+            self.memory_history.append(metrics['memory_usage'])
+            if len(self.memory_history) > self.history_size:
+                self.memory_history.pop(0)
+        
+        # Update GPU usage if available
+        if 'gpu_usage' in metrics and self.has_gpu:
+            self.gpu_history.append(metrics['gpu_usage'])
+            if len(self.gpu_history) > self.history_size:
+                self.gpu_history.pop(0)
+                
+        # Update FPS history if available
+        if 'fps' in metrics:
+            self.fps_history.append(metrics['fps'])
+            if len(self.fps_history) > self.history_size:
+                self.fps_history.pop(0)
+                
+        # Check if we need to apply optimizations based on updated metrics
+        if (len(self.cpu_history) > 0 and np.mean(self.cpu_history[-5:]) > self.cpu_threshold) or \
+           (len(self.memory_history) > 0 and np.mean(self.memory_history[-5:]) > self.memory_threshold) or \
+           (len(self.gpu_history) > 0 and np.mean(self.gpu_history[-5:]) > self.gpu_threshold):
+            # Apply optimizations if resources are constrained
+            self.optimize_resources()
+        
+        # Log current status after update
+        logger.debug(f"Updated performance metrics - CPU: {np.mean(self.cpu_history[-5:]) if len(self.cpu_history) >= 5 else 0:.1f}%, "
+                    f"Memory: {np.mean(self.memory_history[-5:]) if len(self.memory_history) >= 5 else 0:.1f}%, "
+                    f"GPU: {np.mean(self.gpu_history[-5:]) if len(self.gpu_history) >= 5 else 0:.1f}%, "
+                    f"Emergency mode: {self.emergency_mode}") 

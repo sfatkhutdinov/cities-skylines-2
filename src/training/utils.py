@@ -194,7 +194,7 @@ def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None
     return env
 
 def setup_agent(config, env, args, config_loader: Optional[ConfigLoader] = None):
-    """Set up the agent based on arguments.
+    """Set up agent using hardware configuration and environment.
     
     Args:
         config: Hardware configuration
@@ -209,19 +209,22 @@ def setup_agent(config, env, args, config_loader: Optional[ConfigLoader] = None)
     if config_loader:
         model_config = config_loader.get_section('model')
     
+    # Extract only parameters accepted by PPOAgent
+    ppo_params = {
+        'state_dim': env.observation_space.shape,
+        'action_dim': env.action_space.n,
+        'config': config,
+        'use_amp': model_config.get('use_amp', False)
+    }
+    
     # Create agent
-    agent = PPOAgent(
-        env.observation_space,
-        env.action_space,
-        config,
-        **model_config
-    )
+    agent = PPOAgent(**ppo_params)
     
     agent.to(config.get_device())
     logger.info(f"Agent initialized on {config.get_device()}")
     
     # Log agent configuration
-    logger.info(f"Agent configuration: {agent}")
+    logger.info(f"Agent configuration: {str(agent)}")
     
     return agent
 

@@ -515,12 +515,10 @@ class Trainer:
             self._save_checkpoint(episode_num, is_best=True)
         
         # Update visualizer metrics
-        self.visualizer.update(
-            episode_num=episode_num,
-            episode_reward=total_reward,
-            episode_length=step,
-            total_steps=self.total_steps,
-            action_distribution=action_counts
+        self.visualizer.record_episode_metrics(
+            episode=episode_num,
+            reward=total_reward,
+            length=step
         )
         
         # Log to wandb if enabled
@@ -826,49 +824,53 @@ class Trainer:
             if using_mixed_precision:
                 with torch.cuda.amp.autocast():
                     # Get new action distributions and values
-                    new_action_dists, new_values = self.agent.network(batch_states)
+                    new_action_probs, new_values = self.agent.network(batch_states)
                     
-                    # Calculate new log probs
-                    new_log_probs = new_action_dists.log_prob(batch_actions)
+                    # Calculate new log probs - properly gathering the probabilities for each action
+                    # and then taking the log
+                    gathered_probs = torch.gather(new_action_probs, 1, batch_actions.unsqueeze(1))
+                    new_log_probs = torch.log(gathered_probs.squeeze(1).clamp(min=1e-10))
                     
                     # Calculate policy loss (PPO objective)
                     ratio = torch.exp(new_log_probs - batch_log_probs)
                     surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - self.agent.clip_range, 1.0 + self.agent.clip_range) * batch_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.agent.updater.clip_param, 1.0 + self.agent.updater.clip_param) * batch_advantages
                     policy_loss = -torch.min(surr1, surr2).mean()
                     
                     # Calculate value loss
                     value_loss = ((new_values - batch_returns) ** 2).mean()
                     
-                    # Calculate entropy bonus
-                    entropy_loss = -new_action_dists.entropy().mean()
+                    # Calculate entropy bonus - using the formula -sum(p_i * log(p_i))
+                    entropy_loss = -torch.sum(new_action_probs * torch.log(new_action_probs.clamp(min=1e-10)), dim=1).mean()
                     
                     # Calculate total loss
-                    loss = policy_loss + self.agent.value_coef * value_loss + self.agent.entropy_coef * entropy_loss
+                    loss = policy_loss + self.agent.updater.value_coef * value_loss + self.agent.updater.entropy_coef * entropy_loss
                 
                 # Backpropagate with scaler
                 scaler.scale(loss).backward()
             else:
                 # Standard forward pass
-                new_action_dists, new_values = self.agent.network(batch_states)
+                new_action_probs, new_values = self.agent.network(batch_states)
                 
-                # Calculate new log probs
-                new_log_probs = new_action_dists.log_prob(batch_actions)
+                # Calculate new log probs - properly gathering the probabilities for each action
+                # and then taking the log
+                gathered_probs = torch.gather(new_action_probs, 1, batch_actions.unsqueeze(1))
+                new_log_probs = torch.log(gathered_probs.squeeze(1).clamp(min=1e-10))
                 
                 # Calculate policy loss (PPO objective)
                 ratio = torch.exp(new_log_probs - batch_log_probs)
                 surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.agent.clip_range, 1.0 + self.agent.clip_range) * batch_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.agent.updater.clip_param, 1.0 + self.agent.updater.clip_param) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # Calculate value loss
                 value_loss = ((new_values - batch_returns) ** 2).mean()
                 
-                # Calculate entropy bonus
-                entropy_loss = -new_action_dists.entropy().mean()
+                # Calculate entropy bonus - using the formula -sum(p_i * log(p_i))
+                entropy_loss = -torch.sum(new_action_probs * torch.log(new_action_probs.clamp(min=1e-10)), dim=1).mean()
                 
                 # Calculate total loss
-                loss = policy_loss + self.agent.value_coef * value_loss + self.agent.entropy_coef * entropy_loss
+                loss = policy_loss + self.agent.updater.value_coef * value_loss + self.agent.updater.entropy_coef * entropy_loss
                 
                 # Standard backprop
                 loss.backward()
@@ -884,14 +886,14 @@ class Trainer:
             scaler.unscale_(self.optimizer)
             
             # Clip gradients using L2 norm
-            torch.nn.utils.clip_grad_norm_(self.agent.network.parameters(), self.agent.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.agent.network.parameters(), self.agent.updater.max_grad_norm)
             
             # Step with scaler
             scaler.step(self.optimizer)
             scaler.update()
         else:
             # Standard gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.agent.network.parameters(), self.agent.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.agent.network.parameters(), self.agent.updater.max_grad_norm)
             
             # Standard optimizer step
             self.optimizer.step()
@@ -901,7 +903,7 @@ class Trainer:
             self.scheduler.step()
         
         # Update visualizer metrics
-        self.visualizer.update_training_metrics(
+        self.visualizer.record_training_metrics(
             actor_loss=sum(policy_losses) / len(policy_losses) if policy_losses else 0.0,
             critic_loss=sum(value_losses) / len(value_losses) if value_losses else 0.0,
             entropy=sum(entropy_losses) / len(entropy_losses) if entropy_losses else 0.0

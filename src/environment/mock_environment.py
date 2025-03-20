@@ -11,8 +11,8 @@ import logging
 import time
 from typing import Dict, Tuple, List, Any, Optional
 import random
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 from src.config.hardware_config import HardwareConfig
 

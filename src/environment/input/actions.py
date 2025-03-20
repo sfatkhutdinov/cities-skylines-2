@@ -311,4 +311,182 @@ class InputActions:
         """Release all input resources."""
         # Nothing specific needed here, as keyboard and mouse are
         # passed in and managed externally
-        logger.info("Input actions resources released") 
+        logger.info("Input actions resources released")
+
+
+class ActionExecutor:
+    """Executes high-level actions in the game environment."""
+    
+    def __init__(
+        self,
+        keyboard_controller = None,
+        mouse_controller = None,
+        config: Dict[str, Any] = None
+    ):
+        """Initialize action executor.
+        
+        Args:
+            keyboard_controller: Keyboard controller
+            mouse_controller: Mouse controller
+            config: Configuration dictionary
+        """
+        self.keyboard = keyboard_controller
+        self.mouse = mouse_controller
+        self.config = config or {}
+        
+        # Initialize input actions if controllers provided
+        self.actions = None
+        if self.keyboard and self.mouse:
+            self.actions = InputActions(self.keyboard, self.mouse)
+            
+        # Action history for tracking
+        self.action_history = []
+        self.max_history_size = 100
+        
+        logger.info("Action executor initialized")
+        
+    def set_controllers(
+        self,
+        keyboard_controller,
+        mouse_controller
+    ):
+        """Set input controllers.
+        
+        Args:
+            keyboard_controller: Keyboard controller
+            mouse_controller: Mouse controller
+        """
+        self.keyboard = keyboard_controller
+        self.mouse = mouse_controller
+        self.actions = InputActions(self.keyboard, self.mouse)
+        logger.info("Input controllers set for action executor")
+        
+    def execute_action(self, action_name: str, **kwargs) -> bool:
+        """Execute a named action with parameters.
+        
+        Args:
+            action_name: Name of the action to execute
+            **kwargs: Parameters for the action
+            
+        Returns:
+            bool: Success flag
+        """
+        if not self.actions:
+            logger.error("Cannot execute action, no input actions available")
+            return False
+            
+        # Check if the action exists
+        if not hasattr(self.actions, action_name):
+            logger.error(f"Unknown action: {action_name}")
+            return False
+            
+        try:
+            # Get the action method
+            action_method = getattr(self.actions, action_name)
+            
+            # Execute action
+            logger.info(f"Executing action: {action_name} with params: {kwargs}")
+            result = action_method(**kwargs)
+            
+            # Record action
+            self._record_action(action_name, kwargs, result)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error executing action {action_name}: {e}")
+            return False
+            
+    def _record_action(self, action_name: str, params: dict, success: bool):
+        """Record action execution to history.
+        
+        Args:
+            action_name: Name of the action
+            params: Parameters used
+            success: Whether action was successful
+        """
+        timestamp = time.time()
+        record = {
+            'timestamp': timestamp,
+            'action': action_name,
+            'params': params,
+            'success': success
+        }
+        
+        self.action_history.append(record)
+        
+        # Limit history size
+        if len(self.action_history) > self.max_history_size:
+            self.action_history.pop(0)
+            
+    def get_action_history(self) -> List[Dict]:
+        """Get action execution history.
+        
+        Returns:
+            List of action records
+        """
+        return self.action_history.copy()
+
+
+class InputSimulator:
+    """Simulates all user input for the game environment."""
+    
+    def __init__(self, config: Dict[str, Any] = None):
+        """Initialize input simulator.
+        
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config or {}
+        input_config = self.config.get('input', {})
+        
+        # Initialize components
+        self.keyboard_controller = None
+        self.mouse_controller = None
+        self.action_executor = None
+        
+        # Configure components based on config
+        self._configure_input(input_config)
+        
+        logger.info("Input simulator initialized")
+        
+    def _configure_input(self, input_config: Dict[str, Any]):
+        """Configure input components.
+        
+        Args:
+            input_config: Input configuration dictionary
+        """
+        # Create keyboard controller
+        from .keyboard import KeyboardController
+        self.keyboard_controller = KeyboardController(
+            config=input_config.get('keyboard', {})
+        )
+        
+        # Create mouse controller
+        from .mouse import MouseController
+        self.mouse_controller = MouseController(
+            config=input_config.get('mouse', {})
+        )
+        
+        # Create action executor
+        self.action_executor = ActionExecutor(
+            keyboard_controller=self.keyboard_controller,
+            mouse_controller=self.mouse_controller,
+            config=input_config
+        )
+        
+    def get_action_executor(self) -> ActionExecutor:
+        """Get the action executor.
+        
+        Returns:
+            ActionExecutor instance
+        """
+        return self.action_executor
+        
+    def cleanup(self):
+        """Cleanup resources used by the input simulator."""
+        if self.keyboard_controller:
+            self.keyboard_controller.cleanup()
+        if self.mouse_controller:
+            self.mouse_controller.cleanup()
+        logger.info("Input simulator cleaned up") 
