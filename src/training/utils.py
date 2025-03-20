@@ -154,24 +154,23 @@ def setup_hardware_config(args, config_loader: Optional[ConfigLoader] = None):
     
     return config
 
-def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None):
-    """Set up the environment based on arguments.
+def setup_environment(
+    config: HardwareConfig,
+    args: argparse.Namespace,
+    config_loader: ConfigLoader
+) -> Environment:
+    """Set up the environment.
     
     Args:
         config: Hardware configuration
-        args: Parsed arguments
-        config_loader: Optional configuration loader
+        args: Command-line arguments
+        config_loader: Configuration loader
         
     Returns:
-        Environment instance
+        Environment: Environment instance
     """
-    from src.environment.core import Environment
-    from src.environment.mock_environment import MockEnvironment
-    from src.environment.core.error_recovery import ErrorRecovery
-    
-    env_config = {}
-    if config_loader:
-        env_config = config_loader.get_section('environment')
+    # Get environment configuration
+    env_config = config_loader.get_section('environment')
     
     # Create a wrapper class for HardwareConfig that adds a 'get' method
     class ConfigWrapper:
@@ -206,6 +205,7 @@ def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None
     
     # Use mock environment if requested
     if args.mock_env:
+        from src.environment.mock_environment import MockEnvironment
         logger.info("Using mock environment for testing")
         mock_env_params = {
             'frame_height': env_config.get('frame_height', 240),
@@ -216,53 +216,82 @@ def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None
             'menu_probability': env_config.get('menu_probability', 0.02)
         }
         wrapped_config = ConfigWrapper(config, env_config)
-        return MockEnvironment(config=wrapped_config, **mock_env_params)
-    
-    # Create real environment
-    logger.info("Setting up real game environment")
-    
-    # Create a wrapped config that has both HardwareConfig methods and a 'get' method
-    wrapped_config = ConfigWrapper(config, env_config)
-    
-    # Get game path from args or config
-    game_path = args.game_path
-    if not game_path and config_loader:
-        game_path = env_config.get('game_path')
-    
-    # Get window title from args or config
-    window_title = args.window_title
-    if not window_title and config_loader:
-        window_title = env_config.get('window_title', "Cities: Skylines II")
-    
-    logger.info(f"Game path: {game_path or 'Not specified'}")
-    logger.info(f"Window title: {window_title or 'Using default'}")
-    
-    # Remove arguments that might conflict with env_config
-    # to avoid multiple values error
-    env_kwargs = {
-        'config': wrapped_config,
-        'disable_menu_detection': args.disable_menu_detection,
-    }
-    
-    # Add these parameters only if not already in env_config
-    if game_path and 'game_path' not in env_config:
-        env_kwargs['game_path'] = game_path
+        env = MockEnvironment(config=wrapped_config, **mock_env_params)
+    else:
+        # Set up real environment
+        logger.info("Setting up real game environment")
         
-    if window_title and 'window_title' not in env_config:
-        env_kwargs['window_title'] = window_title
+        # Create a wrapped config that has both HardwareConfig methods and a 'get' method
+        wrapped_config = ConfigWrapper(config, env_config)
         
-    # Pass skip_game_check if specified
-    if args.skip_game_check:
-        env_kwargs['skip_game_check'] = args.skip_game_check
+        # Get game path from args or config
+        game_path = args.game_path if hasattr(args, 'game_path') else None
+        if not game_path:
+            game_path = env_config.get('game_path')
+        
+        # Get window title from args or config
+        window_title = args.window_title if hasattr(args, 'window_title') else None
+        if not window_title:
+            window_title = env_config.get('window_title', "Cities: Skylines II")
+        
+        logger.info(f"Game path: {game_path or 'Not specified'}")
+        logger.info(f"Window title: {window_title or 'Using default'}")
+        
+        # Remove arguments that might conflict with env_config
+        # to avoid multiple values error
+        env_kwargs = {
+            'config': wrapped_config,
+            'disable_menu_detection': args.disable_menu_detection if hasattr(args, 'disable_menu_detection') else False,
+        }
+        
+        # Add these parameters only if not already in env_config
+        if game_path and 'game_path' not in env_config:
+            env_kwargs['game_path'] = game_path
+            
+        if window_title and 'window_title' not in env_config:
+            env_kwargs['window_title'] = window_title
+            
+        # Pass skip_game_check if specified
+        if hasattr(args, 'skip_game_check') and args.skip_game_check:
+            env_kwargs['skip_game_check'] = args.skip_game_check
+        
+        # Filter env_config to avoid duplicate parameters
+        filtered_env_config = {k: v for k, v in env_config.items() 
+                            if k not in ('game_path', 'window_title', 'disable_menu_detection')}
+        
+        env = Environment(
+            **env_kwargs,
+            **filtered_env_config
+        )
     
-    # Filter env_config to avoid duplicate parameters
-    filtered_env_config = {k: v for k, v in env_config.items() 
-                          if k not in ('game_path', 'window_title', 'disable_menu_detection')}
+    # Add additional initialization for improved window focus
+    time.sleep(2)  # Wait for environment initialization
     
-    env = Environment(
-        **env_kwargs,
-        **filtered_env_config
-    )
+    # Force window focus with multiple attempts
+    logger.info("Ensuring initial window focus for training")
+    focus_success = False
+    for attempt in range(3):
+        logger.info(f"Focus attempt {attempt+1}/3")
+        if env._ensure_window_focused():
+            focus_success = True
+            logger.info("Window focus successful")
+            break
+        time.sleep(1)
+        
+    if not focus_success:
+        logger.warning("Could not get reliable window focus during initialization")
+        
+    # Set minimum action delay for more reliable action execution
+    env.min_action_delay = 0.3  # Increased from the default 0.1
+    logger.info(f"Set minimum action delay to {env.min_action_delay}s")
+    
+    # Ensure initial observation is available
+    logger.info("Getting initial observation")
+    try:
+        env.get_observation()
+        logger.info("Initial observation obtained successfully")
+    except Exception as e:
+        logger.warning(f"Error getting initial observation: {e}")
     
     return env
 

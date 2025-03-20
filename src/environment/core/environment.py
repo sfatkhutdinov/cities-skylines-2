@@ -277,7 +277,7 @@ class Environment:
         # Execute appropriate action based on menu state
         success = False
         action_retries = 0
-        max_action_retries = 3  # Increased from 2 to 3 for more reliability
+        max_action_retries = 3  # Keep at 3 for more reliability
         
         if menu_detected and self.menu_handler:
             # In menu - try to recover
@@ -289,34 +289,40 @@ class Environment:
             # In game - execute requested action with retries
             while not success and action_retries <= max_action_retries:
                 try:
-                    # Ensure minimum time between actions
+                    # Ensure minimum time between actions - INCREASED for reliability
                     elapsed = time.time() - self.last_action_time
-                    if elapsed < self.min_action_delay:
-                        time.sleep(self.min_action_delay - elapsed)
+                    min_action_delay = 0.3  # Increased from default 0.1
+                    if elapsed < min_action_delay:
+                        time.sleep(min_action_delay - elapsed)
                     
                     # Check if focus was lost and try to regain it before retrying
                     if action_retries > 0:
                         logger.info(f"Retrying action execution (attempt {action_retries+1}/{max_action_retries+1})")
-                        # Try harder to focus on retries
+                        # Always refocus on retries
+                        logger.info("Refocusing window before retry")
                         if not self._ensure_window_focused():
                             logger.warning("Failed to refocus window during action retry")
                             time.sleep(0.5)  # Wait a bit and try again anyway
                         
                     # Execute action
+                    logger.info(f"Executing action {action_idx}")
                     success = self.action_executor.execute_action(action_info)
                     self.last_action_time = time.time()
                     
                     # Track action success/failure for statistics
                     self._track_action_result(action_idx, success)
                     
-                    # Break if successful
+                    # Log success or failure
                     if success:
+                        logger.info(f"Action {action_idx} executed successfully")
                         break
+                    else:
+                        logger.warning(f"Action {action_idx} execution failed")
                     
                     # If failed but can retry, give a short delay
                     if not success and action_retries < max_action_retries:
                         logger.warning(f"Action execution failed, will retry after delay")
-                        time.sleep(1.0)  # Increased wait time before retry
+                        time.sleep(1.0)  # Keep 1.0s delay before retry
                     
                     action_retries += 1
                     
@@ -330,7 +336,7 @@ class Environment:
                         action_retries += 1
                         # Try to refocus the window in case the error was caused by lost focus
                         self._ensure_window_focused()
-                        time.sleep(1.0)  # Increased wait time before retry
+                        time.sleep(1.0)  # Keep 1.0s delay before retry
                     else:
                         break
         
@@ -356,7 +362,7 @@ class Environment:
         # Check if episode is done
         done = self.steps_taken >= self.max_steps
         
-        # Reset consecutive errors counter if successful
+        # Reset consecutive errors counter on success
         if success:
             self.consecutive_errors = 0
         
@@ -579,9 +585,10 @@ class Environment:
             for attempt in range(3):
                 result = self.screen_capture.focus_game_window()
                 if result:
-                    logger.debug(f"Successfully focused game window on attempt {attempt+1}")
+                    logger.info(f"Successfully focused game window on attempt {attempt+1}")
                     # Add a consistent wait time after focus to ensure window is fully responsive
-                    time.sleep(0.75)  # Increased from the 0.5s in the debug script that worked
+                    # This is critical - the window needs time to properly receive input after focus
+                    time.sleep(0.75)  # Increased from the original value
                     return True
                 else:
                     logger.warning(f"Failed to focus game window (attempt {attempt+1}/3)")

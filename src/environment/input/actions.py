@@ -474,10 +474,12 @@ class ActionExecutor:
                         for attempt in range(2):
                             result = self.keyboard.key_press(key, duration)
                             if result:
+                                logger.debug(f"Key press {key} successful on attempt {attempt+1}")
                                 return True
                             elif attempt < 1:  # Don't wait after last attempt
-                                logger.warning(f"Key press failed, retrying after delay")
+                                logger.warning(f"Key press for {key} failed, retrying after delay")
                                 time.sleep(0.5)
+                        logger.error(f"All key press attempts for {key} failed")
                         return False
                     else:
                         logger.error(f"Keyboard controller doesn't support key_press method")
@@ -514,12 +516,24 @@ class ActionExecutor:
                             for attempt in range(2):
                                 if mouse_action == 'click':
                                     # First ensure mouse is at the target position
-                                    self.mouse.mouse_move(x, y)
+                                    move_result = self.mouse.mouse_move(x, y)
+                                    if not move_result:
+                                        logger.warning(f"Failed to move mouse to ({x}, {y}) before click")
+                                        time.sleep(0.2)
+                                        # Try one more time
+                                        move_result = self.mouse.mouse_move(x, y)
+                                        
                                     time.sleep(0.2)  # Wait for mouse to settle
                                     result = self.mouse.mouse_click(x, y, button=button, double=False)
                                 elif mouse_action == 'double_click':
                                     # First ensure mouse is at the target position
-                                    self.mouse.mouse_move(x, y)
+                                    move_result = self.mouse.mouse_move(x, y)
+                                    if not move_result:
+                                        logger.warning(f"Failed to move mouse to ({x}, {y}) before double-click")
+                                        time.sleep(0.2)
+                                        # Try one more time
+                                        move_result = self.mouse.mouse_move(x, y)
+                                        
                                     time.sleep(0.2)  # Wait for mouse to settle
                                     result = self.mouse.mouse_click(x, y, button=button, double=True)
                                 elif mouse_action == 'move':
@@ -529,10 +543,12 @@ class ActionExecutor:
                                     return False
                                     
                                 if result:
+                                    logger.debug(f"Mouse action {mouse_action} at ({x}, {y}) successful on attempt {attempt+1}")
                                     return True
                                 elif attempt < 1:  # Don't wait after last attempt
-                                    logger.warning(f"Mouse action failed, retrying after delay")
+                                    logger.warning(f"Mouse action {mouse_action} at ({x}, {y}) failed, retrying after delay")
                                     time.sleep(0.5)
+                            logger.error(f"All {mouse_action} attempts at ({x}, {y}) failed")
                             return False
                         else:
                             logger.error(f"Mouse controller doesn't support the required methods")
