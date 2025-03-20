@@ -948,131 +948,44 @@ class VisualMetricsEstimator:
         Returns:
             List[Tuple[int, int, int, int]]: List of UI element bounding boxes (x, y, w, h)
         """
-        from src.utils.image_utils import ImageUtils
-        
-        # Convert PyTorch tensor to numpy if needed
-        if isinstance(frame, torch.Tensor):
-            frame_np = frame.detach().cpu().numpy()
-            # Convert from PyTorch's CHW format to HWC format if needed
-            if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:
-                frame_np = frame_np.transpose(1, 2, 0)
-            # Ensure values are in range 0-255 and uint8 type for OpenCV
-            if frame_np.max() <= 1.0:
-                frame_np = (frame_np * 255).astype(np.uint8)
-            else:
-                frame_np = frame_np.astype(np.uint8)
-        else:
-            # If already numpy array, ensure it's uint8 type
-            if frame.dtype != np.uint8:
-                if frame.max() <= 1.0:
-                    frame_np = (frame * 255).astype(np.uint8)
-                else:
-                    frame_np = frame.astype(np.uint8)
-            else:
-                frame_np = frame
-        
-        # Create image utils if not already created
-        if not hasattr(self, 'image_utils'):
-            self.image_utils = ImageUtils()
-            
-        # Enhanced UI detection
-        ui_elements = []
-        
         try:
-            # First try using image utils
-            standard_elements = self.image_utils.detect_ui_elements(frame_np)
-            ui_elements.extend(standard_elements)
-            
-            # Add additional detection method for more robust detection
-            if len(frame_np.shape) == 3:
-                gray = cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = frame_np
-            
-            # 1. Multi-threshold UI element detection
-            for threshold in [120, 150, 180, 200, 220]:
-                _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-                contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Safety check for None or invalid frames
+            if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+                logger.warning("Invalid frame passed to detect_ui_elements")
+                return []
                 
-                for contour in contours:
-                    x, y, w, h = cv2.boundingRect(contour)
-                    # Filter by reasonable UI element size
-                    if w > 5 and h > 5 and w < frame_np.shape[1] // 2 and h < frame_np.shape[0] // 2:
-                        ui_elements.append((x, y, w, h))
+            # Get image utils instance safety
+            if not hasattr(self, 'image_utils'):
+                from src.utils.image_utils import ImageUtils
+                self.image_utils = ImageUtils()
             
-            # 2. Edge detection for UI borders
-            edges = cv2.Canny(gray, 30, 150)
-            # Dilate edges to connect nearby lines
-            kernel = np.ones((3, 3), np.uint8)
-            dilated = cv2.dilate(edges, kernel, iterations=1)
-            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                # Only add large contours that might be UI panels
-                if w > 20 and h > 20 and w < frame_np.shape[1] * 0.8 and h < frame_np.shape[0] * 0.8:
-                    ui_elements.append((x, y, w, h))
-            
-            # 3. Adaptive thresholding for better text detection
-            adaptive_thresh = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-            )
-            contours, _ = cv2.findContours(adaptive_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                # Filter for text-like proportions
-                if w > 5 and h > 5 and w/h < 15 and h/w < 15:
-                    ui_elements.append((x, y, w, h))
+            # Use ImageUtils to detect UI elements with robust error handling
+            try:
+                frame_np = frame
+                # Handle tensor conversion if needed
+                if hasattr(frame, 'detach'):
+                    frame_np = frame.detach().cpu().numpy()
+                    if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:  # CHW format
+                        frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
                 
-            # 4. Search for rectangular shapes (menu panels)
-            # Use morphological operations to enhance rectangular shapes
-            morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            morph_close = cv2.morphologyEx(edges.copy(), cv2.MORPH_CLOSE, morph_kernel)
-            
-            contours, _ = cv2.findContours(morph_close, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for contour in contours:
-                # Approximate contour to simplify shape
-                epsilon = 0.02 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
+                # Ensure proper data type
+                if frame_np.dtype != np.uint8:
+                    if frame_np.max() <= 1.0:
+                        frame_np = (frame_np * 255).astype(np.uint8)
+                    else:
+                        frame_np = frame_np.astype(np.uint8)
                 
-                # Check if shape is rectangular (4-sided) or close to it
-                if len(approx) >= 4 and len(approx) <= 6:
-                    x, y, w, h = cv2.boundingRect(approx)
-                    # Filter for panels
-                    if w > 30 and h > 30:
-                        ui_elements.append((x, y, w, h))
-            
-            # 5. Sort and merge overlapping elements
-            ui_elements = sorted(ui_elements, key=lambda x: (x[0], x[1]))
-            i = 0
-            while i < len(ui_elements) - 1:
-                x1, y1, w1, h1 = ui_elements[i]
-                x2, y2, w2, h2 = ui_elements[i + 1]
+                # Use ImageUtils to detect UI elements
+                standard_elements = self.image_utils.detect_ui_elements(frame_np)
+                if standard_elements is None:
+                    standard_elements = []
                 
-                # Check for significant overlap
-                if (x1 <= x2 + w2 and x2 <= x1 + w1 and 
-                    y1 <= y2 + h2 and y2 <= y1 + h1):
-                    # Merge the boxes
-                    x = min(x1, x2)
-                    y = min(y1, y2)
-                    w = max(x1 + w1, x2 + w2) - x
-                    h = max(y1 + h1, y2 + h2) - y
-                    
-                    ui_elements[i] = (x, y, w, h)
-                    ui_elements.pop(i + 1)
-                else:
-                    i += 1
-            
-            # Remove duplicates
-            unique_elements = []
-            for elem in ui_elements:
-                if elem not in unique_elements:
-                    unique_elements.append(elem)
-            
-            return unique_elements
+                return standard_elements
+            except Exception as e:
+                logger.error(f"Error in detect_ui_elements using ImageUtils: {e}")
+                return []
         except Exception as e:
-            logger.error(f"Error detecting UI elements: {e}")
+            logger.error(f"Uncaught error in detect_ui_elements: {e}")
             return []
 
     def calculate_ui_density(self, frame: np.ndarray) -> float:
@@ -1201,4 +1114,57 @@ class VisualMetricsEstimator:
             return menu_score
         except Exception as e:
             logger.error(f"Error detecting menu contrast pattern: {e}")
-            return 0.0 
+            return 0.0
+
+    def calculate_frame_difference(self, frame1, frame2):
+        """Calculate the difference between two frames.
+        
+        Args:
+            frame1: First frame (torch.Tensor or numpy array)
+            frame2: Second frame (torch.Tensor or numpy array)
+            
+        Returns:
+            float: Difference score between 0 and 1
+        """
+        # Ensure frames are valid
+        if frame1 is None or frame2 is None:
+            return 0.0
+            
+        # Convert to numpy if needed
+        if isinstance(frame1, torch.Tensor):
+            frame1_np = frame1.detach().cpu().numpy()
+            # Convert CHW to HWC format if needed
+            if len(frame1_np.shape) == 3 and frame1_np.shape[0] == 3:
+                frame1_np = np.transpose(frame1_np, (1, 2, 0))
+        else:
+            frame1_np = frame1
+            
+        if isinstance(frame2, torch.Tensor):
+            frame2_np = frame2.detach().cpu().numpy()
+            # Convert CHW to HWC format if needed
+            if len(frame2_np.shape) == 3 and frame2_np.shape[0] == 3:
+                frame2_np = np.transpose(frame2_np, (1, 2, 0))
+        else:
+            frame2_np = frame2
+            
+        # Convert to grayscale if needed
+        if len(frame1_np.shape) == 3 and frame1_np.shape[2] == 3:
+            frame1_gray = cv2.cvtColor(frame1_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        else:
+            frame1_gray = frame1_np.astype(np.uint8)
+            
+        if len(frame2_np.shape) == 3 and frame2_np.shape[2] == 3:
+            frame2_gray = cv2.cvtColor(frame2_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        else:
+            frame2_gray = frame2_np.astype(np.uint8)
+            
+        # Ensure frames are the same size
+        if frame1_gray.shape != frame2_gray.shape:
+            # Resize frame2 to match frame1
+            frame2_gray = cv2.resize(frame2_gray, (frame1_gray.shape[1], frame1_gray.shape[0]))
+            
+        # Calculate mean absolute difference
+        diff = cv2.absdiff(frame1_gray, frame2_gray)
+        diff_score = np.mean(diff) / 255.0
+        
+        return diff_score 

@@ -114,31 +114,58 @@ class ImageUtils:
         Returns:
             List[Tuple[int, int, int, int]]: List of UI element bounding boxes (x, y, w, h)
         """
-        if frame is None:
-            return []
-            
-        # Convert to grayscale if needed
-        if frame.ndim == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = frame
-            
-        # Apply thresholding to highlight UI elements (buttons, text, etc.)
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        
-        # Find contours in the thresholded image
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filter contours by size to find likely UI elements
-        ui_elements = []
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Filter by size to exclude noise
-            if w > 10 and h > 10 and w < frame.shape[1] // 2 and h < frame.shape[0] // 2:
-                ui_elements.append((x, y, w, h))
+        try:
+            if frame is None:
+                logger.warning("Received None frame in detect_ui_elements")
+                return []
                 
-        return ui_elements
+            # Check frame validity
+            if not isinstance(frame, np.ndarray):
+                logger.error(f"Invalid frame type in detect_ui_elements: {type(frame)}")
+                return []
+                
+            if frame.size == 0 or frame.ndim < 2:
+                logger.error(f"Invalid frame shape in detect_ui_elements: {frame.shape}")
+                return []
+                
+            # Convert to grayscale if needed
+            try:
+                if frame.ndim == 3:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = frame
+                    
+                # Apply thresholding to highlight UI elements (buttons, text, etc.)
+                _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+                
+                # Find contours in the thresholded image
+                contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                # Check if contours is None (shouldn't happen but being defensive)
+                if contours is None:
+                    logger.warning("No contours found in detect_ui_elements")
+                    return []
+                
+                # Filter contours by size to find likely UI elements
+                ui_elements = []
+                for contour in contours:
+                    try:
+                        x, y, w, h = cv2.boundingRect(contour)
+                        
+                        # Filter by size to exclude noise
+                        if w > 10 and h > 10 and w < frame.shape[1] // 2 and h < frame.shape[0] // 2:
+                            ui_elements.append((x, y, w, h))
+                    except Exception as e:
+                        logger.warning(f"Error processing contour: {e}")
+                        continue
+                        
+                return ui_elements
+            except Exception as e:
+                logger.error(f"Error in image processing for detect_ui_elements: {e}")
+                return []
+        except Exception as e:
+            logger.error(f"Uncaught exception in detect_ui_elements: {e}")
+            return []
     
     def template_match(self, frame: np.ndarray, template: np.ndarray, 
                       threshold: float = 0.8, 

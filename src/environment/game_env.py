@@ -158,6 +158,14 @@ class CitiesEnvironment:
             
             # New attributes
             self.in_menu = False
+            self.max_menu_stuck_steps = 5
+            self.likely_in_menu_from_mouse_test = False
+            self.mouse_freedom_visual_change = 1.0  # Initialize with high value (indicates not in menu)
+            self.last_mouse_freedom_test_time = 0
+            self.previous_menu_state = False
+            self.menu_entry_time = 0
+            self.last_menu_exit_time = 0
+            self.menu_entry_count = 0
             
             # Game crash detection
             self.game_crashed = False
@@ -168,17 +176,6 @@ class CitiesEnvironment:
             self.waiting_for_game_restart = False
             self.game_restart_check_interval = 5.0  # Seconds between checking if game has restarted
             self.last_game_restart_check = time.time()
-            
-            # Initialize likely_in_menu_from_mouse_test
-            self.likely_in_menu_from_mouse_test = False
-            self.mouse_freedom_visual_change = 1.0  # Initialize with high value (indicates not in menu)
-            self.last_mouse_freedom_test_time = 0
-            
-            # Menu detection state
-            self.previous_menu_state = False
-            self.menu_entry_time = 0
-            self.last_menu_exit_time = 0
-            self.menu_entry_count = 0
         
     def _setup_actions(self) -> Dict[int, Dict[str, Any]]:
         """Setup the action space for the agent using default game key bindings."""
@@ -405,27 +402,70 @@ class CitiesEnvironment:
         # Keep trying to exit menu if detected
         menu_attempts = 0
         max_menu_exit_attempts = 5
+        last_menu_type = None
+        consecutive_same_menu = 0
         
         while self.check_menu_state() and menu_attempts < max_menu_exit_attempts:
+            # Get current menu info
+            menu_detected, menu_type, _ = self.menu_handler.detect_menu(self.screen_capture.capture_frame())
+            
+            # Track if we're seeing the same menu repeatedly
+            if menu_type == last_menu_type:
+                consecutive_same_menu += 1
+            else:
+                consecutive_same_menu = 0
+            last_menu_type = menu_type
+                
             logger.info(f"Detected menu during reset, attempting to exit (attempt {menu_attempts+1})")
             
-            # Try to exit menu
-            self.input_simulator.key_press('escape')
-            time.sleep(0.7)
-            
-            # Try clicking resume button
-            width, height = self._get_screen_dimensions()
-            resume_x = int(width * 0.15)
-            resume_y = int(height * 0.25)
-            self.input_simulator.mouse_click(resume_x, resume_y)
-            time.sleep(0.7)
-            
-            # Try again with specific resume coords for main menu
-            resume_x = int(width * 0.5)  # Center X
-            resume_y = int(height * 0.4)  # About 40% down from top
-            self.input_simulator.mouse_click(resume_x, resume_y)
-            time.sleep(0.7)
-            
+            # If we've tried the same menu 3 times, try a different approach
+            if consecutive_same_menu >= 2:
+                logger.warning(f"Same menu type {menu_type} detected multiple times, trying alternative exit method")
+                # Click in different locations based on menu type
+                width, height = self._get_screen_dimensions()
+                
+                if menu_type == "main_menu":
+                    # For main menu, try clicking "Resume Game" near top
+                    resume_x = int(width * 0.5)
+                    resume_y = int(height * 0.35)
+                    self.input_simulator.mouse_click(resume_x, resume_y)
+                    time.sleep(0.5)
+                    
+                    # Also try "Continue" button
+                    resume_x = int(width * 0.5)
+                    resume_y = int(height * 0.45)
+                    self.input_simulator.mouse_click(resume_x, resume_y)
+                elif menu_type == "settings_menu":
+                    # For settings menu, try clicking back/close button (top-right)
+                    close_x = int(width * 0.95)
+                    close_y = int(height * 0.05)
+                    self.input_simulator.mouse_click(close_x, close_y)
+                    time.sleep(0.5)
+                    
+                    # Also try back button (bottom)
+                    back_x = int(width * 0.15)
+                    back_y = int(height * 0.9)
+                    self.input_simulator.mouse_click(back_x, back_y)
+                else:
+                    # Generic approach - try pressing ESC and clicking center-bottom
+                    self.input_simulator.key_press('escape')
+                    time.sleep(0.5)
+                    self.input_simulator.mouse_click(width // 2, int(height * 0.8))
+            else:
+                # Standard approach - try to exit menu with ESC key
+                self.input_simulator.key_press('escape')
+                time.sleep(0.5)
+                self.input_simulator.key_press('enter')  # Sometimes helps confirm dialogs
+                time.sleep(0.2)
+                
+                # Try clicking resume button (vary location slightly each time)
+                width, height = self._get_screen_dimensions()
+                variation = menu_attempts * 0.05  # Vary by 5% each attempt
+                resume_x = int(width * (0.15 + variation))
+                resume_y = int(height * (0.25 + variation))
+                self.input_simulator.mouse_click(resume_x, resume_y)
+                time.sleep(0.5)
+                
             # Increment counter
             menu_attempts += 1
             
