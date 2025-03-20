@@ -2,10 +2,46 @@
 Environment package for Cities: Skylines 2 agent.
 """
 
-from .game_env import CitiesEnvironment
-from .input_simulator import InputSimulator
-from .optimized_capture import OptimizedScreenCapture
-from .visual_metrics import VisualMetricsEstimator
-from .autonomous_reward_system import AutonomousRewardSystem
+# Backward compatibility alias
+from src.environment.game_env import CitiesEnvironment
 
-__all__ = ['CitiesEnvironment', 'InputSimulator', 'OptimizedScreenCapture', 'VisualMetricsEstimator', 'AutonomousRewardSystem'] 
+# New modular structure
+from src.environment.core import Environment
+from src.environment.core import GameState
+from src.environment.core import ObservationManager
+from src.environment.core import ActionSpace
+from src.environment.core import PerformanceMonitor
+
+# Import components from modularized sections
+from src.environment.input import InputSimulator, KeyboardController, MouseController
+from src.environment.menu import MenuHandler, MenuDetector, MenuNavigator, MenuRecovery, MenuTemplateManager
+from src.environment.rewards import AutonomousRewardSystem, VisualChangeAnalyzer, WorldModelCNN
+
+__all__ = [
+    # Legacy classes
+    'CitiesEnvironment',
+    
+    # Core environment
+    'Environment',
+    'GameState',
+    'ObservationManager',
+    'ActionSpace',
+    'PerformanceMonitor',
+    
+    # Input components
+    'InputSimulator',
+    'KeyboardController',
+    'MouseController',
+    
+    # Menu components
+    'MenuHandler',
+    'MenuDetector',
+    'MenuNavigator',
+    'MenuRecovery',
+    'MenuTemplateManager',
+    
+    # Reward components
+    'AutonomousRewardSystem',
+    'VisualChangeAnalyzer',
+    'WorldModelCNN'
+] 
