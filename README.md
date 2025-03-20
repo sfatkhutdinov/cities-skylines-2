@@ -173,5 +173,5 @@ Current progress:
 - ✅ Menu handling modularization
 - ✅ Input simulation modularization
 - ✅ Reward system modularization
-- ⬜ Core environment modularization
+- ✅ Core environment modularization
 - ⬜ Agent module modularization 
