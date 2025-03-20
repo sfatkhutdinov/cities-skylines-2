@@ -312,6 +312,78 @@ class InputActions:
         # Nothing specific needed here, as keyboard and mouse are
         # passed in and managed externally
         logger.info("Input actions resources released")
+    
+    def click(self, x: int, y: int, button: str = 'left', double: bool = False) -> bool:
+        """Click at a specific location.
+        
+        Args:
+            x: X screen coordinate
+            y: Y screen coordinate
+            button: Mouse button ('left', 'right', or 'middle')
+            double: Whether to perform a double click
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.info(f"Clicking at ({x}, {y}) with {button} button, double={double}")
+        if double:
+            return self.mouse.mouse_double_click(x, y, button)
+        else:
+            return self.mouse.mouse_click(x, y, button)
+    
+    def drag(self, start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.5, button: str = 'left') -> bool:
+        """Drag from one position to another.
+        
+        Args:
+            start_x: Starting X coordinate
+            start_y: Starting Y coordinate
+            end_x: Ending X coordinate
+            end_y: Ending Y coordinate
+            duration: Duration of the drag operation
+            button: Mouse button to use for dragging
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.info(f"Dragging from ({start_x}, {start_y}) to ({end_x}, {end_y}), duration={duration}s")
+        return self.mouse.mouse_drag(start_x, start_y, end_x, end_y, duration, button)
+    
+    def edge_scroll(self, direction: str, duration: float = 0.5) -> bool:
+        """Scroll the view by moving the mouse to the screen edge.
+        
+        Args:
+            direction: Direction to scroll ('left', 'right', 'up', 'down')
+            duration: How long to hold at the edge
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        # Calculate edge position based on direction
+        screen_width, screen_height = self.mouse.screen_width, self.mouse.screen_height
+        
+        # Calculate coordinates (stay 2 pixels from edge to avoid triggering OS features)
+        if direction.lower() == 'left':
+            x, y = 2, screen_height // 2
+        elif direction.lower() == 'right':
+            x, y = screen_width - 2, screen_height // 2
+        elif direction.lower() == 'up':
+            x, y = screen_width // 2, 2
+        elif direction.lower() == 'down':
+            x, y = screen_width // 2, screen_height - 2
+        else:
+            logger.warning(f"Invalid edge scroll direction: {direction}")
+            return False
+        
+        logger.info(f"Edge scrolling {direction} for {duration}s")
+        
+        # Move mouse to edge and wait
+        self.mouse.mouse_move(x, y)
+        time.sleep(duration)
+        
+        # Move back to center
+        self.mouse.mouse_move(screen_width // 2, screen_height // 2)
+        
+        return True
 
 
 class ActionExecutor:
@@ -374,6 +446,30 @@ class ActionExecutor:
         if not self.actions:
             logger.error("Cannot execute action, no input actions available")
             return False
+            
+        # Handle case where action is an integer (action ID)
+        if isinstance(action_name, int):
+            logger.info(f"Converting action ID {action_name} to string")
+            action_name = str(action_name)
+            
+        # Handle case where action is a dict
+        if isinstance(action_name, dict):
+            # Handle "type" + "key" format - convert to key_press action
+            if 'type' in action_name and action_name['type'] == 'key' and 'key' in action_name:
+                key = action_name.get('key')
+                duration = action_name.get('duration', 0.1)
+                logger.info(f"Converting 'key' action format to key_press with key={key}, duration={duration}")
+                return self.keyboard.key_press(key, duration)
+            
+            # Legacy format with 'action' key
+            elif 'action' in action_name:
+                params = {k: v for k, v in action_name.items() if k != 'action'}
+                action_str = action_name['action']
+                logger.debug(f"Extracted action '{action_str}' from dictionary with params: {params}")
+                return self.execute_action(action_str, **params)
+            else:
+                logger.error(f"Invalid action dictionary format: {action_name}")
+                return False
             
         # Check if the action exists
         if not hasattr(self.actions, action_name):
@@ -457,8 +553,9 @@ class InputSimulator:
             input_config: Input configuration dictionary
         """
         # Create keyboard controller
-        from .keyboard import KeyboardController
+        from .keyboard import KeyboardController, KeyboardInput
         self.keyboard_controller = KeyboardController()
+        self.keyboard_input = KeyboardInput()
         
         # Create mouse controller
         from .mouse import MouseController
@@ -478,6 +575,24 @@ class InputSimulator:
             ActionExecutor instance
         """
         return self.action_executor
+    
+    def press_key(self, key: str) -> bool:
+        """Press a key without holding it.
+        
+        Args:
+            key: Key to press
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            # Press and quickly release the key using the keyboard input
+            if hasattr(self, 'keyboard_input') and self.keyboard_input:
+                return self.keyboard_input.key_press(key, duration=0.1)
+            return False
+        except Exception as e:
+            logger.error(f"Error in press_key: {e}")
+            return False
         
     def cleanup(self):
         """Cleanup resources used by the input simulator."""

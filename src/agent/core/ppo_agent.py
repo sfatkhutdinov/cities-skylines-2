@@ -505,4 +505,46 @@ class PPOAgent:
             'action_dim': self.action_dim,
             'steps_taken': self.steps_taken,
             'episodes_completed': self.episodes_completed
-        } 
+        }
+    
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Load state dictionary for checkpointing.
+        
+        Args:
+            state_dict: State dictionary containing agent state
+        """
+        # Check if state dimensions match
+        if 'state_dim' in state_dict and state_dict['state_dim'] != self.state_dim:
+            logger.warning(f"State dimensions don't match: {state_dict['state_dim']} vs {self.state_dim}")
+        
+        if 'action_dim' in state_dict and state_dict['action_dim'] != self.action_dim:
+            logger.warning(f"Action dimensions don't match: {state_dict['action_dim']} vs {self.action_dim}")
+            return
+        
+        # Load network state
+        if 'network' in state_dict:
+            try:
+                self.network.load_state_dict(state_dict['network'])
+            except Exception as e:
+                logger.error(f"Error loading network state: {e}")
+        
+        # Load component states
+        if 'policy' in state_dict:
+            self.policy.load_state_dict(state_dict['policy'])
+        
+        if 'value_function' in state_dict:
+            self.value_function.load_state_dict(state_dict['value_function'])
+        
+        if 'updater' in state_dict:
+            self.updater.load_state_dict(state_dict['updater'])
+        
+        # Load other parameters
+        self.gamma = state_dict.get('gamma', self.gamma)
+        self.gae_lambda = state_dict.get('gae_lambda', self.gae_lambda)
+        self.steps_taken = state_dict.get('steps_taken', 0)
+        self.episodes_completed = state_dict.get('episodes_completed', 0)
+        
+        # Update value function parameters
+        self.value_function.set_params(gamma=self.gamma, gae_lambda=self.gae_lambda)
+        
+        logger.info("Agent state loaded successfully") 

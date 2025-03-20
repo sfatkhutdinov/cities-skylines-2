@@ -236,4 +236,24 @@ class PerformanceMonitor:
         # Update optimization level for any performance safeguards
         if hasattr(environment, 'safeguards') and hasattr(environment.safeguards, 'set_optimization_level'):
             environment.safeguards.set_optimization_level(self.optimization_level)
-            logger.info(f"Updated safeguards optimization level to {self.optimization_level}") 
+            logger.info(f"Updated safeguards optimization level to {self.optimization_level}")
+    
+    def close(self):
+        """Clean up resources used by the performance monitor."""
+        logger.debug("Closing performance monitor")
+        # Clear histories
+        self.fps_history.clear()
+        self.cpu_usage_history.clear()
+        self.gpu_usage_history.clear()
+        self.ram_usage_history.clear()
+    
+    def get_fps(self) -> float:
+        """Get the current FPS (frames per second).
+        
+        Returns:
+            float: Current FPS or target FPS if no data available
+        """
+        if not self.fps_history:
+            return self.target_fps
+            
+        return sum(self.fps_history) / max(1, len(self.fps_history)) 

@@ -25,7 +25,8 @@ class ErrorRecovery:
         game_path: Optional[str] = None,
         max_restart_attempts: int = 3,
         timeout_seconds: int = 120,
-        input_simulator = None
+        input_simulator = None,
+        skip_game_check: bool = False
     ):
         """Initialize error recovery module.
         
@@ -35,12 +36,14 @@ class ErrorRecovery:
             max_restart_attempts: Maximum number of restart attempts
             timeout_seconds: Timeout for game start/restart
             input_simulator: Input simulator for menu navigation
+            skip_game_check: If True, skip game process verification
         """
         self.process_name = process_name
         self.game_path = game_path
         self.max_restart_attempts = max_restart_attempts
         self.timeout_seconds = timeout_seconds
         self.input_simulator = input_simulator
+        self.skip_game_check = skip_game_check
         
         # Error tracking
         self.restart_attempts = 0
@@ -58,7 +61,7 @@ class ErrorRecovery:
         self.pre_restart_callback: Optional[Callable] = None
         self.post_restart_callback: Optional[Callable] = None
         
-        logger.info(f"Initialized error recovery module for process '{process_name}'")
+        logger.info(f"Initialized error recovery module for process '{process_name}', skip_game_check={skip_game_check}")
     
     def register_callbacks(self, pre_restart: Optional[Callable] = None, post_restart: Optional[Callable] = None):
         """Register callbacks for restart events.
@@ -76,6 +79,11 @@ class ErrorRecovery:
         Returns:
             bool: True if the game is running, False otherwise
         """
+        # If skip_game_check is True, always return True
+        if self.skip_game_check:
+            logger.info("Skipping game process check as requested")
+            return True
+            
         for proc in psutil.process_iter(['name']):
             try:
                 if self.process_name.lower() in proc.info['name'].lower():
@@ -211,7 +219,26 @@ class ErrorRecovery:
                 except Exception as e:
                     logger.error(f"Error in pre-restart callback: {e}")
             
-            # Kill any existing game processes
+            # Handle skip_game_check case
+            if self.skip_game_check:
+                logger.info("Skipping game process verification, attempting to focus window only")
+                # Try to find and focus the game window
+                self.focus_game_window()
+                time.sleep(2)  # Short wait for focus
+                
+                # Call post-restart callback if registered
+                if hasattr(self, 'post_restart_callback') and self.post_restart_callback:
+                    try:
+                        self.post_restart_callback()
+                    except Exception as e:
+                        logger.error(f"Error in post-restart callback: {e}")
+                
+                # Reset restart attempts
+                self.restart_attempts = 0
+                logger.info("Focus operation completed with skip_game_check=True")
+                return True
+            
+            # Normal case: Kill any existing game processes
             self._kill_game_processes()
             
             # Start the game

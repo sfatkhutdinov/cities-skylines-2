@@ -53,7 +53,7 @@ class ObservationManager:
         self.target_resolution = (84, 84)  # Width, height
         
         # Processing options
-        self.grayscale = True
+        self.grayscale = False  # Using RGB (3 channels) instead of grayscale
         self.normalize = True
         
         # Capture timing
@@ -160,16 +160,32 @@ class ObservationManager:
         
         return torch.abs(current - previous)
     
-    def _process_frame(self, frame: torch.Tensor) -> torch.Tensor:
+    def _process_frame(self, frame) -> torch.Tensor:
         """Process raw frame for neural network input.
         
         Args:
-            frame: Raw frame from screen capture
+            frame: Raw frame from screen capture (numpy.ndarray or torch.Tensor)
             
         Returns:
             torch.Tensor: Processed frame
         """
         import torch.nn.functional as F
+        
+        # Convert numpy array to torch tensor if needed
+        if not isinstance(frame, torch.Tensor):
+            try:
+                # Make a copy of the array to avoid negative stride issues
+                if isinstance(frame, np.ndarray):
+                    frame = frame.copy()
+                
+                # Convert from HWC to CHW format
+                frame = torch.from_numpy(frame).permute(2, 0, 1) if frame.ndim == 3 else torch.from_numpy(frame)
+            except Exception as e:
+                logger.error(f"Error converting numpy array to tensor: {e}")
+                # Return a blank frame as fallback
+                blank = torch.zeros((3, self.target_resolution[1], self.target_resolution[0]), 
+                                     dtype=torch.float32, device=self.device)
+                return blank
         
         # Convert to float if needed
         if frame.dtype != torch.float32:
@@ -179,7 +195,7 @@ class ObservationManager:
         if self.normalize and frame.max() > 1.0:
             frame = frame / 255.0
             
-        # Convert to grayscale if needed
+        # Convert to grayscale if needed (for grayscale mode)
         if self.grayscale and frame.shape[0] == 3:
             # RGB to grayscale conversion weights
             weights = torch.tensor([0.299, 0.587, 0.114], device=frame.device).view(3, 1, 1)
@@ -199,6 +215,14 @@ class ObservationManager:
         if frame.device != self.device:
             frame = frame.to(self.device)
             
+        # Ensure correct number of channels (1 for grayscale, 3 for RGB)
+        if self.grayscale and frame.shape[0] != 1:
+            logger.warning(f"Expected grayscale image with 1 channel, but got {frame.shape[0]} channels. Reshaping.")
+            frame = frame[0:1, :, :]
+        elif not self.grayscale and frame.shape[0] != 3:
+            logger.warning(f"Expected RGB image with 3 channels, but got {frame.shape[0]} channels. Reshaping.")
+            frame = frame.expand(3, -1, -1)
+            
         return frame
     
     def close(self) -> None:
@@ -214,4 +238,15 @@ class ObservationManager:
             Tuple[int, int, int]: Shape of observations (channels, height, width)
         """
         channels = 1 if self.grayscale else 3
-        return (channels, self.target_resolution[1], self.target_resolution[0]) 
+        return (channels, self.target_resolution[1], self.target_resolution[0])
+    
+    def capture_frame(self) -> Optional[np.ndarray]:
+        """Capture a frame from the screen.
+        
+        Returns:
+            numpy.ndarray: Captured frame as numpy array in RGB format,
+                          or None if capture failed
+        """
+        if hasattr(self, 'screen_capture') and self.screen_capture:
+            return self.screen_capture.capture_frame()
+        return None 

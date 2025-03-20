@@ -36,6 +36,8 @@ class Environment:
                  disable_menu_detection: bool = False,
                  game_path: Optional[str] = None,
                  process_name: str = "CitiesSkylines2",
+                 window_title: Optional[str] = None,
+                 skip_game_check: bool = False,
                  **kwargs):
         """Initialize the Cities: Skylines 2 environment.
         
@@ -46,6 +48,8 @@ class Environment:
             disable_menu_detection: Whether to disable menu detection
             game_path: Path to the game executable
             process_name: Name of the game process
+            window_title: Title of the game window
+            skip_game_check: Skip game process verification (assume game is running)
             **kwargs: Additional arguments
         """
         # Basic setup
@@ -56,9 +60,23 @@ class Environment:
         self.disable_menu_detection = disable_menu_detection
         self.game_path = game_path
         self.process_name = process_name
+        self.window_title = window_title or "Cities: Skylines II"
+        self.skip_game_check = skip_game_check
+        
+        if self.skip_game_check:
+            logger.info("Game process verification is disabled - assuming game is already running")
         
         if self.disable_menu_detection:
             logger.info("Menu detection is disabled - menu detection and recovery will be skipped")
+            
+        # If config is a wrapped object with get method, update capture config with window title
+        if hasattr(self.config, 'get') and callable(getattr(self.config, 'get')):
+            capture_config = self.config.get('capture', {})
+            capture_config['window_title'] = self.window_title
+            
+            # Create updated config
+            if hasattr(self.config, 'sections'):
+                self.config.sections['capture'] = capture_config
         
         # Initialize the core components
         self.observation_manager = ObservationManager(config=self.config, mock_mode=mock_mode)
@@ -73,7 +91,8 @@ class Environment:
         # Initialize the input system
         input_simulator = InputSimulator(config=self.config)
         
-        # Get action executor from input simulator
+        # Store reference to input simulator and get action executor
+        self.input_simulator = input_simulator
         self.action_executor = input_simulator.get_action_executor()
         
         # Initialize menu handler if not disabled
@@ -95,12 +114,13 @@ class Environment:
         self.error_recovery = ErrorRecovery(
             process_name=self.process_name,
             game_path=self.game_path,
+            max_restart_attempts=3,
+            timeout_seconds=120,
             input_simulator=input_simulator,
-            max_restart_attempts=kwargs.get('restart_attempts', 3),
-            timeout_seconds=kwargs.get('restart_timeout', 120)
+            skip_game_check=self.skip_game_check
         )
         
-        # Register error recovery callbacks
+        # Register callbacks for game restart events
         self.error_recovery.register_callbacks(
             pre_restart=self._pre_restart_callback,
             post_restart=self._post_restart_callback
@@ -295,12 +315,17 @@ class Environment:
             observation = self.observation_manager.get_observation()
             return observation
         except Exception as e:
+            # Log the specific error for debugging
             logger.error(f"Error getting observation: {e}")
             self.consecutive_errors += 1
+            
             # Return the previous observation if available, otherwise a blank one
             if self.current_frame is not None:
                 return self.current_frame
-            return torch.zeros(self.observation_manager.get_observation_shape(), dtype=self.dtype, device=self.device)
+                
+            # Create a compatible blank observation
+            shape = self.observation_manager.get_observation_shape()
+            return torch.zeros(shape, dtype=torch.float32, device=self.device)
     
     def close(self) -> None:
         """Clean up resources."""
@@ -365,6 +390,12 @@ class Environment:
     
     def _ensure_game_running(self) -> None:
         """Make sure the game is running, start it if not."""
+        if self.skip_game_check:
+            logger.info("Skipping game process verification as requested")
+            # Still wait a bit to ensure window is properly focused
+            time.sleep(1) 
+            return
+            
         if not self.check_game_state():
             logger.warning("Game not running at environment initialization")
             if not self.error_recovery.restart_game():
@@ -384,14 +415,14 @@ class Environment:
         try:
             logger.debug(f"Setting game speed to level {speed_level}")
             # First set to minimum speed
-            self.action_executor.input_simulator.press_key('1')
+            self.input_simulator.press_key('1')
             time.sleep(0.1)
             
             # Then set to desired speed
             if speed_level == 2:
-                self.action_executor.input_simulator.press_key('2')
+                self.input_simulator.press_key('2')
             elif speed_level == 3:
-                self.action_executor.input_simulator.press_key('3')
+                self.input_simulator.press_key('3')
         except Exception as e:
             logger.error(f"Error setting game speed: {e}")
     
@@ -468,6 +499,24 @@ class Environment:
 
     def _ensure_window_focused(self):
         """Ensure the game window is focused before taking actions."""
-        if not self.mock_mode and hasattr(self.screen_capture, 'focus_game_window'):
-            return self.screen_capture.focus_game_window()
+        if self.mock_mode:
+            return True
+            
+        if hasattr(self.screen_capture, 'focus_game_window'):
+            logger.debug("Attempting to focus game window")
+            
+            # Try multiple focus attempts if needed
+            for attempt in range(3):
+                result = self.screen_capture.focus_game_window()
+                if result:
+                    logger.debug(f"Successfully focused game window on attempt {attempt+1}")
+                    return True
+                else:
+                    logger.warning(f"Failed to focus game window (attempt {attempt+1}/3)")
+                    time.sleep(0.5)
+            
+            logger.error("Failed to focus game window after multiple attempts")
+            return False
+            
+        logger.warning("Screen capture doesn't support window focusing")
         return True 

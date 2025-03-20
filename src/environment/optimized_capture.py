@@ -52,7 +52,7 @@ class OptimizedScreenCapture:
         # Initialize capture state
         self.last_capture_time = 0
         self.use_mock = False
-        self.window_title = "Cities: Skylines II"
+        self.window_title = self.capture_config.get('window_title', "Cities: Skylines II")
         self.client_position = None
         self.sct = None
         self.initialized = False
@@ -102,36 +102,130 @@ class OptimizedScreenCapture:
             return
             
         try:
-            hwnd = win32gui.FindWindow(None, self.window_title)
+            # Use the provided window title as the primary search target
+            primary_title = self.window_title
+            logger.info(f"Searching for game window with title: '{primary_title}'")
+            
+            # Try several possible window titles, with the provided title first
+            possible_titles = [
+                primary_title,
+                "Cities: Skylines II",
+                "Cities Skylines II", 
+                "Cities: Skylines 2",
+                "Cities Skylines 2",
+                "CitiesSkylines2"
+            ]
+            
+            # Remove duplicates while preserving order
+            possible_titles = list(dict.fromkeys(possible_titles))
+            logger.info(f"Will try these window titles: {possible_titles}")
+            
+            # First try exact matches
+            hwnd = 0
+            for title in possible_titles:
+                hwnd = win32gui.FindWindow(None, title)
+                if hwnd != 0:
+                    logger.info(f"Found game window with exact title: {title}")
+                    break
+            
+            # If no exact match, try partial match
             if hwnd == 0:
-                # Try partial match if exact title not found
-                def callback(hwnd, windows):
-                    if self.window_title in win32gui.GetWindowText(hwnd):
-                        windows.append(hwnd)
+                # List all windows for logging
+                all_windows = []
+                def enum_callback(hwnd, windows):
+                    if win32gui.IsWindowVisible(hwnd):
+                        window_title = win32gui.GetWindowText(hwnd)
+                        if window_title:
+                            windows.append((hwnd, window_title))
                     return True
-                    
-                windows = []
-                win32gui.EnumWindows(callback, windows)
                 
-                if windows:
-                    hwnd = windows[0]
-                    
+                win32gui.EnumWindows(enum_callback, all_windows)
+                logger.info(f"Found {len(all_windows)} visible windows")
+                
+                # Log the first 10 windows for debugging
+                for i, (_, title) in enumerate(all_windows[:10]):
+                    logger.info(f"Window {i+1}: {title}")
+                
+                # First try to find windows containing the primary title
+                logger.info(f"Looking for windows containing '{primary_title}'")
+                for hwnd, title in all_windows:
+                    if primary_title.lower() in title.lower():
+                        logger.info(f"Found game window with partial match to primary title: {title}")
+                        hwnd_candidate = hwnd
+                        hwnd = hwnd_candidate
+                        break
+                
+                # If still not found, try other possible titles
+                if hwnd == 0:
+                    for hwnd, title in all_windows:
+                        for game_title in possible_titles:
+                            if game_title.lower() in title.lower() or "cities" in title.lower():
+                                logger.info(f"Found potential game window with partial match: {title}")
+                                hwnd_candidate = hwnd
+                                hwnd = hwnd_candidate
+                                break
+                        if hwnd != 0:
+                            break
+                        
             if hwnd != 0:
                 # Get window rect
-                left, top, right, bottom = win32gui.GetClientRect(hwnd)
+                try:
+                    rect = win32gui.GetWindowRect(hwnd)
+                    left, top, right, bottom = rect
+                    logger.info(f"Window rectangle: {rect}")
+                    
+                    # Check if window size is reasonable
+                    width = right - left
+                    height = bottom - top
+                    logger.info(f"Window size: {width}x{height}")
+                    
+                    if width < 100 or height < 100:
+                        logger.warning(f"Window size too small, may not be game window")
+                        
+                    # Try to get client rect
+                    try:
+                        client_rect = win32gui.GetClientRect(hwnd)
+                        logger.info(f"Client rectangle: {client_rect}")
+                        left, top, right, bottom = client_rect
+                        
+                        # Convert to screen coordinates
+                        try:
+                            left_screen, top_screen = win32gui.ClientToScreen(hwnd, (left, top))
+                            right_screen, bottom_screen = win32gui.ClientToScreen(hwnd, (right, bottom))
+                            
+                            self.client_position = (left_screen, top_screen, right_screen, bottom_screen)
+                            logger.info(f"Found game window: {self.client_position}")
+                        except Exception as e:
+                            logger.error(f"Error converting to screen coordinates: {e}")
+                            self.client_position = rect
+                            logger.info(f"Using window rect as fallback: {self.client_position}")
+                    except Exception as e:
+                        logger.error(f"Error getting client rect: {e}")
+                        self.client_position = rect
+                        logger.info(f"Using window rect as fallback: {self.client_position}")
+                except Exception as e:
+                    logger.error(f"Error getting window rect: {e}")
+                    # Fallback to primary monitor
+                    monitor = self.sct.monitors[1]  # Primary monitor
+                    self.client_position = (
+                        monitor["left"], monitor["top"],
+                        monitor["left"] + monitor["width"],
+                        monitor["top"] + monitor["height"]
+                    )
                 
-                # Convert to screen coordinates
-                left_screen, top_screen = win32gui.ClientToScreen(hwnd, (left, top))
-                right_screen, bottom_screen = win32gui.ClientToScreen(hwnd, (right, bottom))
-                
-                self.client_position = (left_screen, top_screen, right_screen, bottom_screen)
-                logger.info(f"Found game window: {self.client_position}")
+                # Store the window handle
+                self.game_hwnd = hwnd
+                # Store the actual window title we found for future reference
+                try:
+                    self.actual_window_title = win32gui.GetWindowText(hwnd)
+                    logger.info(f"Using window with title: '{self.actual_window_title}'")
+                except:
+                    self.actual_window_title = self.window_title
                 
                 # Focus the window
-                self.game_hwnd = hwnd
                 self.focus_game_window()
             else:
-                logger.warning(f"Game window '{self.window_title}' not found")
+                logger.warning(f"Game window not found after trying multiple titles")
                 self.game_hwnd = None
                 # Fallback to primary monitor
                 monitor = self.sct.monitors[1]  # Primary monitor
@@ -159,32 +253,147 @@ class OptimizedScreenCapture:
             return False
             
         try:
+            # Get window info for logging
+            try:
+                window_title = win32gui.GetWindowText(self.game_hwnd)
+                logger.info(f"Focusing window: '{window_title}' (hwnd: {self.game_hwnd})")
+            except Exception as e:
+                logger.error(f"Error getting window title: {e}")
+            
+            # Check if window exists
+            if not win32gui.IsWindow(self.game_hwnd):
+                logger.error(f"Window handle {self.game_hwnd} is not a valid window")
+                return False
+            
+            # Check if window is visible
+            if not win32gui.IsWindowVisible(self.game_hwnd):
+                logger.warning(f"Window {self.game_hwnd} is not visible")
+                try:
+                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_SHOW)
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Error showing window: {e}")
+            
             # Check if window is minimized
             if win32gui.IsIconic(self.game_hwnd):
+                logger.info("Window is minimized, restoring...")
                 # Show the window if it's minimized
-                win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                try:
+                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Error restoring window: {e}")
                 
             # Check if window is already in foreground
-            foreground_hwnd = win32gui.GetForegroundWindow()
-            if foreground_hwnd == self.game_hwnd:
-                logger.debug("Game window is already in focus")
-                return True
-                
-            # Set window as foreground window
-            result = win32gui.SetForegroundWindow(self.game_hwnd)
-            
-            # Try setting focus too as a fallback
             try:
-                win32gui.SetFocus(self.game_hwnd)
-            except Exception:
-                pass
+                foreground_hwnd = win32gui.GetForegroundWindow()
+                foreground_title = win32gui.GetWindowText(foreground_hwnd)
+                logger.info(f"Current foreground window: '{foreground_title}' (hwnd: {foreground_hwnd})")
                 
-            logger.info(f"Set game window to foreground (result: {result})")
+                if foreground_hwnd == self.game_hwnd:
+                    logger.info("Game window is already in focus")
+                    return True
+            except Exception as e:
+                logger.error(f"Error checking foreground window: {e}")
+                
+            # Create a counter for retry attempts
+            focus_attempts = 0
+            max_focus_attempts = 3
             
-            # Give OS time to process the focus change
-            time.sleep(0.5)
+            # Try different approaches with retry mechanism
+            while focus_attempts < max_focus_attempts:
+                focus_attempts += 1
+                
+                # Approach 1: Standard SetForegroundWindow
+                try:
+                    logger.info(f"Attempt {focus_attempts}: Focusing window with SetForegroundWindow...")
+                    import ctypes
+                    user32 = ctypes.windll.user32
+                    user32.AllowSetForegroundWindow(self.game_hwnd)
+                    
+                    # Set window as foreground window
+                    result = win32gui.SetForegroundWindow(self.game_hwnd)
+                    logger.info(f"SetForegroundWindow result: {result}")
+                    
+                    # Small delay to allow OS to process
+                    time.sleep(0.5)
+                    
+                    # Check if successful
+                    if win32gui.GetForegroundWindow() == self.game_hwnd:
+                        logger.info("Successfully focused window with SetForegroundWindow")
+                        return True
+                except Exception as e:
+                    # If we got "Access is denied", just log it and continue to other approaches
+                    if "Access is denied" in str(e):
+                        logger.warning(f"SetForegroundWindow denied access: {e}")
+                    else:
+                        logger.error(f"Error using SetForegroundWindow: {e}")
+                
+                # Approach 2: Alternative using BringWindowToTop
+                try:
+                    logger.info(f"Attempt {focus_attempts}: Focusing window with BringWindowToTop...")
+                    win32gui.BringWindowToTop(self.game_hwnd)
+                    time.sleep(0.5)
+                    
+                    # Check if successful
+                    if win32gui.GetForegroundWindow() == self.game_hwnd:
+                        logger.info("Successfully focused window with BringWindowToTop")
+                        return True
+                except Exception as e:
+                    logger.error(f"Error using BringWindowToTop: {e}")
+                
+                # Approach 3: Use ShowWindow to activate
+                try:
+                    logger.info(f"Attempt {focus_attempts}: Focusing window with ShowWindow...")
+                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_SHOW)
+                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                    time.sleep(0.5)
+                    
+                    # Check if successful
+                    if win32gui.GetForegroundWindow() == self.game_hwnd:
+                        logger.info("Successfully focused window with ShowWindow")
+                        return True
+                except Exception as e:
+                    logger.error(f"Error using ShowWindow: {e}")
+                
+                # Approach 4: Try using AttachThreadInput technique
+                try:
+                    logger.info(f"Attempt {focus_attempts}: Focusing with AttachThreadInput technique...")
+                    import ctypes
+                    user32 = ctypes.windll.user32
+                    
+                    # Get the threads of the foreground window and our target window
+                    foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+                    target_thread = user32.GetWindowThreadProcessId(self.game_hwnd, None)
+                    
+                    if foreground_thread != target_thread:
+                        # Attach the threads
+                        user32.AttachThreadInput(foreground_thread, target_thread, True)
+                        
+                        # Set focus and bring to top
+                        user32.SetForegroundWindow(self.game_hwnd)
+                        user32.BringWindowToTop(self.game_hwnd)
+                        
+                        # Detach the threads
+                        user32.AttachThreadInput(foreground_thread, target_thread, False)
+                        
+                        time.sleep(0.5)
+                        
+                        # Check if successful
+                        if win32gui.GetForegroundWindow() == self.game_hwnd:
+                            logger.info("Successfully focused window with AttachThreadInput")
+                            return True
+                except Exception as e:
+                    logger.error(f"Error using AttachThreadInput: {e}")
+                
+                # Wait before retrying
+                time.sleep(1.0)
             
-            return True
+            logger.warning(f"Failed to focus window after {max_focus_attempts} attempts")
+            
+            # Fallback method - if all else fails, try to continue without focus
+            logger.info("Proceeding with capturing without window focus as a fallback")
+            return False
             
         except Exception as e:
             logger.error(f"Failed to focus game window: {e}")

@@ -213,4 +213,57 @@ class GameState:
             'menu_stuck': self.is_menu_stuck(),
             'menu_entries': self.menu_entry_count,
             'performance_stable': self.is_performance_stable()
-        } 
+        }
+        
+    def save_state(self) -> Dict[str, Any]:
+        """Save the current state for backup/recovery.
+        
+        Returns:
+            Dict: Serializable state data
+        """
+        logger.info("Saving game state for recovery")
+        # We only save simple attributes that can be serialized and 
+        # are useful for recovery
+        state_data = {
+            'in_menu': self.in_menu,
+            'paused': self.paused,
+            'game_speed': self.game_speed,
+            'game_crashed': self.game_crashed,
+            'menu_stuck_counter': self.menu_stuck_counter,
+            'menu_entry_count': self.menu_entry_count,
+            'time_saved': time.time()
+        }
+        
+        return state_data
+        
+    def load_state(self, state_data: Dict[str, Any]) -> None:
+        """Load saved state data after recovery.
+        
+        Args:
+            state_data: Saved state data from save_state
+        """
+        if not state_data:
+            logger.warning("No state data provided for loading")
+            return
+            
+        logger.info("Loading saved game state")
+        
+        # Restore saved state attributes
+        self.in_menu = state_data.get('in_menu', False)
+        self.paused = state_data.get('paused', False)
+        self.game_speed = state_data.get('game_speed', 1)
+        self.game_crashed = False  # Always reset crash status after recovery
+        self.menu_stuck_counter = 0  # Reset stuck counter after recovery
+        self.menu_entry_count = state_data.get('menu_entry_count', 0)
+        
+        # Clear histories as they can't be reliably restored
+        self.observation_history.clear()
+        self.reward_history.clear()
+        self.action_history.clear()
+        self.menu_history.clear()
+        
+        # Add recovery event to histories
+        self.menu_history.append(self.in_menu)
+        
+        # Reset timing counters
+        self.last_frame_time = time.time() 

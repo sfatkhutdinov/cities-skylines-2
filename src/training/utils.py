@@ -57,6 +57,9 @@ def parse_args():
     # Environment settings
     parser.add_argument("--mock_env", action="store_true", help="Use mock environment for testing")
     parser.add_argument("--disable_menu_detection", action="store_true", help="Disable menu detection")
+    parser.add_argument("--game_path", type=str, help="Path to the game executable")
+    parser.add_argument("--window_title", type=str, help="Window title to search for")
+    parser.add_argument("--skip_game_check", action="store_true", help="Skip game process verification (use when game is already running)")
     
     # Monitoring and logging
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
@@ -221,10 +224,44 @@ def setup_environment(config, args, config_loader: Optional[ConfigLoader] = None
     # Create a wrapped config that has both HardwareConfig methods and a 'get' method
     wrapped_config = ConfigWrapper(config, env_config)
     
+    # Get game path from args or config
+    game_path = args.game_path
+    if not game_path and config_loader:
+        game_path = env_config.get('game_path')
+    
+    # Get window title from args or config
+    window_title = args.window_title
+    if not window_title and config_loader:
+        window_title = env_config.get('window_title', "Cities: Skylines II")
+    
+    logger.info(f"Game path: {game_path or 'Not specified'}")
+    logger.info(f"Window title: {window_title or 'Using default'}")
+    
+    # Remove arguments that might conflict with env_config
+    # to avoid multiple values error
+    env_kwargs = {
+        'config': wrapped_config,
+        'disable_menu_detection': args.disable_menu_detection,
+    }
+    
+    # Add these parameters only if not already in env_config
+    if game_path and 'game_path' not in env_config:
+        env_kwargs['game_path'] = game_path
+        
+    if window_title and 'window_title' not in env_config:
+        env_kwargs['window_title'] = window_title
+        
+    # Pass skip_game_check if specified
+    if args.skip_game_check:
+        env_kwargs['skip_game_check'] = args.skip_game_check
+    
+    # Filter env_config to avoid duplicate parameters
+    filtered_env_config = {k: v for k, v in env_config.items() 
+                          if k not in ('game_path', 'window_title', 'disable_menu_detection')}
+    
     env = Environment(
-        config=wrapped_config,
-        disable_menu_detection=args.disable_menu_detection,
-        **env_config
+        **env_kwargs,
+        **filtered_env_config
     )
     
     return env
