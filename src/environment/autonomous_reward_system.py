@@ -17,6 +17,7 @@ from skimage.metrics import structural_similarity as ssim
 from scipy.spatial import KDTree
 import os
 from src.environment.visual_change_analyzer import VisualChangeAnalyzer
+from src.environment.causal_learning import CausalUnderstandingModule, ActionSequenceMemory
 
 logger = logging.getLogger(__name__)
 
@@ -669,6 +670,22 @@ class AutonomousRewardSystem:
         
         # Visual change analyzer for pattern recognition
         self.visual_change_analyzer = VisualChangeAnalyzer(memory_size=1000)
+        
+        # Initialize enhanced causal understanding module
+        self.causal_module = CausalUnderstandingModule(
+            config=config,
+            feature_dim=512,  # Match the feature extractor dimension
+            device=self.device
+        )
+        
+        # Feature history for causal analysis
+        self.feature_history = deque(maxlen=history_length)
+        self.outcome_history = deque(maxlen=history_length)
+        
+        # Causal rewards weighting
+        self.use_causal_prediction = False  # Start with False, enable after collecting data
+        self.causal_weight = 0.2  # Weight for causal component in reward calculation
+        self.training_steps = 0  # Track how many steps we've trained
     
     def save_state(self, path_prefix: str):
         """Save the state of the reward system for later resumption.
@@ -775,20 +792,50 @@ class AutonomousRewardSystem:
             density_reward = self._density_reward(curr_frame)
             association_reward = self._association_reward(prev_frame, action_idx, curr_frame)
             
+            # Extract features for causal analysis
+            with torch.no_grad():
+                prev_features = self.world_model.encode_frame(prev_frame)
+                curr_features = self.world_model.encode_frame(curr_frame)
+                
+            # Compute causal reward if enabled
+            causal_reward = 0.0
+            if self.use_causal_prediction and len(self.action_history) > 5:
+                # Query expected outcome from causal module
+                expected_outcome, confidence = self.causal_module.predict_action_outcome(
+                    prev_features, action_idx
+                )
+                
+                # Calculate the accuracy of causal prediction
+                actual_outcome = (prediction_error_reward + visual_change_reward + density_reward + association_reward) / 4.0
+                prediction_error = abs(expected_outcome - actual_outcome)
+                
+                # Reward agent more when outcomes align with causal predictions (encourage predictable behavior)
+                causal_reward = 0.5 * (1.0 - min(1.0, prediction_error)) * confidence
+                
+                # Log causal prediction accuracy
+                logger.debug(f"Causal prediction: expected={expected_outcome:.3f}, actual={actual_outcome:.3f}, confidence={confidence:.3f}")
+            
             # Combine reward components
             total_reward = (
-                0.4 * prediction_error_reward +
-                0.3 * visual_change_reward +
-                0.2 * density_reward +
-                0.1 * association_reward
+                0.3 * prediction_error_reward +
+                0.25 * visual_change_reward +
+                0.15 * density_reward +
+                0.1 * association_reward +
+                self.causal_weight * causal_reward
             )
             
-            # Update internal state
-            self._update_state(prev_frame, action_idx, curr_frame, total_reward)
+            # Update internal state, including causal module
+            self._update_state(prev_frame, action_idx, curr_frame, total_reward, prev_features, curr_features)
             
             # Apply adaptive normalization
             normalized_reward = self._normalize_reward(total_reward)
             
+            # After 1000 steps, start using causal predictions
+            self.training_steps += 1
+            if self.training_steps == 1000:
+                self.use_causal_prediction = True
+                logger.info("Enabled causal predictions for reward calculation")
+                
             return normalized_reward
             
         except Exception as e:
@@ -1080,7 +1127,8 @@ class AutonomousRewardSystem:
             logger.error(f"Error computing association reward: {e}")
             return 0.0
     
-    def _update_state(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor, reward: float) -> None:
+    def _update_state(self, prev_frame: torch.Tensor, action_idx: int, curr_frame: torch.Tensor, reward: float, 
+                     prev_features: torch.Tensor = None, curr_features: torch.Tensor = None) -> None:
         """Update internal state with new experience.
         
         Args:
@@ -1088,6 +1136,8 @@ class AutonomousRewardSystem:
             action_idx: Action index
             curr_frame: Current frame
             reward: Computed reward
+            prev_features: Feature embedding of previous frame (optional)
+            curr_features: Feature embedding of current frame (optional)
         """
         try:
             # Skip if frames are invalid
@@ -1106,9 +1156,24 @@ class AutonomousRewardSystem:
             else:
                 self.frame_history.append(curr_frame)
                 
+            # Update action history
+            self.action_history.append(action_idx)
+            
+            # Update feature history for causal analysis
+            if curr_features is not None:
+                self.feature_history.append(curr_features.detach())
+                self.outcome_history.append(reward)
+                
+                # Update causal understanding module
+                self.causal_module.update(curr_features, action_idx, reward)
+                
             # Maintain limited history
             if len(self.frame_history) > self.max_history_length:
                 self.frame_history.pop(0)
+                
+            if len(self.action_history) > self.max_history_length:
+                self.action_history.pop(0)
+                
         except Exception as e:
             logger.error(f"Error updating agent state: {e}")
             # Continue without updating state
@@ -1278,4 +1343,65 @@ class AutonomousRewardSystem:
         # Reset history
         self.reward_history = deque(maxlen=self.max_history_length)
         
-        logger.info("Initialized reward system with default values") 
+        logger.info("Initialized reward system with default values")
+
+    def get_action_recommendation(self, curr_frame: torch.Tensor, available_actions: List[int]) -> Tuple[int, float]:
+        """Get a recommended action based on causal understanding.
+        
+        Args:
+            curr_frame: Current frame
+            available_actions: List of available action indices
+            
+        Returns:
+            Tuple[int, float]: Recommended action and confidence
+        """
+        if not available_actions:
+            return 0, 0.0
+            
+        try:
+            # Extract features from current frame
+            with torch.no_grad():
+                curr_features = self.world_model.encode_frame(curr_frame)
+                
+            # Get recommendation from causal module
+            recommended_action = self.causal_module.get_best_action(curr_features, available_actions)
+            
+            # Get confidence
+            confidence = 0.0
+            if recommended_action is not None:
+                expected_outcome, conf = self.causal_module.predict_action_outcome(curr_features, recommended_action)
+                confidence = conf
+                
+            return recommended_action, confidence
+            
+        except Exception as e:
+            logger.error(f"Error getting action recommendation: {e}")
+            return available_actions[0], 0.0
+            
+    def analyze_causality(self) -> Dict[str, Any]:
+        """Analyze causal relationships in recent history.
+        
+        Returns:
+            Dict[str, Any]: Analysis results
+        """
+        try:
+            # Collect data from history
+            features = list(self.feature_history)
+            actions = list(self.action_history)
+            outcomes = list(self.outcome_history)
+            
+            # Get current state if available
+            current_state = self.feature_history[-1] if self.feature_history else None
+            
+            # Run analysis
+            if len(features) >= 5 and len(actions) >= 5 and current_state is not None:
+                analysis = self.causal_module.enhance_temporal_causality(
+                    features, actions, outcomes, current_state
+                )
+                return analysis
+            else:
+                return {"causal_strength": 0.0, "significant_actions": []}
+                
+        except Exception as e:
+            logger.error(f"Error analyzing causality: {e}")
+            return {"causal_strength": 0.0, "significant_actions": [], "error": str(e)} 

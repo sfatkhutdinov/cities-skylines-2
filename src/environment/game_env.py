@@ -21,6 +21,8 @@ from .menu_handler import MenuHandler
 from src.utils.image_utils import ImageUtils
 import cv2
 import traceback
+from src.utils.menu_detection import MenuDetector
+from src.utils.window_manager import WindowManager
 
 
 logger = logging.getLogger(__name__)
@@ -355,170 +357,46 @@ class CitiesEnvironment:
             
         return success
     
-    def reset(self) -> torch.Tensor:
-        """Reset the environment and return initial observation.
-        
-        Returns:
-            torch.Tensor: Initial observation
-        """
-        # Reset internal state variables
-        self.steps_taken = 0
-        self.episode_step = 0
-        self.cumulative_reward = 0.0
-        self.done = False
-        self.menu_stuck_counter = 0
-        self.suppress_menu_actions = False
-        self.menu_action_suppression_steps = 0
-        
-        # Reset game state detection
-        self.game_crashed = False
-        self.game_window_missing_count = 0
-        self.waiting_for_game_restart = False
-        
-        # Check if game is running
-        if not self._check_game_running():
-            logger.warning("Game does not appear to be running during reset. Will wait for game to start.")
-            self._wait_for_game_start()
-        
-        # Capture initial frame
-        frame = self.screen_capture.capture_frame()
-        
-        # If in mock mode, just return mock frame
-        if self.mock_mode:
-            self.current_frame = self._get_mock_frame()
-            logger.info("Reset complete in mock mode")
-            return self.current_frame
+    def reset(self):
+        """Reset the environment."""
+        try:
+            # Reset state variables
+            self.current_frame = None
+            self.prev_frame = None
+            self.steps_count = 0
+            self.total_reward = 0.0
+            self.episode_reward = 0.0
+            self.last_action_info = {}
+            self.last_action_result = None
+            self.is_in_menu = False
+            self.menu_frames_counter = 0
+            self.consecutive_empty_frames = 0
+            self.reference_frames = []
             
-        # If for some reason we can't capture frame, return mock frame
-        if frame is None:
-            logger.warning("Could not capture initial frame, providing mock frame")
-            self.current_frame = self._get_mock_frame()
-            return self.current_frame
-            
-        # Process frame and keep it as current state
-        self.current_frame = self._process_frame(frame)
-        
-        # Check if this is the first run and we don't have a menu reference yet
-        if not self.has_menu_reference and not self.menu_detection_initialized:
-            # On first run, assume we might be at the menu and capture a reference
-            logger.info("First run, capturing menu reference image")
-            
-            # Save the current frame as a reference (assuming we're starting at the menu)
-            self.capture_menu_reference("menu_reference.png")
-            
-            # Try to exit the menu immediately after capturing reference
-            self.input_simulator.key_press('escape')
-            time.sleep(0.7)
-            self.input_simulator.key_press('escape')  # Press twice to be safe
-            time.sleep(0.7)
-            
-            # Also try clicking the Resume Game button
-            width, height = self._get_screen_dimensions()
-            resume_x = int(width * 0.15)  # About 15% in from left
-            resume_y = int(height * 0.25)  # About 25% down from top
-            self.input_simulator.mouse_click(resume_x, resume_y)
-            time.sleep(0.7)
-            
-            # Update the current frame
-            initial_frame = self.screen_capture.capture_frame()
-        
-        # Keep trying to exit menu if detected
-        menu_attempts = 0
-        max_menu_exit_attempts = 5
-        last_menu_type = None
-        consecutive_same_menu = 0
-        
-        while self.check_menu_state() and menu_attempts < max_menu_exit_attempts:
-            # Get current menu info
-            menu_detected, menu_type, _ = self.menu_handler.detect_menu(self.screen_capture.capture_frame())
-            
-            # Track if we're seeing the same menu repeatedly
-            if menu_type == last_menu_type:
-                consecutive_same_menu += 1
-            else:
-                consecutive_same_menu = 0
-            last_menu_type = menu_type
+            # Initialize reward system if needed
+            if not hasattr(self, 'reward_system') or self.reward_system is None:
+                logger.info("Initializing autonomous reward system")
+                self.reward_system = AutonomousRewardSystem(self.config)
                 
-            logger.info(f"Detected menu during reset, attempting to exit (attempt {menu_attempts+1})")
+            # Initialize menu detector if needed
+            if not hasattr(self, 'menu_detector') or self.menu_detector is None:
+                logger.info("Initializing menu detector")
+                self.menu_detector = MenuDetector()
+                
+            # Connect the reward system to the agent for causal action suggestions
+            if hasattr(self, 'agent') and self.agent is not None:
+                if hasattr(self.agent, 'set_reward_system'):
+                    logger.info("Connecting reward system to agent")
+                    self.agent.set_reward_system(self.reward_system)
             
-            # If we've tried the same menu 3 times, try a different approach
-            if consecutive_same_menu >= 2:
-                logger.warning(f"Same menu type {menu_type} detected multiple times, trying alternative exit method")
-                # Click in different locations based on menu type
-                width, height = self._get_screen_dimensions()
-                
-                if menu_type == "main_menu":
-                    # For main menu, try clicking "Resume Game" near top
-                    resume_x = int(width * 0.5)
-                    resume_y = int(height * 0.35)
-                    self.input_simulator.mouse_click(resume_x, resume_y)
-                    time.sleep(0.5)
-                    
-                    # Also try "Continue" button
-                    resume_x = int(width * 0.5)
-                    resume_y = int(height * 0.45)
-                    self.input_simulator.mouse_click(resume_x, resume_y)
-                elif menu_type == "settings_menu":
-                    # For settings menu, try clicking back/close button (top-right)
-                    close_x = int(width * 0.95)
-                    close_y = int(height * 0.05)
-                    self.input_simulator.mouse_click(close_x, close_y)
-                    time.sleep(0.5)
-                    
-                    # Also try back button (bottom)
-                    back_x = int(width * 0.15)
-                    back_y = int(height * 0.9)
-                    self.input_simulator.mouse_click(back_x, back_y)
-                else:
-                    # Generic approach - try pressing ESC and clicking center-bottom
-                    self.input_simulator.key_press('escape')
-                    time.sleep(0.5)
-                    self.input_simulator.mouse_click(width // 2, int(height * 0.8))
-            else:
-                # Standard approach - try to exit menu with ESC key
-                self.input_simulator.key_press('escape')
-                time.sleep(0.5)
-                self.input_simulator.key_press('enter')  # Sometimes helps confirm dialogs
-                time.sleep(0.2)
-                
-                # Try clicking resume button (vary location slightly each time)
-                width, height = self._get_screen_dimensions()
-                variation = menu_attempts * 0.05  # Vary by 5% each attempt
-                resume_x = int(width * (0.15 + variation))
-                resume_y = int(height * (0.25 + variation))
-                self.input_simulator.mouse_click(resume_x, resume_y)
-                time.sleep(0.5)
-                
-            # Increment counter
-            menu_attempts += 1
+            # Get initial observation
+            obs = self._get_observation()
             
-            # Update frame
-            initial_frame = self.screen_capture.capture_frame()
-        
-        if menu_attempts >= max_menu_exit_attempts:
-            logger.warning("Failed to exit menu after multiple attempts - continuing anyway")
-        
-        # Ensure mouse can move freely after menu handling
-        # Move mouse to center of screen
-        width, height = self._get_screen_dimensions()
-        center_x, center_y = width // 2, height // 2
-        self.input_simulator.mouse_move(center_x, center_y)
-        
-        # Capture again after potential menu exit
-        self.current_frame = self.screen_capture.capture_frame()
-        
-        # Reset game state (unpause if paused)
-        self._ensure_game_running()
-        
-        # Set normal game speed
-        self._set_game_speed(1)
-        
-        # Run mouse freedom test during first reset to diagnose any issues
-        # Only run on the first episode to avoid disrupting training
-        if self.steps_taken == 0:
-            self.test_mouse_freedom()
-        
-        return self.current_frame
+            return obs
+        except Exception as e:
+            logger.error(f"Error resetting environment: {e}")
+            # Return empty observation as fallback
+            return np.zeros((3, 84, 84), dtype=np.float32)
     
     def _ensure_game_running(self):
         """Make sure game is not paused. Press space if it is."""
@@ -1140,87 +1018,43 @@ class CitiesEnvironment:
         """Compute the reward for an action.
         
         Args:
-            action_info: Action information
-            action_idx: Action index
-            success: Whether the action was successful
-            menu_detected: Whether a menu is detected
+            action_info (Dict): Information about the action
+            action_idx (int): Action index
+            success (bool): Whether the action was successful
+            menu_detected (bool): Whether a menu was detected
             
         Returns:
-            float: Reward value
+            float: Computed reward
         """
-        # Base reward for successful actions
+        # Set a default reward
         reward = 0.0
         
-        # Penalty for unsuccessful actions 
-        if not success:
-            reward -= 0.1
-            
-        # Severe penalty for being in a menu (we want to avoid menus)
+        # Get frames for comparison
+        curr_frame = self.current_frame
+        prev_frame = self.prev_frame
+        
+        # Penalize being in a menu (we want to stay in the game)
         if menu_detected:
             reward -= 1.0
             
-            # Store the timestamp when we first detected the menu
-            if not hasattr(self, 'menu_entry_time') or not hasattr(self, 'previous_menu_state') or not self.previous_menu_state:
-                self.menu_entry_time = time.time()
+            # Extra penalty if this is a new menu (state changed)
+            if not self.is_in_menu:
+                reward -= 2.0
+                logger.debug("Menu state change detected, applying penalty")
         
-        # Add a reward for successfully exiting a menu (but prevent farming)
-        if hasattr(self, 'previous_menu_state') and self.previous_menu_state and not menu_detected:
-            # Successfully exited a menu
-            # Calculate how long we were in the menu
-            current_time = time.time()
-            menu_duration = current_time - getattr(self, 'menu_entry_time', current_time)
+        # Bonus for successful actions
+        if success:
+            reward += 0.5
             
-            # Only give exit reward if we were in the menu for a reasonable time
-            # This prevents the agent from rapidly toggling the menu for rewards
-            if menu_duration > 1.0:  # Must be in menu for at least 1 second
-                # Base reward for exiting menu
-                exit_reward = 0.5
-                
-                # Scale reward based on how quickly the agent exited (encourage faster exits)
-                # Cap at reasonable maximum time to not overly punish long menu stays
-                time_factor = min(menu_duration, 10.0) / 10.0  # Normalize to 0-1
-                # Inverted - faster exits (lower time_factor) get higher rewards
-                time_bonus = (1.0 - time_factor) * 0.5
-                
-                # Add the exit reward and time bonus
-                reward += exit_reward + time_bonus
-                
-                logger.debug(f"Menu exit reward: +{exit_reward + time_bonus:.2f} after {menu_duration:.1f}s in menu")
-                
-                # Reset menu cooldown timer - this prevents immediate re-entry farming
-                self.last_menu_exit_time = current_time
-                self.menu_entry_count = getattr(self, 'menu_entry_count', 0) + 1
+            # Extra bonus for escaping from menu
+            if self.is_in_menu and not menu_detected:
+                reward += 5.0
+                logger.debug("Successfully exited menu, applying bonus")
         
-        # Extra penalty for repeatedly entering/exiting menus (anti-farming)
-        if menu_detected and not getattr(self, 'previous_menu_state', False):
-            # Just entered a menu, check if this is too soon after exiting one
-            current_time = time.time()
-            time_since_last_exit = current_time - getattr(self, 'last_menu_exit_time', 0)
-            menu_entry_count = getattr(self, 'menu_entry_count', 0)
+        # Penalize failures (exception cases)
+        if not success:
+            reward -= 1.0
             
-            # Penalty for entering menu too soon after exiting
-            if time_since_last_exit < 5.0 and menu_entry_count > 0:
-                # Calculate penalty that increases with each rapid re-entry
-                farming_penalty = min(0.5 * menu_entry_count, 3.0)
-                reward -= farming_penalty
-                logger.debug(f"Menu farming penalty: -{farming_penalty:.2f} (re-entered after {time_since_last_exit:.1f}s)")
-        
-        # Update menu state tracking
-        self.previous_menu_state = menu_detected
-        
-        # Get frames before and after action
-        prev_frame = getattr(self, 'prev_frame', None)
-        curr_frame = self.screen_capture.capture_frame()
-        
-        # Store current frame for next reward computation
-        if curr_frame is not None:
-            # Handle PyTorch tensors properly
-            if isinstance(curr_frame, torch.Tensor):
-                self.prev_frame = curr_frame.clone().detach()
-            else:
-                # For numpy arrays
-                self.prev_frame = curr_frame.copy() if curr_frame is not None else None
-        
         # If we have visual diversity reward system, use it
         if hasattr(self, 'reward_system') and self.reward_system:
             # Get additional reward from autonomous system
@@ -1248,6 +1082,12 @@ class CitiesEnvironment:
                         curr_frame
                     )
                     reward += autonomous_reward
+                    
+                    # Periodically analyze causality
+                    if self.steps_count > 0 and self.steps_count % 100 == 0:
+                        causality_analysis = self.reward_system.analyze_causality()
+                        if causality_analysis["causal_strength"] > 0.3:
+                            logger.info(f"Strong causal patterns detected: {causality_analysis['significant_actions']}")
             except Exception as e:
                 logger.error(f"Error computing reward: {str(e)}")
                 # Don't add any reward if there was an error

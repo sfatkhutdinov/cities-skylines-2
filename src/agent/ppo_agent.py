@@ -84,75 +84,80 @@ class PPOAgent:
         self.rewards_mean = 0
         self.rewards_std = 1
         
+        # Causal understanding integration
+        self.use_causal_suggestions = False  # Start with policy-only, enable after 1000 steps
+        self.causal_suggestion_weight = 0.3  # How much to bias towards causal suggestions
+        self.steps_counter = 0
+        self.reward_system = None  # Will be set externally
+        
     def select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Select an action based on state.
         
         Args:
-            state (torch.Tensor): Current state
+            state: Current state tensor
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (action, log_prob, value)
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Action, log probability, and value
         """
-        # Ensure state is on the correct device and has correct shape
-        if state.device != self.device:
-            state = state.to(self.device)
-            
-        # Get action probabilities and value
+        # Count steps
+        self.steps_counter += 1
+        
+        # Check if we should start using causal suggestions
+        if self.steps_counter == 1000 and not self.use_causal_suggestions:
+            self.use_causal_suggestions = True
+            logger.info("Enabled causal action suggestions for agent decision making")
+        
+        # Get policy distribution and value
         with torch.no_grad():
-            # We need to check if this is a batch of states or a single state
-            if len(state.shape) == 3:  # Single state with shape [C, H, W]
-                # Add batch dimension
-                state_batch = state.unsqueeze(0)
-            else:
-                state_batch = state
-                
-            # Forward pass through network
-            action_probs, value = self.network(state_batch)
+            policy, value = self.network(state)
             
-            # Remove batch dimension if it was added
-            if len(state.shape) == 3:
-                action_probs = action_probs.squeeze(0)
-                value = value.squeeze(0) if value.dim() > 0 else value
+        # Standard policy-based action selection
+        dist = torch.distributions.Categorical(logits=policy)
+        
+        # Get causal suggestion if available and enabled
+        causal_action = None
+        confidence = 0.0
+        
+        if self.use_causal_suggestions and self.reward_system is not None:
+            try:
+                # Get available actions (all actions by default)
+                available_actions = list(range(self.action_dim))
+                
+                # Get recommendation from causal system
+                causal_action, confidence = self.reward_system.get_action_recommendation(
+                    state, available_actions
+                )
+                
+                # Log causal recommendation
+                logger.debug(f"Causal action recommendation: {causal_action}, confidence: {confidence:.3f}")
+            except Exception as e:
+                logger.error(f"Error getting causal action recommendation: {e}")
+                causal_action = None
+        
+        # Combine policy with causal suggestion if available
+        if causal_action is not None and confidence > 0.2:
+            # Calculate new probabilities biased towards causal suggestion
+            probs = dist.probs.clone()
             
-            # Apply penalties to menu-opening actions
-            if self.menu_action_indices and hasattr(self, 'menu_action_penalties'):
-                # Create a penalty mask (default 1.0 for all actions)
-                penalty_mask = torch.ones_like(action_probs)
-                
-                # Apply specific penalties to known menu actions
-                for action_idx, penalty in self.menu_action_penalties.items():
-                    if 0 <= action_idx < len(penalty_mask):
-                        # Reduce probability of this action by the penalty factor
-                        penalty_mask[action_idx] = max(0.05, 1.0 - penalty)  # Ensure minimal probability
-                
-                # Apply the mask to reduce probabilities of problematic actions
-                action_probs = action_probs * penalty_mask
-                
-                # Renormalize probabilities
-                if action_probs.sum() > 0:
-                    action_probs = action_probs / action_probs.sum()
-                else:
-                    # Safety fallback if all actions are severely penalized
-                    action_probs = torch.ones_like(action_probs) / action_probs.size(0)
+            # Scale confidence by number of actions
+            bias_strength = self.causal_suggestion_weight * confidence
             
-        # Sample action from probability distribution
-        action = torch.multinomial(action_probs, 1)
-        
-        # Get log probability of the chosen action
-        log_prob = torch.log(action_probs[action.item()].clamp(min=1e-10))
-        
-        # Make sure log_prob is a tensor with proper dimensions
-        if not isinstance(log_prob, torch.Tensor):
-            log_prob = torch.tensor(log_prob, device=self.device)
-        elif log_prob.dim() == 0:
-            log_prob = log_prob.unsqueeze(0)
-        
-        # Add experience to memory
-        if self.training:
-            self.states.append(state)
-            self.actions.append(action.squeeze())
-            self.action_probs.append(action_probs.detach())  # Store full probability distribution
-            self.values.append(value)
+            # Increase probability of causal action
+            probs[causal_action] = probs[causal_action] * (1.0 + bias_strength)
+            
+            # Normalize to ensure sum=1
+            probs = probs / probs.sum()
+            
+            # Create new distribution
+            biased_dist = torch.distributions.Categorical(probs=probs)
+            
+            # Sample from biased distribution
+            action = biased_dist.sample()
+            log_prob = biased_dist.log_prob(action)
+        else:
+            # Sample from standard policy distribution
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
             
         return action, log_prob, value
         
@@ -616,3 +621,12 @@ class PPOAgent:
             
             # Strongly penalize the action that led to this reward
             self.register_menu_action(action_idx, penalty=0.9) 
+
+    def set_reward_system(self, reward_system):
+        """Set the reward system for causal suggestions.
+        
+        Args:
+            reward_system: AutonomousRewardSystem instance
+        """
+        self.reward_system = reward_system
+        logger.info("Reward system connected to agent for causal action suggestions") 
