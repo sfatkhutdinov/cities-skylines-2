@@ -11,6 +11,7 @@ from collections import deque
 import logging
 from typing import List, Dict, Tuple, Any, Optional, Union
 from scipy.spatial import KDTree
+from src.learning.advanced_learning import ActionPatternDiscovery, AdaptiveLearningRate, ContrastiveLearning, MemoryConsolidation
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +479,33 @@ class CausalUnderstandingModule:
             learning_rate=0.01
         )
         
+        # Advanced learning components
+        self.pattern_discovery = ActionPatternDiscovery(
+            sequence_length=5,
+            threshold=0.5,
+            max_patterns=100
+        )
+        
+        self.adaptive_lr = AdaptiveLearningRate(
+            base_rate=0.01,
+            min_rate=0.001,
+            max_rate=0.05
+        )
+        
+        self.contrastive_learner = ContrastiveLearning(
+            embedding_dim=feature_dim,
+            device=self.device
+        )
+        
+        self.memory_consolidation = MemoryConsolidation(
+            update_frequency=1000,
+            importance_threshold=0.3
+        )
+        
+        # Performance tracking
+        self.prediction_errors = deque(maxlen=100)
+        self.update_count = 0
+        
     def update(self, frame_feature: torch.Tensor, action_idx: int, reward: float) -> None:
         """Update the causal understanding with new experience.
         
@@ -501,6 +529,12 @@ class CausalUnderstandingModule:
             list(self.action_history)[:-1]          # Previous actions
         )
         
+        # Use adaptive learning rate
+        if self.prediction_errors:
+            learning_rate = self.adaptive_lr.update(sum(self.prediction_errors) / len(self.prediction_errors))
+            # Apply to meta-learner
+            self.meta_learner.learning_rate = learning_rate
+        
         # Update action sequence memory
         action_sequence = list(self.action_history)
         self.action_sequence_memory.store(
@@ -515,6 +549,81 @@ class CausalUnderstandingModule:
             action=action_idx,
             outcome=reward
         )
+        
+        # Update pattern discovery
+        self.pattern_discovery.update(
+            action_history=list(self.action_history),
+            reward_history=list(self.reward_history)
+        )
+        
+        # Update contrastive learning if we have enough history
+        if len(self.frame_feature_history) >= 2:
+            prev_feature = self.frame_feature_history[-2]
+            curr_feature = self.frame_feature_history[-1]
+            
+            contrastive_loss = self.contrastive_learner.update(
+                state=prev_feature,
+                next_state=curr_feature,
+                action=action_idx,
+                reward=reward
+            )
+            
+            if contrastive_loss > 0:
+                logger.debug(f"Contrastive learning loss: {contrastive_loss:.4f}")
+        
+        # Periodically consolidate memory
+        if self.memory_consolidation.should_consolidate():
+            # Define memory importance function
+            def importance_fn(key, items):
+                importances = []
+                
+                # Different importance calculations based on memory type
+                if key == 'frame_features':
+                    # For frame features, use recency as main factor
+                    for i, _ in enumerate(items):
+                        recency = i / max(1, len(items))
+                        importances.append(
+                            self.memory_consolidation.compute_memory_importance(
+                                key, i, 0.0, recency
+                            )
+                        )
+                elif key in ['action_sequences', 'context_features', 'outcome_values']:
+                    # For action-related memories, use reward association
+                    outcomes = self.action_sequence_memory.outcome_values if key == 'outcome_values' else [0.0] * len(items)
+                    
+                    for i, item in enumerate(items):
+                        recency = i / max(1, len(items))
+                        reward_val = outcomes[i] if i < len(outcomes) else 0.0
+                        importances.append(
+                            self.memory_consolidation.compute_memory_importance(
+                                key, i, reward_val, recency
+                            )
+                        )
+                else:
+                    # Default case
+                    importances = [0.5] * len(items)
+                    
+                return importances
+                
+            # Consolidate action sequence memory
+            memory_dict = {
+                'action_sequences': self.action_sequence_memory.action_sequences,
+                'context_features': self.action_sequence_memory.context_features,
+                'outcome_values': self.action_sequence_memory.outcome_values
+            }
+            
+            consolidated = self.memory_consolidation.consolidate_memory(memory_dict, importance_fn)
+            
+            # Update memory with consolidated version
+            if consolidated and 'action_sequences' in consolidated:
+                self.action_sequence_memory.action_sequences = consolidated['action_sequences']
+                self.action_sequence_memory.context_features = consolidated['context_features']
+                self.action_sequence_memory.outcome_values = consolidated['outcome_values']
+                # Reset KD-tree
+                self.action_sequence_memory.kdtree = None
+                self.action_sequence_memory.last_update_size = 0
+        
+        self.update_count += 1
         
     def predict_action_outcome(self, frame_feature: torch.Tensor, action_idx: int) -> Tuple[float, float]:
         """Predict the outcome of taking an action in the current state.
@@ -540,7 +649,7 @@ class CausalUnderstandingModule:
         action_sequence = list(self.action_history)[-4:] + [action_idx]
         
         # Query action sequence memory
-        outcome, confidence = self.action_sequence_memory.query(
+        memory_outcome, memory_confidence = self.action_sequence_memory.query(
             context_feature=context_features,
             action_sequence=action_sequence,
             k=5
@@ -549,15 +658,42 @@ class CausalUnderstandingModule:
         # Get meta-learner prediction
         meta_outcome = self.meta_learner.predict(context_features, action_idx)
         
-        # Combine predictions based on confidence
-        if confidence > 0.3:
+        # Check if this action is part of a discovered successful pattern
+        pattern_confidence = 0.0
+        if len(self.action_history) > 0:
+            # Check if current action sequence matches the start of any discovered patterns
+            recent_actions = list(self.action_history)[-4:] if len(self.action_history) >= 4 else list(self.action_history)
+            recent_actions_with_new = recent_actions + [action_idx]
+            
+            # Get recommended continuation from pattern discovery
+            _ = self.pattern_discovery.recommend_continuation(recent_actions)
+            
+            # Check if the pattern would recommend this action
+            successful_patterns = self.pattern_discovery.get_successful_patterns(min_success_rate=0.6)
+            for pattern, success_rate, avg_reward in successful_patterns:
+                prefix_len = min(len(recent_actions_with_new), len(pattern))
+                if pattern[:prefix_len] == tuple(recent_actions_with_new[:prefix_len]):
+                    pattern_confidence = success_rate
+                    break
+        
+        # Combine predictions based on confidence levels
+        final_confidence = max(memory_confidence, pattern_confidence)
+        
+        if final_confidence > 0.3:
             # Higher weight to memory-based prediction when confidence is high
-            final_outcome = 0.7 * outcome + 0.3 * meta_outcome
+            combined_outcome = 0.6 * memory_outcome + 0.3 * meta_outcome
+            if pattern_confidence > 0.0:
+                # Include pattern-based confidence
+                combined_outcome = 0.5 * combined_outcome + 0.5 * pattern_confidence
         else:
             # Otherwise rely more on meta-learner
-            final_outcome = 0.3 * outcome + 0.7 * meta_outcome
+            combined_outcome = 0.3 * memory_outcome + 0.7 * meta_outcome
             
-        return final_outcome, confidence
+        # Track prediction for error calculation in next update
+        if len(self.prediction_errors) >= self.prediction_errors.maxlen:
+            self.prediction_errors.popleft()
+        
+        return combined_outcome, final_confidence
         
     def get_best_action(self, frame_feature: torch.Tensor, available_actions: List[int]) -> int:
         """Get the best action to take in the current state.
@@ -579,6 +715,16 @@ class CausalUnderstandingModule:
             list(self.action_history)
         )
         
+        # Get pattern-based recommendation
+        pattern_action = None
+        if self.action_history:
+            recent_actions = list(self.action_history)[-min(4, len(self.action_history)):]
+            pattern_action = self.pattern_discovery.recommend_continuation(recent_actions)
+            
+            # Only use if it's in available actions
+            if pattern_action is not None and pattern_action not in available_actions:
+                pattern_action = None
+        
         # Query action sequence memory
         sequence_action = self.action_sequence_memory.get_best_action_for_context(
             context_feature=context_features,
@@ -591,8 +737,20 @@ class CausalUnderstandingModule:
             available_actions=available_actions
         )
         
-        # Use sequence-based action if available, otherwise fall back to meta-learner
-        return sequence_action if sequence_action is not None else meta_action
+        # Choose best action based on priority:
+        # 1. Pattern-based (if discovered successful pattern)
+        # 2. Sequence-based (if strong memory association)
+        # 3. Meta-learner (fallback)
+        
+        if pattern_action is not None:
+            logger.debug(f"Using pattern-based action: {pattern_action}")
+            return pattern_action
+        elif sequence_action is not None:
+            logger.debug(f"Using sequence-based action: {sequence_action}")
+            return sequence_action
+        else:
+            logger.debug(f"Using meta-learner action: {meta_action}")
+            return meta_action
 
     def enhance_temporal_causality(self, prev_frames: List[torch.Tensor], 
                                  actions: List[int], 
@@ -664,9 +822,13 @@ class CausalUnderstandingModule:
             reverse=True
         )
         
+        # 6. Update pattern discovery with significant sequences
+        self.pattern_discovery.update(actions, outcomes)
+        
         # Return analysis
         return {
             "causal_strength": sorted_patterns[0][1]["causal_strength"] if sorted_patterns else 0.0,
             "significant_actions": [list(pattern) for pattern, _ in sorted_patterns[:3]],
-            "detailed_analysis": sorted_patterns[:3]
+            "detailed_analysis": sorted_patterns[:3],
+            "discovered_patterns": len(self.pattern_discovery.discovered_patterns)
         } 

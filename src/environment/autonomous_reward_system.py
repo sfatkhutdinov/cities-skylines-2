@@ -17,7 +17,8 @@ from skimage.metrics import structural_similarity as ssim
 from scipy.spatial import KDTree
 import os
 from src.environment.visual_change_analyzer import VisualChangeAnalyzer
-from src.environment.causal_learning import CausalUnderstandingModule, ActionSequenceMemory
+from src.environment.causal_learning import CausalUnderstandingModule
+from src.environment.visual_processing import EnhancedVisualProcessor, VisualStreamProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -686,6 +687,22 @@ class AutonomousRewardSystem:
         self.use_causal_prediction = False  # Start with False, enable after collecting data
         self.causal_weight = 0.2  # Weight for causal component in reward calculation
         self.training_steps = 0  # Track how many steps we've trained
+        
+        # Enhanced visual processing
+        self.visual_processor = EnhancedVisualProcessor(
+            input_channels=3,
+            feature_dim=512,
+            device=self.device
+        )
+        
+        self.stream_processor = VisualStreamProcessor(
+            feature_dim=512,
+            history_length=history_length,
+            device=self.device
+        )
+        
+        # Flag to enable enhanced visual processing
+        self.use_enhanced_processing = True
     
     def save_state(self, path_prefix: str):
         """Save the state of the reward system for later resumption.
@@ -786,17 +803,31 @@ class AutonomousRewardSystem:
             if len(curr_frame.shape) == 3:
                 curr_frame = curr_frame.unsqueeze(0)
                 
+            # Use enhanced visual processing if enabled
+            if self.use_enhanced_processing:
+                # Process frames to detect significant changes
+                _, change_score = self.stream_processor.process_frame(curr_frame.squeeze(0))
+                
+                # Extract features using the enhanced processor
+                prev_features = self.visual_processor.extract_features(prev_frame.squeeze(0))
+                curr_features = self.visual_processor.extract_features(curr_frame.squeeze(0))
+                
+                # Extract features that focus on the change
+                change_features = self.visual_processor.extract_visual_change_features(
+                    prev_frame.squeeze(0), curr_frame.squeeze(0)
+                )
+            else:
+                # Use original feature extraction
+                with torch.no_grad():
+                    prev_features = self.world_model.encode_frame(prev_frame)
+                    curr_features = self.world_model.encode_frame(curr_frame)
+            
             # Compute reward components
             prediction_error_reward = self._prediction_error_reward(prev_frame, action_idx, curr_frame)
             visual_change_reward = self._visual_change_reward(prev_frame, curr_frame)
             density_reward = self._density_reward(curr_frame)
             association_reward = self._association_reward(prev_frame, action_idx, curr_frame)
             
-            # Extract features for causal analysis
-            with torch.no_grad():
-                prev_features = self.world_model.encode_frame(prev_frame)
-                curr_features = self.world_model.encode_frame(curr_frame)
-                
             # Compute causal reward if enabled
             causal_reward = 0.0
             if self.use_causal_prediction and len(self.action_history) > 5:
