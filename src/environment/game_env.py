@@ -20,6 +20,7 @@ import win32api
 from .menu_handler import MenuHandler
 from src.utils.image_utils import ImageUtils
 import cv2
+import traceback
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,8 @@ logger = logging.getLogger(__name__)
 class CitiesEnvironment:
     """Environment for interacting with Cities: Skylines 2."""
     
-    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, menu_screenshot_path: Optional[str] = None, disable_menu_detection: bool = False, **kwargs):
+    def __init__(self, config: Optional[HardwareConfig] = None, mock_mode: bool = False, 
+                 menu_screenshot_path: Optional[str] = None, disable_menu_detection: bool = False, **kwargs):
         """Initialize the Cities: Skylines 2 environment.
         
         Args:
@@ -37,6 +39,8 @@ class CitiesEnvironment:
             disable_menu_detection: Whether to disable menu detection
             **kwargs: Additional arguments
         """
+        super().__init__()
+        
         # Basic setup
         self.config = config or HardwareConfig()
         self.mock_mode = mock_mode
@@ -45,11 +49,24 @@ class CitiesEnvironment:
         self.menu_stuck_counter = 0
         self.disable_menu_detection = disable_menu_detection
         
+        # Add gameplay reference frame tracking
+        self.gameplay_reference_frames = []
+        self.max_reference_frames = 5
+        self.gameplay_detection_threshold = 0.85  # Similarity threshold
+        self.steps_since_last_menu = 0
+        
         if self.disable_menu_detection:
             logger.info("Menu detection is disabled - menu detection and recovery will be skipped")
         
+        # Initialize components
+        self.game_process = None
+        self.menu_detection_initialized = False
+        
+        # Basic setup
+        self.menu_stuck_counter = 0
+        
         # Set up components for interacting with the game
-        if not mock_mode:
+        if not self.mock_mode:
             # Initialize screen capture
             self.screen_capture = OptimizedScreenCapture(
                 config=self.config
@@ -588,137 +605,164 @@ class CitiesEnvironment:
         
         return frame
     
-    def step(self, action_idx: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """Execute an action in the environment.
+    def step(self, action_index):
+        """Execute an action and return the next state.
         
         Args:
-            action_idx: Action index to execute
+            action_index: Index of the action to execute
             
         Returns:
-            Tuple[np.ndarray, float, bool, Dict]: state, reward, done, info
+            tuple: (observation, reward, done, info)
         """
-        # First check for menus before taking action
-        self._check_for_menus()
-        
-        # Get action type
-        action_type = self.actions[action_idx].get("type", "")
-        
-        # Initialize return values
-        reward = 0.0
+        start_time = time.time()
+        reward = 0
         done = False
         info = {}
         
-        # Track action in menu handler (helps with menu detection)
-        # Certain actions like ESC can trigger menus
-        if action_type == "key" and self.actions[action_idx].get("key") == "escape":
-            self.menu_handler.track_action("esc_key")
-        elif action_type == "mouse" and self.actions[action_idx].get("action") == "click":
-            # Check if click is near settings/gear icon
-            mouse_x, mouse_y = self.input_simulator.get_mouse_position()
-            gear_x, gear_y = self.menu_handler.GEAR_ICON_POSITION
-            screen_w, screen_h = self._get_screen_dimensions()
-            gear_x_px, gear_y_px = int(gear_x * screen_w), int(gear_y * screen_h)
+        try:
+            # Get the current frame
+            current_frame = self.capture_observation()
             
-            # If click is within 50px of gear icon
-            if ((mouse_x - gear_x_px)**2 + (mouse_y - gear_y_px)**2) < 2500:  # 50px radius
-                self.menu_handler.track_action("gear_click")
-        
-        # Execute action
-        if action_type == "mouse":
-            action_subtype = self.actions[action_idx].get("action", "move")
-            
-            if action_subtype == "move":
-                target_x, target_y = self.actions[action_idx].get("position", (0.5, 0.5))
-                if isinstance(target_x, tuple) and isinstance(target_y, tuple):
-                    x, y = target_x
+            # Check if in a menu (unless disabled)
+            if hasattr(self, 'disable_menu_detection') and self.disable_menu_detection:
+                in_menu = False
+                menu_type = None
+            else:
+                in_menu, menu_type, menu_confidence = self.menu_handler.detect_menu(current_frame)
+                info["menu_confidence"] = menu_confidence
+                
+            # Handle menu state
+            if in_menu:
+                self.steps_since_last_menu = 0
+                logger.debug(f"In menu: {menu_type}, confidence: {menu_confidence:.2f}")
+                
+                # Try to exit menu with increasing persistence
+                exit_success = self.menu_handler.recover_from_menu(max_attempts=3)
+                
+                if exit_success:
+                    logger.info("Successfully exited menu")
+                    reward = -0.1  # Small negative reward for being in menu but recovering
                 else:
-                    # Fallback to normalized coordinates (0.0 to 1.0)
-                    x = target_x if isinstance(target_x, (int, float)) else 0.5
-                    y = target_y if isinstance(target_y, (int, float)) else 0.5
-                
-                logger.debug(f"Moving mouse to: ({x}, {y})")
-                self.input_simulator.mouse_move(x, y)
-                
-            elif action_subtype == "click":
-                button = self.actions[action_idx].get("button", "left")
-                double = self.actions[action_idx].get("double", False)
-                position = self.actions[action_idx].get("position", None)
-                
-                if position:
-                    x, y = position
-                    self.input_simulator.mouse_click(x, y, button=button, double=double)
-                else:
-                    # Click at current position
-                    current_x, current_y = self.input_simulator.get_mouse_position()
-                    self.input_simulator.mouse_click(current_x, current_y, button=button, double=double)
+                    logger.warning("Failed to exit menu")
+                    reward = -0.5  # Larger negative reward for failing to exit menu
                     
-            elif action_subtype == "scroll":
-                direction = self.actions[action_idx].get("direction", -1)
-                self.input_simulator.mouse_scroll(direction)
+                # Re-capture frame after menu exit attempt
+                current_frame = self.capture_observation()
                 
-            elif action_subtype == "drag":
-                start = self.actions[action_idx].get("start", (0, 0))
-                end = self.actions[action_idx].get("end", (0, 0))
-                button = self.actions[action_idx].get("button", "left")
-                duration = self.actions[action_idx].get("duration", 0.5)
-                self.input_simulator.mouse_drag(start, end, button, duration)
+                # Check if still in menu
+                if not self.disable_menu_detection:
+                    in_menu, menu_type, _ = self.menu_handler.detect_menu(current_frame)
+                    if not in_menu:
+                        # If we've successfully exited the menu, store a reference frame
+                        self._store_gameplay_reference_frame(current_frame)
+            else:
+                # Not in a menu - normal gameplay
+                self.steps_since_last_menu += 1
                 
-            elif action_subtype == "edge_scroll":
-                direction = self.actions[action_idx].get("direction", "down")
-                duration = self.actions[action_idx].get("duration", 0.5)
-                self.input_simulator.edge_scroll(direction, duration)
+                # After several steps of normal gameplay, store reference frames
+                if self.steps_since_last_menu % 20 == 0 and self.steps_since_last_menu > 0:
+                    # Store reference frame for normal gameplay
+                    self._store_gameplay_reference_frame(current_frame)
+                    
+                # Check if current frame is similar to reference gameplay frames
+                if len(self.gameplay_reference_frames) > 0:
+                    gameplay_similarity = self._compare_to_gameplay_references(current_frame)
+                    info["gameplay_similarity"] = gameplay_similarity
+                    logger.debug(f"Gameplay similarity: {gameplay_similarity:.2f}")
+                    
+                    # If we're in something that doesn't match gameplay references
+                    if gameplay_similarity < self.gameplay_detection_threshold:
+                        logger.warning(f"Current frame doesn't match gameplay references (similarity: {gameplay_similarity:.2f})")
+                        
+                        # Check if it might be a menu that wasn't detected
+                        if not self.disable_menu_detection:
+                            # Force a menu check with lower threshold
+                            self.menu_handler.detection_threshold_adjustment = -0.1  # Temporarily lower threshold
+                            in_menu, menu_type, _ = self.menu_handler.detect_menu(current_frame)
+                            self.menu_handler.detection_threshold_adjustment = 0.0  # Reset adjustment
+                            
+                            if in_menu:
+                                logger.info(f"Detected menu with lower threshold: {menu_type}")
+                                # Try to exit menu
+                                exit_success = self.menu_handler.recover_from_menu(max_attempts=3)
+                                if exit_success:
+                                    reward = -0.1
+                                else:
+                                    reward = -0.3
+                            else:
+                                # Not recognized as menu but doesn't match gameplay
+                                # Try pressing Escape once to exit possible undetected menu
+                                logger.info("Frame doesn't match gameplay but not detected as menu, trying ESC key")
+                                self.input_simulator.press_escape()
+                                time.sleep(0.5)
+                                reward = -0.2
             
-        elif action_type == "key":
-            key = self.actions[action_idx].get("key", "")
-            if key:
-                self.input_simulator.key_press(key)
-                
-        elif action_type == "speed":
-            speed_value = self.actions[action_idx].get("speed", 1.0)
-            speed_level = 0 if speed_value <= 0.1 else 1 if speed_value <= 0.3 else 2 if speed_value <= 0.6 else 3 if speed_value <= 0.8 else 4
-            self._set_game_speed(speed_level)
+            # Execute the action
+            action_result = self.execute_action(action_index)
+            reward += action_result.get("reward", 0)
+            info.update(action_result)
             
-        # Sleep briefly to allow action to take effect
-        time.sleep(0.05)
-        
-        # Get the current state
-        state = self._process_frame(self.screen_capture.capture_frame())
-        
-        # Calculate reward using autonomous reward system
-        reward = self._compute_reward(self.actions[action_idx], action_idx, True, self.check_menu_state())
-        
-        # Add penalty if in a menu and not attempting to exit
-        # Important: Always check for menus after executing an action
-        is_in_menu = self.check_menu_state()
-        if is_in_menu:
-            # We're in a menu - apply menu penalty and try to recover 
-            # unless the action was an attempt to exit (like ESC or clicking exit buttons)
-            is_exit_attempt = (action_type == "key" and self.actions[action_idx].get("key") == "escape") or \
-                              (action_type == "mouse" and self.actions[action_idx].get("action") == "click")  # Any click could be trying to exit
-                              
-            if not is_exit_attempt:
-                # Apply a penalty for not trying to exit the menu
-                reward -= 0.5
-                info["menu_penalty"] = True
-                
-            # Try to recover from menu
-            self._handle_menu_recovery()
+            # Get next frame after action
+            next_frame = self.capture_observation()
             
-            # Get fresh state after recovery attempt
-            state = self._process_frame(self.screen_capture.capture_frame())
-        
-        # Update the step counter
-        self.steps_taken += 1
-        
-        # Check if the episode is done
-        done = self.steps_taken >= self.max_steps
-        
-        # Add diagnostic information
-        info["step"] = self.steps_taken
-        info["action_type"] = action_type
-        info["in_menu"] = is_in_menu
-        
-        return state, reward, done, info
+            # Calculate frame difference for visual change detection
+            try:
+                frame_diff = self._calculate_frame_difference(current_frame, next_frame)
+                info["frame_difference"] = frame_diff
+                
+                # Add reward based on visual change (encourage actions that cause change)
+                # But only if not in a menu
+                if not in_menu:
+                    change_reward = min(0.1, frame_diff / 50.0)  # Cap at 0.1
+                    reward += change_reward
+                    logger.debug(f"Visual change reward: {change_reward:.4f} (diff: {frame_diff:.2f})")
+                    
+                    # Very low differences in normal gameplay may indicate pause or menu
+                    if frame_diff < 0.01 and self.steps_since_last_menu > 5:
+                        logger.warning("Very low visual change detected in normal gameplay - possible undetected menu")
+                        # Check for menu again with lower threshold
+                        self.menu_handler.detection_threshold_adjustment = -0.15
+                        in_menu, menu_type, _ = self.menu_handler.detect_menu(next_frame)
+                        self.menu_handler.detection_threshold_adjustment = 0.0
+                        
+                        if in_menu:
+                            logger.info(f"Detected menu after low frame diff: {menu_type}")
+                            self.menu_handler.recover_from_menu()
+                        else:
+                            # Try escape key as last resort
+                            self.input_simulator.press_escape()
+                            time.sleep(0.3)
+                            # Add small penalty
+                            reward -= 0.05
+            except Exception as e:
+                logger.error(f"Error calculating frame difference: {e}")
+                frame_diff = 0
+            
+            # Update some metrics
+            self.total_steps += 1
+            self.episode_reward += reward
+            
+            # Process the observation into proper format
+            observation = self._preprocess_observation(next_frame)
+            
+            # Record timing for performance tracking
+            step_time = time.time() - start_time
+            self.step_times.append(step_time)
+            
+            info.update({
+                "in_menu": in_menu,
+                "menu_type": menu_type if in_menu else None,
+                "step_time": step_time,
+                "episode_reward": self.episode_reward,
+                "total_steps": self.total_steps,
+            })
+            
+            return observation, reward, done, info
+            
+        except Exception as e:
+            logger.error(f"Error in step function: {e}")
+            traceback.print_exc()
+            return np.zeros(self.get_observation_shape()), -1.0, True, {"error": str(e)}
     
     def check_menu_state(self) -> bool:
         """Check if the game is currently in a menu state.
@@ -1406,3 +1450,283 @@ class CitiesEnvironment:
             frame_tensor = frame_tensor.to(self.config.get_device())
         
         return frame_tensor
+
+    def _store_gameplay_reference_frame(self, frame):
+        """Store a reference frame for normal gameplay state detection.
+        
+        Args:
+            frame: Frame to store as reference
+        """
+        if frame is None:
+            return
+            
+        # Don't store if we already have the maximum number of references
+        if len(self.gameplay_reference_frames) >= self.max_reference_frames:
+            # Replace oldest frame
+            self.gameplay_reference_frames.pop(0)
+            
+        # Store the new reference frame
+        self.gameplay_reference_frames.append(frame.copy())
+        logger.debug(f"Stored gameplay reference frame (total: {len(self.gameplay_reference_frames)})")
+    
+    def _compare_to_gameplay_references(self, frame):
+        """Compare current frame to gameplay reference frames.
+        
+        Args:
+            frame: Current frame to compare
+            
+        Returns:
+            float: Similarity score (0-1) where 1 is identical
+        """
+        if not self.gameplay_reference_frames or frame is None:
+            return 1.0  # No references or no frame, assume it's fine
+            
+        try:
+            # Calculate similarity scores against all reference frames
+            similarities = []
+            
+            for ref_frame in self.gameplay_reference_frames:
+                # Convert to float for calculations
+                current = frame.astype(np.float32)
+                reference = ref_frame.astype(np.float32)
+                
+                # Calculate mean squared error
+                mse = np.mean(np.square(current - reference))
+                
+                # Convert to similarity score (1 - normalized error)
+                # Higher is more similar
+                similarity = 1.0 - min(1.0, mse / 10000.0)
+                similarities.append(similarity)
+            
+            # Return maximum similarity (best match)
+            return max(similarities) if similarities else 1.0
+            
+        except Exception as e:
+            logger.error(f"Error comparing to gameplay references: {e}")
+            return 1.0  # On error, assume it's fine
+    
+    def _calculate_frame_difference(self, frame1, frame2):
+        """Calculate the difference between two frames.
+        
+        Args:
+            frame1: First frame
+            frame2: Second frame
+            
+        Returns:
+            float: Difference score
+        """
+        if frame1 is None or frame2 is None:
+            return 0
+            
+        try:
+            # Convert to float for calculations
+            f1 = frame1.astype(np.float32)
+            f2 = frame2.astype(np.float32)
+            
+            # Calculate mean absolute difference
+            diff = np.mean(np.abs(f1 - f2))
+            return diff
+            
+        except Exception as e:
+            logger.error(f"Error calculating frame difference: {e}")
+            return 0
+
+    def capture_observation(self):
+        """Capture and return the current frame.
+        
+        Returns:
+            np.ndarray: Current frame
+        """
+        try:
+            frame = self.screen_capture.capture_frame()
+            if frame is None:
+                logger.warning("Failed to capture frame")
+                # Return a black frame as fallback
+                if hasattr(self, 'resolution'):
+                    width, height = self.resolution
+                else:
+                    width, height = 320, 240
+                return np.zeros((height, width, 3), dtype=np.uint8)
+            return frame
+        except Exception as e:
+            logger.error(f"Error in capture_observation: {e}")
+            # Return a black frame on error
+            return np.zeros((240, 320, 3), dtype=np.uint8)
+    
+    def _preprocess_observation(self, frame):
+        """Process the frame into the format expected by the model.
+        
+        Args:
+            frame: Raw frame from screen capture
+            
+        Returns:
+            np.ndarray: Processed observation
+        """
+        if frame is None:
+            logger.warning("Preprocessing None frame")
+            return np.zeros((240, 320, 3), dtype=np.uint8)
+            
+        try:
+            # Ensure frame is in the right format (uint8 RGB)
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+                
+            # Ensure frame has 3 channels (RGB)
+            if len(frame.shape) == 2:
+                # Convert grayscale to RGB
+                frame = np.stack([frame] * 3, axis=2)
+            elif frame.shape[2] == 4:
+                # Convert RGBA to RGB
+                frame = frame[:, :, :3]
+                
+            return frame
+        except Exception as e:
+            logger.error(f"Error in _preprocess_observation: {e}")
+            return np.zeros((240, 320, 3), dtype=np.uint8)
+    
+    def execute_action(self, action_index):
+        """Execute the specified action.
+        
+        Args:
+            action_index: Index of action to execute
+            
+        Returns:
+            dict: Result information
+        """
+        result = {
+            "action_index": action_index,
+            "reward": 0.0,
+            "success": False,
+            "details": ""
+        }
+        
+        try:
+            # Check if action index is valid
+            if action_index < 0 or action_index >= len(self.actions):
+                logger.warning(f"Invalid action index: {action_index}")
+                result["details"] = "Invalid action index"
+                return result
+                
+            # Get action details
+            action_info = self.actions[action_index]
+            action_type = action_info.get("type", "")
+            
+            logger.debug(f"Executing action {action_index}: {action_type}")
+            
+            # Handle different action types
+            if action_type == "mouse":
+                self._execute_mouse_action(action_info)
+                result["success"] = True
+                
+            elif action_type == "keyboard":
+                self._execute_keyboard_action(action_info)
+                result["success"] = True
+                
+            elif action_type == "game":
+                self._execute_game_action(action_info)
+                result["success"] = True
+                
+            else:
+                logger.warning(f"Unknown action type: {action_type}")
+                result["details"] = f"Unknown action type: {action_type}"
+                return result
+                
+            # Calculate basic reward
+            result["reward"] = 0.05  # Small positive reward for successful execution
+            result["details"] = f"Executed {action_type} action"
+            
+        except Exception as e:
+            logger.error(f"Error executing action {action_index}: {e}")
+            result["details"] = f"Error: {str(e)}"
+            
+        return result
+        
+    def _execute_mouse_action(self, action_info):
+        """Execute a mouse action.
+        
+        Args:
+            action_info: Dictionary with action details
+        """
+        action_subtype = action_info.get("subtype", "")
+        
+        if action_subtype == "move":
+            position = action_info.get("position", (0, 0))
+            self.input_simulator.mouse_move(*position)
+            
+        elif action_subtype == "click":
+            position = action_info.get("position", None)
+            button = action_info.get("button", "left")
+            
+            if position:
+                self.input_simulator.move_mouse(*position)
+                time.sleep(0.1)
+                
+            if button == "left":
+                self.input_simulator.click_mouse_left()
+            elif button == "right":
+                self.input_simulator.click_mouse_right()
+            else:
+                self.input_simulator.click_mouse()
+                
+        elif action_subtype == "scroll":
+            direction = action_info.get("direction", "up")
+            steps = action_info.get("steps", 1)
+            self.input_simulator.scroll_mouse(direction, steps)
+            
+        elif action_subtype == "drag":
+            start = action_info.get("start", (0, 0))
+            end = action_info.get("end", (0, 0))
+            self.input_simulator.drag_mouse(start, end)
+            
+        elif action_subtype == "edge_scroll":
+            direction = action_info.get("direction", "up")
+            duration = action_info.get("duration", 0.5)
+            self.input_simulator.edge_scroll(direction, duration)
+            
+    def _execute_keyboard_action(self, action_info):
+        """Execute a keyboard action.
+        
+        Args:
+            action_info: Dictionary with action details
+        """
+        action_subtype = action_info.get("subtype", "")
+        
+        if action_subtype == "press":
+            key = action_info.get("key", "")
+            if isinstance(key, str) and len(key) == 1:
+                self.input_simulator.press_key(ord(key))
+            else:
+                self.input_simulator.press_key(key)
+                
+        elif action_subtype == "hotkey":
+            keys = action_info.get("keys", [])
+            self.input_simulator.press_hotkey(keys)
+            
+    def _execute_game_action(self, action_info):
+        """Execute a game-specific action.
+        
+        Args:
+            action_info: Dictionary with action details
+        """
+        action_subtype = action_info.get("subtype", "")
+        
+        if action_subtype == "speed":
+            speed = action_info.get("speed", 1)
+            self._set_game_speed(speed)
+            
+        elif action_subtype == "pause":
+            self._toggle_pause()
+            
+        elif action_subtype == "tool":
+            tool = action_info.get("tool", "")
+            self._select_tool(tool)
+    
+    def get_observation_shape(self):
+        """Get the shape of the observation space.
+        
+        Returns:
+            tuple: Observation shape
+        """
+        if hasattr(self, 'observation_space') and hasattr(self.observation_space, 'shape'):
+            return self.observation_space.shape
+        return (240, 320, 3)  # Default shape

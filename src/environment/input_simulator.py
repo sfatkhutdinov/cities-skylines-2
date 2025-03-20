@@ -10,6 +10,7 @@ import ctypes
 import pyautogui
 import torch
 import logging
+import numpy as np
 
 # Import Win32 user32 for more direct mouse control
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -1489,7 +1490,7 @@ class InputSimulator:
         return self.mouse_move(x, y)
         
     def edge_scroll(self, direction: str, duration: float = 0.5) -> bool:
-        """Scroll the screen by moving mouse to the specified edge.
+        """Scroll the screen by moving mouse to the specified edge or using keyboard fallback.
         
         Args:
             direction (str): Direction to scroll ('up', 'down', 'left', 'right')
@@ -1504,7 +1505,39 @@ class InputSimulator:
             if not success:
                 logger.warning("Failed to focus game window for edge scrolling")
                 return False
+            
+            # First try mouse-based edge scrolling
+            mouse_success = self._edge_scroll_with_mouse(direction, duration)
+            
+            # If mouse scrolling succeeded or generated visual change, return success
+            if mouse_success and self._verify_visual_change():
+                logger.info(f"Edge scrolling with mouse succeeded in direction: {direction}")
+                return True
                 
+            # If mouse method failed or didn't produce visual change, try keyboard method
+            logger.info(f"Mouse edge scrolling failed or no visual change, trying keyboard for direction: {direction}")
+            return self._edge_scroll_with_keyboard(direction, duration)
+            
+        except Exception as e:
+            logger.error(f"Error during edge scrolling: {e}")
+            # Try keyboard fallback on exception
+            try:
+                return self._edge_scroll_with_keyboard(direction, duration)
+            except Exception as e2:
+                logger.error(f"Keyboard fallback also failed: {e2}")
+                return False
+    
+    def _edge_scroll_with_mouse(self, direction: str, duration: float = 0.5) -> bool:
+        """Scroll using mouse positioned at screen edge.
+        
+        Args:
+            direction: Direction to scroll
+            duration: Duration to hold at edge
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
             # Get game window dimensions
             if hasattr(self, 'screen_capture') and self.screen_capture and hasattr(self.screen_capture, 'game_window_position'):
                 window_pos = self.screen_capture.game_window_position
@@ -1556,5 +1589,116 @@ class InputSimulator:
             return True
             
         except Exception as e:
-            logger.error(f"Error during edge scrolling: {e}")
+            logger.error(f"Error during mouse edge scrolling: {e}")
             return False
+    
+    def _edge_scroll_with_keyboard(self, direction: str, duration: float = 0.5) -> bool:
+        """Scroll using keyboard arrow keys as a fallback method.
+        
+        Args:
+            direction: Direction to scroll ('up', 'down', 'left', 'right')
+            duration: Duration to hold key in seconds
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Ensure game window is focused
+            success = self.ensure_game_window_focused()
+            if not success:
+                logger.warning("Failed to focus game window for keyboard scrolling")
+                return False
+            
+            # Map direction to key codes and alternative keys
+            key_mapping = {
+                'up': {'primary': 0x26, 'secondary': ord('W')},      # UP arrow, W
+                'down': {'primary': 0x28, 'secondary': ord('S')},    # DOWN arrow, S
+                'left': {'primary': 0x25, 'secondary': ord('A')},    # LEFT arrow, A
+                'right': {'primary': 0x27, 'secondary': ord('D')}    # RIGHT arrow, D
+            }
+            
+            if direction not in key_mapping:
+                logger.warning(f"Invalid direction for keyboard scrolling: {direction}")
+                return False
+            
+            # Get key codes for the direction
+            primary_key = key_mapping[direction]['primary']
+            secondary_key = key_mapping[direction]['secondary']
+            
+            logger.info(f"Using keyboard scrolling for direction: {direction}")
+            
+            # Try with arrow keys first
+            before_state = self._capture_visual_state()
+            
+            self.key_down(primary_key)
+            time.sleep(duration)
+            self.key_up(primary_key)
+            
+            # Check if this produced visual change
+            if self._verify_visual_change(before_state):
+                logger.info(f"Arrow key scrolling successful for {direction}")
+                return True
+            
+            # If arrow keys didn't work, try WASD
+            logger.info(f"Arrow key didn't work, trying WASD for {direction}")
+            before_state = self._capture_visual_state()
+            
+            self.key_down(secondary_key)
+            time.sleep(duration)
+            self.key_up(secondary_key)
+            
+            return self._verify_visual_change(before_state)
+            
+        except Exception as e:
+            logger.error(f"Error during keyboard scrolling: {e}")
+            return False
+    
+    def _capture_visual_state(self):
+        """Capture current visual state for change verification.
+        
+        Returns:
+            Current frame or None if not available
+        """
+        if hasattr(self, 'screen_capture') and self.screen_capture:
+            return self.screen_capture.capture_frame()
+        return None
+    
+    def _verify_visual_change(self, before_state=None):
+        """Verify if visual change occurred after an action.
+        
+        Args:
+            before_state: Frame before action, if None will capture a new one
+            
+        Returns:
+            bool: True if visual change detected
+        """
+        if not hasattr(self, 'screen_capture') or not self.screen_capture:
+            return True  # Can't verify, assume success
+            
+        # If no before state provided, return True (can't verify)
+        if before_state is None:
+            return True
+            
+        # Capture after state
+        time.sleep(0.2)  # Brief pause to allow visual changes to occur
+        after_state = self.screen_capture.capture_frame()
+        
+        if after_state is None:
+            return False
+            
+        try:
+            # Calculate difference between frames
+            before_state = before_state.astype(np.float32)
+            after_state = after_state.astype(np.float32)
+            
+            # Calculate MSE between frames
+            frame_diff = np.mean(np.square(before_state - after_state))
+            
+            logger.debug(f"Visual change verification - frame diff: {frame_diff:.6f}")
+            
+            # Return True if difference exceeds threshold
+            return frame_diff > 1.0  # Arbitrary threshold for visual change
+            
+        except Exception as e:
+            logger.error(f"Error verifying visual change: {e}")
+            return True  # Assume success on error

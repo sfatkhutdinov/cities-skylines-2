@@ -344,7 +344,6 @@ class MenuHandler:
                             # If this is the highest menu score so far, update menu_type
                             if score > 0.5 and (not menu_type or score > region_scores.get(menu_type, 0)):
                                 menu_type = menu_type
-                                detection_scores["region_analysis"] = score
                     
                     # Check if any region score is very high - strong indicator
                     max_region_score = max(region_scores.values()) if region_scores else 0
@@ -521,7 +520,7 @@ class MenuHandler:
                 
                 # Determine final menu detection result
                 # Lower the threshold to be more sensitive to manually opened menus
-                detection_threshold = 0.35  # Reduced from 0.45 to 0.35
+                detection_threshold = 0.22  # Reduced from 0.35 to 0.22 to be more sensitive
                 
                 # Apply dynamic adjustment based on consecutive detections
                 detection_threshold += self.detection_threshold_adjustment
@@ -531,6 +530,25 @@ class MenuHandler:
                 # Update menu state based on final detection
                 menu_detected = weighted_score > detection_threshold
                 
+                # Add visual flicker detection as additional menu indicator
+                if not menu_detected and hasattr(self, 'last_frame') and current_frame is not None:
+                    try:
+                        # Calculate frame difference
+                        frame_diff = np.mean(np.abs(current_frame.astype(np.float32) - self.last_frame.astype(np.float32)))
+                        
+                        # Very low frame differences can indicate menu/paused state
+                        if frame_diff < 0.01 and weighted_score > 0.1:
+                            logger.debug(f"Detected possible menu via low frame difference: {frame_diff:.6f}")
+                            menu_detected = True
+                            menu_type = menu_type if menu_type is not None else "static_screen"
+                            weighted_score = max(weighted_score, 0.25)  # Boost confidence
+                    except Exception as e:
+                        logger.error(f"Error in frame difference calculation: {e}")
+                
+                # Store current frame for next comparison
+                if current_frame is not None:
+                    self.last_frame = current_frame.copy()
+                    
                 # Update menu stuck detection
                 was_in_menu = self.in_menu
                 previous_menu_type = self.menu_type
@@ -604,18 +622,29 @@ class MenuHandler:
             logger.info("Forcing menu state reset after max recovery attempts")
             self.reset_state()
             self.menu_recovery_attempts = 0
+            
+            # Execute aggressive escape sequence - multiple key presses
+            logger.info("Executing aggressive escape sequence")
+            self._execute_aggressive_escape_sequence()
+            
             # Simply click in a game area and hope we exit the menu
             center_x, center_y = self.screen_capture.get_window_center()
             self.input_simulator.move_mouse(center_x, center_y)
             self.input_simulator.click_mouse()
             time.sleep(0.5)
-            self.input_simulator.press_escape()  # Try ESC key as a last resort
-            time.sleep(0.5)
             return True  # Return true even though we're forcing it
         
-        # More aggressive exit strategy
+        # Try using specific key for the menu type first
+        if self.menu_type is not None:
+            logger.info(f"Trying menu-specific exit for: {self.menu_type}")
+            if self._try_menu_specific_exit(self.menu_type):
+                logger.info(f"Successfully exited {self.menu_type} menu with specific method")
+                self.menu_recovery_attempts = 0
+                self.last_menu_exit_time = time.time()
+                return True
+        
         # First, try pressing ESC key which works for most menus
-        logger.info("Trying ESC key first for menu exit")
+        logger.info("Trying ESC key for menu exit")
         self.input_simulator.press_escape()
         time.sleep(0.7)  # Wait a bit longer to see if menu transitions
         
@@ -1022,30 +1051,30 @@ class MenuHandler:
                             if (x1_px <= element_center_x <= x2_px and 
                                 y1_px <= element_center_y <= y2_px):
                                 elements_in_region += 1
-                    
-                    # Calculate UI density
-                    region_area = (x2_px - x1_px) * (y2_px - y1_px)
-                    ui_density = elements_in_region / max(1, region_area) * 1000
-                    
-                    # Score based on menu type
-                    if menu_type == "main_menu":
-                        # Main menu usually has characteristic colors
-                        color_score = abs(channel_means[2] - channel_means[0]) * 2.0  # Blue-red difference
-                        score = contrast * 2.0 + color_score + ui_density
-                    elif menu_type == "pause_menu":
-                        # Pause menus often have higher contrast
-                        score = contrast * 3.0 + ui_density
-                    elif menu_type == "settings_menu":
-                        # Settings menus have many UI elements
-                        score = ui_density * 2.0 + contrast
-                    elif menu_type == "dialog":
-                        # Dialogs typically have high contrast in center
-                        score = contrast * 4.0 + ui_density
-                    else:  # notification
-                        # Notifications have small, focused regions
-                        score = (contrast * 2.0 + ui_density) * 1.5
                         
-                    region_scores.append(score)
+                        # Calculate UI density
+                        region_area = (x2_px - x1_px) * (y2_px - y1_px)
+                        ui_density = elements_in_region / max(1, region_area) * 1000
+                        
+                        # Score based on menu type
+                        if menu_type == "main_menu":
+                            # Main menu usually has characteristic colors
+                            color_score = abs(channel_means[2] - channel_means[0]) * 2.0  # Blue-red difference
+                            score = contrast * 2.0 + color_score + ui_density
+                        elif menu_type == "pause_menu":
+                            # Pause menus often have higher contrast
+                            score = contrast * 3.0 + ui_density
+                        elif menu_type == "settings_menu":
+                            # Settings menus have many UI elements
+                            score = ui_density * 2.0 + contrast
+                        elif menu_type == "dialog":
+                            # Dialogs typically have high contrast in center
+                            score = contrast * 4.0 + ui_density
+                        else:  # notification
+                            # Notifications have small, focused regions
+                            score = (contrast * 2.0 + ui_density) * 1.5
+                            
+                        region_scores.append(score)
                 
                 # Use maximum score from regions
                 if region_scores:
@@ -1346,3 +1375,192 @@ class MenuHandler:
                 scores[menu_type] = 0.0
         
         return scores 
+
+    def _execute_aggressive_escape_sequence(self) -> None:
+        """Execute an aggressive series of keyboard shortcuts to exit any menu state."""
+        logger.info("Executing aggressive escape sequence")
+        
+        # Common menu exit keys
+        keys_to_try = [
+            # ESC key multiple times with pauses
+            {'key': 'escape', 'count': 3, 'pause': 0.5},
+            # Enter key (confirm dialogs)
+            {'key': 'return', 'count': 2, 'pause': 0.3},
+            # Tab key (navigate through UI elements)
+            {'key': 'tab', 'count': 2, 'pause': 0.2},
+            # Space key (confirm/continue)
+            {'key': 'space', 'count': 1, 'pause': 0.3},
+            # Known Cities: Skylines 2 shortcuts
+            {'key': 'p', 'count': 1, 'pause': 0.5},  # Pause/unpause game
+            {'key': 'm', 'count': 1, 'pause': 0.5},  # Toggle map
+            {'key': 'b', 'count': 1, 'pause': 0.5},  # Back to game
+        ]
+        
+        # Execute each key sequence
+        for key_data in keys_to_try:
+            key = key_data['key']
+            count = key_data['count']
+            pause = key_data['pause']
+            
+            for _ in range(count):
+                try:
+                    # Press the key
+                    if key == 'escape':
+                        self.input_simulator.press_escape()
+                    elif key == 'return':
+                        self.input_simulator.press_key(0x0D)  # Enter key
+                    elif key == 'tab':
+                        self.input_simulator.press_key(0x09)  # Tab key
+                    elif key == 'space':
+                        self.input_simulator.press_key(0x20)  # Space key
+                    else:
+                        # For other keys, use their ASCII value
+                        self.input_simulator.press_key(ord(key))
+                    
+                    # Pause between keypresses
+                    time.sleep(pause)
+                    
+                    # Check if we've exited the menu
+                    current_frame = self.screen_capture.capture_frame()
+                    if current_frame is not None:
+                        in_menu, _, _ = self.detect_menu(current_frame)
+                        if not in_menu:
+                            logger.info(f"Successfully exited menu with key: {key}")
+                            return
+                except Exception as e:
+                    logger.error(f"Error pressing key {key}: {e}")
+        
+        # If all else fails, try clicking key locations
+        self._try_clicking_common_locations()
+        
+    def _try_clicking_common_locations(self) -> None:
+        """Try clicking common button locations to exit menus."""
+        screen_width, screen_height = self.screen_capture.get_window_size()
+        
+        # Common button locations (normalized coordinates)
+        locations = [
+            (0.5, 0.8),    # Bottom center - common for "Continue" buttons
+            (0.9, 0.1),    # Top right - common for "Close" buttons
+            (0.1, 0.9),    # Bottom left - common for "Back" buttons
+            (0.9, 0.9),    # Bottom right - common for "Next" or "Continue" buttons
+            (0.5, 0.5),    # Center - general fallback
+            (0.5, 0.73),   # Common "OK" button position
+            (0.8, 0.75),   # Common "Accept" button position
+        ]
+        
+        for norm_x, norm_y in locations:
+            x, y = int(norm_x * screen_width), int(norm_y * screen_height)
+            logger.debug(f"Trying click at ({x}, {y})")
+            self.input_simulator.move_mouse(x, y)
+            time.sleep(0.2)
+            self.input_simulator.click_mouse()
+            time.sleep(0.5)
+            
+            # Check if the click helped
+            current_frame = self.screen_capture.capture_frame()
+            if current_frame is not None:
+                in_menu, _, _ = self.detect_menu(current_frame)
+                if not in_menu:
+                    logger.info(f"Successfully exited menu with click at ({norm_x}, {norm_y})")
+                    return
+    
+    def _try_menu_specific_exit(self, menu_type: str) -> bool:
+        """Try menu-specific exit methods.
+        
+        Args:
+            menu_type: Type of menu to exit
+            
+        Returns:
+            bool: True if successfully exited, False otherwise
+        """
+        # Menu-specific exit strategies
+        if menu_type == "main_menu":
+            # For main menu, look for "New Game" or "Continue" button
+            self._try_keyboard_exit("n")  # 'n' for New Game
+            time.sleep(0.5)
+            if self._check_menu_exit():
+                return True
+                
+            # Try clicking start button
+            center_x, center_y = self.screen_capture.get_window_center()
+            self.input_simulator.move_mouse(center_x, center_y + 50)  # Below center, likely start button
+            self.input_simulator.click_mouse()
+            time.sleep(0.7)
+            return self._check_menu_exit()
+            
+        elif menu_type == "pause_menu":
+            # For pause menu, press Escape or look for "Resume" button
+            self._try_keyboard_exit("p")  # 'p' to toggle pause
+            time.sleep(0.5)
+            if self._check_menu_exit():
+                return True
+                
+            # Try clicking the resume button if visible
+            return self._click_menu_button("resume_button")
+            
+        elif menu_type == "settings_menu":
+            # For settings, Escape usually works, or clicking "Back"
+            self._try_keyboard_exit(0x1B)  # Escape key
+            time.sleep(0.5)
+            return self._check_menu_exit()
+            
+        elif menu_type == "dialog":
+            # For dialogs, Enter usually confirms and dismisses
+            self._try_keyboard_exit(0x0D)  # Enter key
+            time.sleep(0.5)
+            return self._check_menu_exit()
+            
+        elif menu_type == "notification":
+            # For notifications, Space or Escape usually dismisses
+            self._try_keyboard_exit(0x20)  # Space key
+            time.sleep(0.5)
+            return self._check_menu_exit()
+            
+        elif menu_type == "static_screen":
+            # For static screens (possibly loading or cutscene), try multiple options
+            keys_to_try = [0x20, 0x0D, 0x1B]  # Space, Enter, Escape
+            for key in keys_to_try:
+                self._try_keyboard_exit(key)
+                time.sleep(0.5)
+                if self._check_menu_exit():
+                    return True
+            
+            # If keys don't work, try clicking center
+            center_x, center_y = self.screen_capture.get_window_center()
+            self.input_simulator.move_mouse(center_x, center_y)
+            self.input_simulator.click_mouse()
+            time.sleep(0.5)
+            return self._check_menu_exit()
+            
+        return False  # No specific exit strategy worked
+        
+    def _check_menu_exit(self) -> bool:
+        """Check if we've successfully exited a menu.
+        
+        Returns:
+            bool: True if not in menu, False otherwise
+        """
+        current_frame = self.screen_capture.capture_frame()
+        if current_frame is not None:
+            in_menu, _, _ = self.detect_menu(current_frame)
+            return not in_menu
+        return False 
+
+    def _try_keyboard_exit(self, key):
+        """Try to exit menu using a keyboard key.
+        
+        Args:
+            key: Key to press (can be character or key code)
+        """
+        try:
+            if isinstance(key, str) and len(key) == 1:
+                # Single character (like 'p')
+                self.input_simulator.press_key(ord(key.lower()))
+            else:
+                # Key code like 0x1B for Escape
+                self.input_simulator.press_key(key)
+        except Exception as e:
+            logger.error(f"Error pressing key {key}: {e}")
+            # Try alternative method
+            if key == 0x1B:  # Escape
+                self.input_simulator.press_escape() 
