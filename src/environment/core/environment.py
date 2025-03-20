@@ -155,6 +155,10 @@ class Environment:
         # to avoid conflict with the ActionSpace instance
         self._gym_action_space = Discrete(self._action_space_manager.get_num_actions())
         
+        # Initialize action tracking
+        self.action_stats = {}
+        self.action_success_rates = {}
+        
         logger.info("Environment initialized successfully.")
     
     @property
@@ -235,7 +239,34 @@ class Environment:
             return observation, reward, done, info
         
         # Ensure game window is focused before interacting with it
-        self._ensure_window_focused()
+        # Try up to 3 times with increasing force
+        focus_success = False
+        for focus_attempt in range(3):
+            # More aggressive focus on later attempts
+            force_focus = focus_attempt > 0
+            if force_focus:
+                logger.info(f"Retry focus with force=True (attempt {focus_attempt+1}/3)")
+            
+            if self._ensure_window_focused():
+                focus_success = True
+                # The _ensure_window_focused method now includes a delay after successful focus
+                break
+            elif focus_attempt < 2:  # Don't wait after the last attempt
+                time.sleep(0.5)
+        
+        if not focus_success:
+            logger.warning("Failed to focus game window after multiple attempts")
+            # Return an error observation with a negative reward
+            observation = self.get_observation()
+            reward = -1.0  # Penalty for focus failure
+            done = False
+            info = {
+                'error': True,
+                'error_type': 'focus_failure',
+                'steps': self.steps_taken,
+                'action': action_idx
+            }
+            return observation, reward, done, info
         
         # Check if we're in a menu
         menu_detected = False
@@ -244,6 +275,10 @@ class Environment:
             self.game_state.in_menu = menu_detected
         
         # Execute appropriate action based on menu state
+        success = False
+        action_retries = 0
+        max_action_retries = 3  # Increased from 2 to 3 for more reliability
+        
         if menu_detected and self.menu_handler:
             # In menu - try to recover
             success = self.menu_handler.handle_menu_recovery()
@@ -251,21 +286,53 @@ class Environment:
                 # If menu recovery failed, try error recovery
                 success = self.error_recovery.handle_menu_detection()
         else:
-            # In game - execute requested action
-            try:
-                # Ensure minimum time between actions
-                elapsed = time.time() - self.last_action_time
-                if elapsed < self.min_action_delay:
-                    time.sleep(self.min_action_delay - elapsed)
-                
-                # Execute action
-                success = self.action_executor.execute_action(action_info)
-                self.last_action_time = time.time()
-                
-            except Exception as e:
-                logger.error(f"Error executing action {action_idx}: {e}")
-                success = False
-                self.consecutive_errors += 1
+            # In game - execute requested action with retries
+            while not success and action_retries <= max_action_retries:
+                try:
+                    # Ensure minimum time between actions
+                    elapsed = time.time() - self.last_action_time
+                    if elapsed < self.min_action_delay:
+                        time.sleep(self.min_action_delay - elapsed)
+                    
+                    # Check if focus was lost and try to regain it before retrying
+                    if action_retries > 0:
+                        logger.info(f"Retrying action execution (attempt {action_retries+1}/{max_action_retries+1})")
+                        # Try harder to focus on retries
+                        if not self._ensure_window_focused():
+                            logger.warning("Failed to refocus window during action retry")
+                            time.sleep(0.5)  # Wait a bit and try again anyway
+                        
+                    # Execute action
+                    success = self.action_executor.execute_action(action_info)
+                    self.last_action_time = time.time()
+                    
+                    # Track action success/failure for statistics
+                    self._track_action_result(action_idx, success)
+                    
+                    # Break if successful
+                    if success:
+                        break
+                    
+                    # If failed but can retry, give a short delay
+                    if not success and action_retries < max_action_retries:
+                        logger.warning(f"Action execution failed, will retry after delay")
+                        time.sleep(1.0)  # Increased wait time before retry
+                    
+                    action_retries += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error executing action {action_idx}: {e}")
+                    success = False
+                    self.consecutive_errors += 1
+                    
+                    # If this wasn't the last retry, try again
+                    if action_retries < max_action_retries:
+                        action_retries += 1
+                        # Try to refocus the window in case the error was caused by lost focus
+                        self._ensure_window_focused()
+                        time.sleep(1.0)  # Increased wait time before retry
+                    else:
+                        break
         
         # Get next observation
         next_observation = self.get_observation()
@@ -299,8 +366,11 @@ class Environment:
             'action': action_idx,
             'success': success,
             'in_menu': menu_detected,
+            'focus_success': focus_success,
+            'action_retries': action_retries,
             'fps': self.performance_monitor.get_fps(),
-            'error_stats': self.error_recovery.get_error_stats() if self.consecutive_errors > 0 else {}
+            'error_stats': self.error_recovery.get_error_stats() if self.consecutive_errors > 0 else {},
+            'action_stats': self.get_action_stats()
         }
         
         return next_observation, reward, done, info
@@ -510,6 +580,8 @@ class Environment:
                 result = self.screen_capture.focus_game_window()
                 if result:
                     logger.debug(f"Successfully focused game window on attempt {attempt+1}")
+                    # Add a consistent wait time after focus to ensure window is fully responsive
+                    time.sleep(0.75)  # Increased from the 0.5s in the debug script that worked
                     return True
                 else:
                     logger.warning(f"Failed to focus game window (attempt {attempt+1}/3)")
@@ -520,3 +592,64 @@ class Environment:
             
         logger.warning("Screen capture doesn't support window focusing")
         return True 
+
+    def _track_action_result(self, action_idx: int, success: bool) -> None:
+        """Track action execution results for statistics.
+        
+        Args:
+            action_idx: Index of the action
+            success: Whether the action was successful
+        """
+        # Initialize tracking for this action if needed
+        if action_idx not in self.action_stats:
+            self.action_stats[action_idx] = {
+                'total': 0,
+                'success': 0,
+                'failure': 0
+            }
+        
+        # Update counters
+        self.action_stats[action_idx]['total'] += 1
+        
+        if success:
+            self.action_stats[action_idx]['success'] += 1
+        else:
+            self.action_stats[action_idx]['failure'] += 1
+        
+        # Calculate success rate
+        total = self.action_stats[action_idx]['total']
+        successes = self.action_stats[action_idx]['success']
+        success_rate = (successes / total) if total > 0 else 0
+        
+        # Store success rate
+        self.action_success_rates[action_idx] = success_rate
+        
+        # Log the result if it's particularly bad
+        if total >= 5 and success_rate < 0.5:
+            action_info = self._action_space_manager.get_action_description(action_idx)
+            logger.warning(f"Low success rate for action {action_idx} ({action_info}): {success_rate:.2f} ({successes}/{total})")
+    
+    def get_action_stats(self) -> Dict[str, Any]:
+        """Get statistics about action execution.
+        
+        Returns:
+            Dict: Statistics about action execution
+        """
+        stats = {
+            'action_stats': self.action_stats,
+            'success_rates': self.action_success_rates,
+        }
+        
+        # Identify problematic actions (success rate < 0.7 with at least 5 attempts)
+        problematic = {}
+        for action_idx, rate in self.action_success_rates.items():
+            if rate < 0.7 and self.action_stats[action_idx]['total'] >= 5:
+                action_info = self._action_space_manager.get_action_description(action_idx)
+                problematic[action_idx] = {
+                    'description': action_info,
+                    'success_rate': rate,
+                    'attempts': self.action_stats[action_idx]['total']
+                }
+        
+        stats['problematic_actions'] = problematic
+        return stats 

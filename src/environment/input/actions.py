@@ -459,7 +459,90 @@ class ActionExecutor:
                 key = action_name.get('key')
                 duration = action_name.get('duration', 0.1)
                 logger.info(f"Converting 'key' action format to key_press with key={key}, duration={duration}")
-                return self.keyboard.key_press(key, duration)
+                try:
+                    # Verify input controller is ready before executing
+                    if not hasattr(self, 'keyboard') or self.keyboard is None:
+                        logger.error("Keyboard controller not available")
+                        return False
+                    
+                    # Use the correct keyboard_input method 
+                    from .keyboard import KeyboardInput
+                    if isinstance(self.keyboard, KeyboardInput):
+                        # Short delay before key press to ensure window is ready
+                        time.sleep(0.1)
+                        # Execute with retry if needed
+                        for attempt in range(2):
+                            result = self.keyboard.key_press(key, duration)
+                            if result:
+                                return True
+                            elif attempt < 1:  # Don't wait after last attempt
+                                logger.warning(f"Key press failed, retrying after delay")
+                                time.sleep(0.5)
+                        return False
+                    else:
+                        logger.error(f"Keyboard controller doesn't support key_press method")
+                        return False
+                except Exception as e:
+                    logger.error(f"Error executing key press action for key={key}: {e}")
+                    return False
+            
+            # Handle "type" + "mouse" format - convert to appropriate mouse action
+            elif 'type' in action_name and action_name['type'] == 'mouse' and 'action' in action_name:
+                mouse_action = action_name.get('action')
+                button = action_name.get('button', 'left')
+                position = action_name.get('position', None)
+                
+                # Extract normalized position if provided and convert to screen coordinates
+                if position and len(position) == 2:
+                    screen_width, screen_height = self._get_screen_dimensions()
+                    x = int(position[0] * screen_width)
+                    y = int(position[1] * screen_height)
+                    logger.info(f"Converted normalized position {position} to screen coordinates ({x}, {y})")
+                    
+                    try:
+                        # Verify mouse controller is ready
+                        if not hasattr(self, 'mouse') or self.mouse is None:
+                            logger.error("Mouse controller not available")
+                            return False
+                            
+                        from .mouse import MouseInput
+                        if isinstance(self.mouse, MouseInput):
+                            # Short delay before mouse action to ensure window is ready
+                            time.sleep(0.1)
+                            
+                            # Execute with retry if needed
+                            for attempt in range(2):
+                                if mouse_action == 'click':
+                                    # First ensure mouse is at the target position
+                                    self.mouse.mouse_move(x, y)
+                                    time.sleep(0.2)  # Wait for mouse to settle
+                                    result = self.mouse.mouse_click(x, y, button=button, double=False)
+                                elif mouse_action == 'double_click':
+                                    # First ensure mouse is at the target position
+                                    self.mouse.mouse_move(x, y)
+                                    time.sleep(0.2)  # Wait for mouse to settle
+                                    result = self.mouse.mouse_click(x, y, button=button, double=True)
+                                elif mouse_action == 'move':
+                                    result = self.mouse.mouse_move(x, y)
+                                else:
+                                    logger.error(f"Unknown mouse action: {mouse_action}")
+                                    return False
+                                    
+                                if result:
+                                    return True
+                                elif attempt < 1:  # Don't wait after last attempt
+                                    logger.warning(f"Mouse action failed, retrying after delay")
+                                    time.sleep(0.5)
+                            return False
+                        else:
+                            logger.error(f"Mouse controller doesn't support the required methods")
+                            return False
+                    except Exception as e:
+                        logger.error(f"Error executing mouse action {mouse_action} at ({x}, {y}): {e}")
+                        return False
+                else:
+                    logger.warning(f"Mouse action {mouse_action} requires position, but none provided or invalid")
+                    return False
             
             # Legacy format with 'action' key
             elif 'action' in action_name:
@@ -471,42 +554,122 @@ class ActionExecutor:
                 logger.error(f"Invalid action dictionary format: {action_name}")
                 return False
             
-        # Check if the action exists
-        if not hasattr(self.actions, action_name):
-            logger.error(f"Unknown action: {action_name}")
-            return False
-            
+        # Check if the action exists as a direct method
+        action_str = str(action_name)
+        
+        if hasattr(self.actions, action_str):
+            try:
+                # Get the action method
+                action_method = getattr(self.actions, action_str)
+                
+                # Execute action with appropriate parameters
+                logger.info(f"Executing action: {action_str} with params: {kwargs}")
+                start_time = time.time()
+                
+                # Add a small delay before action to ensure window is ready
+                time.sleep(0.1)
+                
+                # Execute with retry if needed
+                for attempt in range(2):
+                    result = action_method(**kwargs)
+                    if result:
+                        execution_time = time.time() - start_time
+                        # Record action with execution time
+                        self._record_action(action_str, kwargs, result, execution_time)
+                        logger.debug(f"Action {action_str} executed successfully in {execution_time:.3f}s")
+                        return True
+                    elif attempt < 1:  # Don't wait after last attempt
+                        logger.warning(f"Action {action_str} failed, retrying after delay")
+                        time.sleep(0.5)
+                
+                # If we get here, all attempts failed
+                execution_time = time.time() - start_time
+                self._record_action(action_str, kwargs, False, execution_time)
+                logger.warning(f"Action {action_str} reported failure after {execution_time:.3f}s")
+                return False
+                
+            except Exception as e:
+                logger.error(f"Error executing action {action_str}: {e}")
+                self._record_action(action_str, kwargs, False, 0, error=str(e))
+                return False
+        else:
+            # For undocumented actions, try to handle based on name conventions
+            # This allows for more flexible action handling
+            try:
+                if action_str.startswith('key_'):
+                    # Handle key_X actions (where X is a key name)
+                    key = action_str[4:]  # Extract key name
+                    logger.info(f"Converting action name '{action_str}' to key press for key '{key}'")
+                    # Add a small delay before action to ensure window is ready
+                    time.sleep(0.1)
+                    result = self.keyboard.key_press(key, kwargs.get('duration', 0.1))
+                    self._record_action(action_str, kwargs, result, 0)
+                    return result
+                    
+                elif action_str.startswith('mouse_'):
+                    # Handle mouse_X actions (click, move, etc.)
+                    logger.info(f"Attempting to handle undocumented mouse action: {action_str}")
+                    # Try to find a similar method in mouse controller
+                    for method_name in dir(self.mouse):
+                        if method_name.lower() == action_str.lower() or method_name.lower() == action_str[6:].lower():
+                            logger.info(f"Found matching mouse method: {method_name}")
+                            method = getattr(self.mouse, method_name)
+                            # Add a small delay before action to ensure window is ready
+                            time.sleep(0.1)
+                            result = method(**kwargs)
+                            self._record_action(action_str, kwargs, result, 0)
+                            return result
+                
+                logger.error(f"Unknown action: {action_str}")
+                return False
+                
+            except Exception as e:
+                logger.error(f"Error handling undocumented action {action_str}: {e}")
+                self._record_action(action_str, kwargs, False, 0, error=str(e))
+                return False
+    
+    def _get_screen_dimensions(self) -> Tuple[int, int]:
+        """Get screen dimensions for position calculations.
+        
+        Returns:
+            Tuple[int, int]: Width and height of screen
+        """
         try:
-            # Get the action method
-            action_method = getattr(self.actions, action_name)
+            # Default dimensions
+            default_width, default_height = 1920, 1080
             
-            # Execute action
-            logger.info(f"Executing action: {action_name} with params: {kwargs}")
-            result = action_method(**kwargs)
+            # Try to get actual screen dimensions
+            import win32api
+            screen_width = win32api.GetSystemMetrics(0)
+            screen_height = win32api.GetSystemMetrics(1)
             
-            # Record action
-            self._record_action(action_name, kwargs, result)
-            
-            return result
-            
+            # Return valid dimensions or defaults
+            if screen_width > 0 and screen_height > 0:
+                return screen_width, screen_height
+                
+            return default_width, default_height
         except Exception as e:
-            logger.error(f"Error executing action {action_name}: {e}")
-            return False
-            
-    def _record_action(self, action_name: str, params: dict, success: bool):
+            logger.error(f"Error getting screen dimensions: {e}")
+            return 1920, 1080
+    
+    def _record_action(self, action_name: str, params: dict, success: bool, execution_time: float = 0, error: str = None):
         """Record action execution to history.
         
         Args:
             action_name: Name of the action
             params: Parameters used
             success: Whether action was successful
+            execution_time: Time taken to execute the action
+            error: Error message if action failed
         """
         timestamp = time.time()
         record = {
             'timestamp': timestamp,
             'action': action_name,
             'params': params,
-            'success': success
+            'success': success,
+            'execution_time': execution_time,
+            'error': error
         }
         
         self.action_history.append(record)
@@ -553,13 +716,13 @@ class InputSimulator:
             input_config: Input configuration dictionary
         """
         # Create keyboard controller
-        from .keyboard import KeyboardController, KeyboardInput
-        self.keyboard_controller = KeyboardController()
-        self.keyboard_input = KeyboardInput()
+        from .keyboard import KeyboardInput
+        self.keyboard_controller = KeyboardInput()
+        self.keyboard_input = self.keyboard_controller
         
         # Create mouse controller
-        from .mouse import MouseController
-        self.mouse_controller = MouseController()
+        from .mouse import MouseInput
+        self.mouse_controller = MouseInput()
         
         # Create action executor
         self.action_executor = ActionExecutor(

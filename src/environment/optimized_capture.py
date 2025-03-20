@@ -8,6 +8,11 @@ with various optimization techniques for game state observation.
 import time
 import logging
 import numpy as np
+import win32gui
+import win32con
+import win32ui
+import win32api
+import ctypes
 from typing import Tuple, Optional, Dict, Any
 
 # Import MSS for fast screen capture
@@ -21,9 +26,8 @@ except ImportError:
 
 # Try to import Windows-specific libraries for additional optimizations
 try:
-    import win32gui
-    import win32con
-    WIN32_AVAILABLE = True
+    import platform
+    WIN32_AVAILABLE = platform.system() == "Windows"
 except ImportError:
     WIN32_AVAILABLE = False
     logging.warning("Win32 libraries not available. Some features will be limited.")
@@ -246,158 +250,149 @@ class OptimizedScreenCapture:
                 monitor["top"] + monitor["height"]
             )
     
-    def focus_game_window(self):
-        """Bring the game window to the foreground."""
-        if not WIN32_AVAILABLE or not hasattr(self, 'game_hwnd') or self.game_hwnd is None:
-            logger.warning("Cannot focus game window - window handle not available")
-            return False
+    def focus_game_window(self, retries=3, verification_time=0.5) -> bool:
+        """Focus the game window to ensure inputs go to the game.
+        
+        Args:
+            retries: Number of retry attempts
+            verification_time: Time to wait before verifying focus
             
+        Returns:
+            True if window is successfully focused
+        """
+        if not self.game_hwnd:
+            logger.warning("Cannot focus window, no game window handle")
+            return False
+        
+        window_title = win32gui.GetWindowText(self.game_hwnd)
+        logger.info(f"Focusing window: '{window_title}' (hwnd: {self.game_hwnd})")
+        
+        # Check if window is already focused
+        current_hwnd = win32gui.GetForegroundWindow()
+        current_title = win32gui.GetWindowText(current_hwnd)
+        logger.info(f"Current foreground window: '{current_title}' (hwnd: {current_hwnd})")
+        
+        if current_hwnd == self.game_hwnd:
+            logger.info("Game window is already focused")
+            return True
+        
+        # Try different focus techniques
+        focused = False
+        
+        # Technique 1: SetForegroundWindow with input state
+        logger.info("Trying focus technique 1...")
         try:
-            # Get window info for logging
-            try:
-                window_title = win32gui.GetWindowText(self.game_hwnd)
-                logger.info(f"Focusing window: '{window_title}' (hwnd: {self.game_hwnd})")
-            except Exception as e:
-                logger.error(f"Error getting window title: {e}")
+            # Try to simulate Alt key press to allow focus change
+            # Define ASFW_ANY ourselves if it's not in win32con
+            ASFW_ANY = 0x01  # ASFW_ANY constant value for allowing focus change
             
-            # Check if window exists
-            if not win32gui.IsWindow(self.game_hwnd):
-                logger.error(f"Window handle {self.game_hwnd} is not a valid window")
-                return False
+            # Attach foreground window rights
+            user32 = ctypes.windll.user32
+            user32.AllowSetForegroundWindow(ASFW_ANY)
             
-            # Check if window is visible
-            if not win32gui.IsWindowVisible(self.game_hwnd):
-                logger.warning(f"Window {self.game_hwnd} is not visible")
-                try:
-                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_SHOW)
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"Error showing window: {e}")
+            # Set game window to foreground
+            result = win32gui.SetForegroundWindow(self.game_hwnd)
+            focused = result != 0
             
-            # Check if window is minimized
-            if win32gui.IsIconic(self.game_hwnd):
-                logger.info("Window is minimized, restoring...")
-                # Show the window if it's minimized
-                try:
-                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"Error restoring window: {e}")
-                
-            # Check if window is already in foreground
-            try:
-                foreground_hwnd = win32gui.GetForegroundWindow()
-                foreground_title = win32gui.GetWindowText(foreground_hwnd)
-                logger.info(f"Current foreground window: '{foreground_title}' (hwnd: {foreground_hwnd})")
-                
-                if foreground_hwnd == self.game_hwnd:
-                    logger.info("Game window is already in focus")
-                    return True
-            except Exception as e:
-                logger.error(f"Error checking foreground window: {e}")
-                
-            # Create a counter for retry attempts
-            focus_attempts = 0
-            max_focus_attempts = 3
-            
-            # Try different approaches with retry mechanism
-            while focus_attempts < max_focus_attempts:
-                focus_attempts += 1
-                
-                # Approach 1: Standard SetForegroundWindow
-                try:
-                    logger.info(f"Attempt {focus_attempts}: Focusing window with SetForegroundWindow...")
-                    import ctypes
-                    user32 = ctypes.windll.user32
-                    user32.AllowSetForegroundWindow(self.game_hwnd)
-                    
-                    # Set window as foreground window
-                    result = win32gui.SetForegroundWindow(self.game_hwnd)
-                    logger.info(f"SetForegroundWindow result: {result}")
-                    
-                    # Small delay to allow OS to process
-                    time.sleep(0.5)
-                    
-                    # Check if successful
-                    if win32gui.GetForegroundWindow() == self.game_hwnd:
-                        logger.info("Successfully focused window with SetForegroundWindow")
-                        return True
-                except Exception as e:
-                    # If we got "Access is denied", just log it and continue to other approaches
-                    if "Access is denied" in str(e):
-                        logger.warning(f"SetForegroundWindow denied access: {e}")
-                    else:
-                        logger.error(f"Error using SetForegroundWindow: {e}")
-                
-                # Approach 2: Alternative using BringWindowToTop
-                try:
-                    logger.info(f"Attempt {focus_attempts}: Focusing window with BringWindowToTop...")
-                    win32gui.BringWindowToTop(self.game_hwnd)
-                    time.sleep(0.5)
-                    
-                    # Check if successful
-                    if win32gui.GetForegroundWindow() == self.game_hwnd:
-                        logger.info("Successfully focused window with BringWindowToTop")
-                        return True
-                except Exception as e:
-                    logger.error(f"Error using BringWindowToTop: {e}")
-                
-                # Approach 3: Use ShowWindow to activate
-                try:
-                    logger.info(f"Attempt {focus_attempts}: Focusing window with ShowWindow...")
-                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_SHOW)
-                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
-                    time.sleep(0.5)
-                    
-                    # Check if successful
-                    if win32gui.GetForegroundWindow() == self.game_hwnd:
-                        logger.info("Successfully focused window with ShowWindow")
-                        return True
-                except Exception as e:
-                    logger.error(f"Error using ShowWindow: {e}")
-                
-                # Approach 4: Try using AttachThreadInput technique
-                try:
-                    logger.info(f"Attempt {focus_attempts}: Focusing with AttachThreadInput technique...")
-                    import ctypes
-                    user32 = ctypes.windll.user32
-                    
-                    # Get the threads of the foreground window and our target window
-                    foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None)
-                    target_thread = user32.GetWindowThreadProcessId(self.game_hwnd, None)
-                    
-                    if foreground_thread != target_thread:
-                        # Attach the threads
-                        user32.AttachThreadInput(foreground_thread, target_thread, True)
-                        
-                        # Set focus and bring to top
-                        user32.SetForegroundWindow(self.game_hwnd)
-                        user32.BringWindowToTop(self.game_hwnd)
-                        
-                        # Detach the threads
-                        user32.AttachThreadInput(foreground_thread, target_thread, False)
-                        
-                        time.sleep(0.5)
-                        
-                        # Check if successful
-                        if win32gui.GetForegroundWindow() == self.game_hwnd:
-                            logger.info("Successfully focused window with AttachThreadInput")
-                            return True
-                except Exception as e:
-                    logger.error(f"Error using AttachThreadInput: {e}")
-                
-                # Wait before retrying
-                time.sleep(1.0)
-            
-            logger.warning(f"Failed to focus window after {max_focus_attempts} attempts")
-            
-            # Fallback method - if all else fails, try to continue without focus
-            logger.info("Proceeding with capturing without window focus as a fallback")
-            return False
-            
+            # Wait and verify
+            time.sleep(verification_time)
+            if win32gui.GetForegroundWindow() == self.game_hwnd:
+                logger.info("Focus technique 1 successful")
+                return True
         except Exception as e:
-            logger.error(f"Failed to focus game window: {e}")
-            return False
+            logger.error(f"Error using SetForegroundWindow: {e}")
+        
+        # If technique 1 failed or verification failed, try technique 2
+        if not focused:
+            logger.info("Trying focus technique 2...")
+            try:
+                # Restore window if minimized
+                if win32gui.IsIconic(self.game_hwnd):
+                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                
+                # Make window visible and activate
+                win32gui.ShowWindow(self.game_hwnd, win32con.SW_SHOW)
+                win32gui.SetActiveWindow(self.game_hwnd)
+                
+                # Alt+Tab simulation to switch to the window
+                user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+                user32.keybd_event(0x09, 0, 0, 0)  # Tab down
+                user32.keybd_event(0x09, 0, 2, 0)  # Tab up
+                user32.keybd_event(0x12, 0, 2, 0)  # Alt up
+                
+                # Wait and verify
+                time.sleep(verification_time)
+                if win32gui.GetForegroundWindow() == self.game_hwnd:
+                    logger.info("Focus technique 2 successful")
+                    return True
+                else:
+                    logger.warning("Focus technique 2 reported success but verification failed")
+            except Exception as e:
+                logger.error(f"Error using Alt+Tab technique: {e}")
+            
+        # Technique 3: Manipulate window Z-order
+        logger.info("Trying focus technique 3...")
+        try:
+            # Get current foreground window
+            fg_hwnd = win32gui.GetForegroundWindow()
+            
+            # Temporarily disable window if it's the foreground window (force context switch)
+            if fg_hwnd != 0:
+                win32gui.EnableWindow(fg_hwnd, False)
+                
+            # Force our window to top and activate
+            win32gui.BringWindowToTop(self.game_hwnd)
+            win32gui.SetForegroundWindow(self.game_hwnd)
+            
+            # Re-enable previous window
+            if fg_hwnd != 0:
+                win32gui.EnableWindow(fg_hwnd, True)
+                
+            # Wait and verify
+            time.sleep(verification_time)
+            if win32gui.GetForegroundWindow() == self.game_hwnd:
+                logger.info("Focus technique 3 successful")
+                return True
+            else:
+                logger.warning("Focus technique 3 reported success but verification failed")
+        except Exception as e:
+            logger.error(f"Error using BringWindowToTop technique: {e}")
+        
+        # Technique 4: Use thread attachment
+        logger.info("Trying focus technique 4...")
+        try:
+            # Get IDs of foreground window thread and our thread
+            cur_thread = ctypes.windll.user32.GetCurrentThreadId()
+            if not cur_thread:
+                raise Exception("function 'GetCurrentThreadId' not found")
+            
+            # For workaround, use an alternative
+            import threading
+            cur_thread = threading.get_ident()
+            
+            fg_hwnd = win32gui.GetForegroundWindow()
+            fg_thread = ctypes.windll.user32.GetWindowThreadProcessId(fg_hwnd, None)
+            
+            # Attach threads
+            result = ctypes.windll.user32.AttachThreadInput(cur_thread, fg_thread, True)
+            
+            # Set our window to foreground
+            win32gui.BringWindowToTop(self.game_hwnd)
+            win32gui.SetForegroundWindow(self.game_hwnd)
+            
+            # Detach threads
+            ctypes.windll.user32.AttachThreadInput(cur_thread, fg_thread, False)
+            
+            # Wait and verify
+            time.sleep(verification_time)
+            if win32gui.GetForegroundWindow() == self.game_hwnd:
+                logger.info("Focus technique 4 successful")
+                return True
+        except Exception as e:
+            logger.error(f"Error using thread attachment method: {e}")
+        
+        logger.error("All focus techniques failed")
+        return False
     
     def capture_frame(self) -> Optional[np.ndarray]:
         """Capture a frame from the screen.

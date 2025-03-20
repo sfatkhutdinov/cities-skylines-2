@@ -73,101 +73,239 @@ class MouseInput:
             logger.error(f"Error finding game window: {e}")
             return False
     
-    def mouse_move(self, x: int, y: int) -> bool:
+    def mouse_move(self, x: int, y: int, retry_count: int = 2) -> bool:
         """Move mouse pointer to the specified coordinates.
         
         Args:
             x: X coordinate in screen space
             y: Y coordinate in screen space
+            retry_count: Number of retry attempts if movement fails
             
         Returns:
             True if successful, False otherwise
         """
-        try:
-            # Use win32api for direct cursor positioning
-            win32api.SetCursorPos((x, y))
-            return True
-        except Exception as e:
-            logger.error(f"Error moving mouse using win32api: {e}")
+        # Ensure coordinates are integers
+        x, y = int(x), int(y)
+        
+        # Verify coordinates are within screen boundaries
+        if x < 0 or x >= self.screen_width or y < 0 or y >= self.screen_height:
+            logger.warning(f"Mouse coordinates ({x}, {y}) outside screen boundaries ({self.screen_width}x{self.screen_height})")
             
-            # Fallback to pynput
+            # Clamp coordinates to screen boundaries
+            x = max(0, min(x, self.screen_width - 1))
+            y = max(0, min(y, self.screen_height - 1))
+            logger.info(f"Clamped coordinates to ({x}, {y})")
+        
+        # Try different movement methods with retry
+        success = False
+        errors = []
+        
+        for attempt in range(retry_count + 1):
+            if attempt > 0:
+                logger.info(f"Retrying mouse move to ({x}, {y}), attempt {attempt}/{retry_count}")
+                time.sleep(0.1)  # Short delay between retries
+            
+            # Method 1: Win32 API for direct positioning
             try:
-                self.mouse.position = (x, y)
-                return True
-            except Exception as e2:
-                logger.error(f"Error moving mouse using pynput fallback: {e2}")
-                return False
+                win32api.SetCursorPos((x, y))
+                
+                # Verify position
+                curr_x, curr_y = win32api.GetCursorPos()
+                if abs(curr_x - x) <= 5 and abs(curr_y - y) <= 5:
+                    logger.debug(f"Successfully moved mouse to ({x}, {y}) using win32api")
+                    success = True
+                    break
+                else:
+                    error_msg = f"Mouse position verification failed: requested ({x}, {y}), got ({curr_x}, {curr_y})"
+                    logger.warning(error_msg)
+                    errors.append(f"win32api: {error_msg}")
+            except Exception as e:
+                logger.warning(f"Error moving mouse using win32api: {e}")
+                errors.append(f"win32api: {str(e)}")
+            
+            # Method 2: Fallback to pynput
+            if not success:
+                try:
+                    self.mouse.position = (x, y)
+                    
+                    # Verify position
+                    curr_x, curr_y = win32api.GetCursorPos()
+                    if abs(curr_x - x) <= 5 and abs(curr_y - y) <= 5:
+                        logger.debug(f"Successfully moved mouse to ({x}, {y}) using pynput")
+                        success = True
+                        break
+                    else:
+                        error_msg = f"Mouse position verification failed: requested ({x}, {y}), got ({curr_x}, {curr_y})"
+                        logger.warning(error_msg)
+                        errors.append(f"pynput: {error_msg}")
+                except Exception as e:
+                    logger.warning(f"Error moving mouse using pynput: {e}")
+                    errors.append(f"pynput: {str(e)}")
+            
+            # Method 3: Use Win32 SendInput
+            if not success:
+                try:
+                    # Create input event structure
+                    import ctypes
+                    x_norm = int(x * 65535 / self.screen_width)
+                    y_norm = int(y * 65535 / self.screen_height)
+                    
+                    extra = ctypes.c_ulong(0)
+                    ii_ = ctypes.c_ulong(0)
+                    # Move mouse
+                    x0, y0 = ctypes.c_long(x_norm), ctypes.c_long(y_norm)
+                    
+                    # Define input structure
+                    class MOUSEINPUT(ctypes.Structure):
+                        _fields_ = [("dx", ctypes.c_long),
+                                    ("dy", ctypes.c_long),
+                                    ("mouseData", ctypes.c_ulong),
+                                    ("dwFlags", ctypes.c_ulong),
+                                    ("time", ctypes.c_ulong),
+                                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+                                    
+                    class INPUT(ctypes.Structure):
+                        _fields_ = [("type", ctypes.c_ulong),
+                                    ("mi", MOUSEINPUT),
+                                    ("padding", ctypes.c_longlong)]
+                    
+                    pt = MOUSEINPUT(x0, y0, 0, 0x0001 | 0x8000, 0, ctypes.pointer(extra)) # MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE
+                    command = INPUT(0, pt, 0)
+                    ctypes.windll.user32.SendInput(1, ctypes.pointer(command), ctypes.sizeof(command))
+                    
+                    # Verify position
+                    time.sleep(0.05)  # Wait for OS to process
+                    curr_x, curr_y = win32api.GetCursorPos()
+                    if abs(curr_x - x) <= 5 and abs(curr_y - y) <= 5:
+                        logger.debug(f"Successfully moved mouse to ({x}, {y}) using SendInput")
+                        success = True
+                        break
+                    else:
+                        error_msg = f"Mouse position verification failed: requested ({x}, {y}), got ({curr_x}, {curr_y})"
+                        logger.warning(error_msg)
+                        errors.append(f"SendInput: {error_msg}")
+                except Exception as e:
+                    logger.warning(f"Error moving mouse using SendInput: {e}")
+                    errors.append(f"SendInput: {str(e)}")
+        
+        if not success:
+            logger.error(f"All mouse movement methods failed after {retry_count+1} attempts. Errors: {errors}")
+        
+        return success
     
-    def mouse_click(self, x: int, y: int, button: str = 'left', double: bool = False) -> bool:
+    def mouse_click(self, x: int, y: int, button: str = 'left', double: bool = False, retry_count: int = 2) -> bool:
         """Move mouse to specified coordinates and perform click.
         
         Args:
             x: X coordinate in screen space
             y: Y coordinate in screen space
-            button: Which button to click ('left', 'right', 'middle')
+            button: Button to click ('left', 'right', 'middle')
             double: Whether to perform a double-click
+            retry_count: Number of retry attempts if clicking fails
             
         Returns:
             True if successful, False otherwise
         """
-        try:
-            # Move to position first
-            if not self.mouse_move(x, y):
-                logger.warning(f"Failed to move mouse to ({x}, {y}) before clicking")
-                return False
-                
-            # Small delay for stability
-            time.sleep(0.05)
-            
-            # Try to click using direct Win32 calls
-            try:
-                if button.lower() == 'left':
-                    user32.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                    time.sleep(0.05)
-                    user32.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                    
-                    if double:
-                        time.sleep(0.05)
-                        user32.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                        time.sleep(0.05)
-                        user32.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                elif button.lower() == 'right':
-                    user32.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-                    time.sleep(0.05)
-                    user32.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-                    
-                    if double:
-                        time.sleep(0.05)
-                        user32.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-                        time.sleep(0.05)
-                        user32.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-                elif button.lower() == 'middle':
-                    user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
-                    time.sleep(0.05)
-                    user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
-                    
-                    if double:
-                        time.sleep(0.05)
-                        user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
-                        time.sleep(0.05)
-                        user32.mouse_event(win32con.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
-                    
-                return True
-            except Exception as e:
-                logger.warning(f"Direct Win32 click failed: {e}, falling back to pynput")
-            
-            # Fallback to pynput
-            btn = self.button_map.get(button.lower(), Button.left)
-            
-            if double:
-                self.mouse.click(btn, 2)
-            else:
-                self.mouse.click(btn)
-                
-            return True
-        except Exception as e:
-            logger.error(f"Error during mouse click at ({x}, {y}): {e}")
+        # Ensure mouse is at the target position first
+        if not self.mouse_move(x, y):
+            logger.warning(f"Failed to move mouse to ({x}, {y}) for click")
             return False
+            
+        # Get mapped button
+        try:
+            btn = self.button_map.get(button.lower(), Button.left)
+        except Exception as e:
+            logger.error(f"Error mapping button {button}: {e}")
+            return False
+            
+        # Try different click methods with retry
+        success = False
+        errors = []
+        
+        for attempt in range(retry_count + 1):
+            if attempt > 0:
+                logger.info(f"Retrying mouse click at ({x}, {y}), attempt {attempt}/{retry_count}")
+                # Ensure mouse is still at the position
+                if not self.mouse_move(x, y):
+                    logger.warning(f"Failed to move mouse to position for click retry")
+                    continue
+                    
+                time.sleep(0.1)  # Short delay between retries
+            
+            # Method 1: pynput click
+            try:
+                if double:
+                    self.mouse.click(btn, 2)
+                else:
+                    self.mouse.click(btn)
+                
+                success = True
+                break
+            except Exception as e:
+                logger.warning(f"Error clicking using pynput: {e}")
+                errors.append(f"pynput: {str(e)}")
+            
+            # Method 2: pyautogui (fallback)
+            if not success:
+                try:
+                    import pyautogui
+                    btn_map = {'left': 'left', 'right': 'right', 'middle': 'middle'}
+                    pyautogui_btn = btn_map.get(button.lower(), 'left')
+                    
+                    # Ensure position is correct in pyautogui as well
+                    pyautogui.moveTo(x, y)
+                    
+                    if double:
+                        pyautogui.doubleClick(button=pyautogui_btn)
+                    else:
+                        pyautogui.click(button=pyautogui_btn)
+                        
+                    success = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Error clicking using pyautogui: {e}")
+                    errors.append(f"pyautogui: {str(e)}")
+                    
+            # Method 3: Direct Win32 API call
+            if not success:
+                try:
+                    # Define button down/up event constants
+                    button_down_flags = {
+                        'left': 0x0002,     # MOUSEEVENTF_LEFTDOWN
+                        'right': 0x0008,    # MOUSEEVENTF_RIGHTDOWN
+                        'middle': 0x0020    # MOUSEEVENTF_MIDDLEDOWN
+                    }
+                    
+                    button_up_flags = {
+                        'left': 0x0004,     # MOUSEEVENTF_LEFTUP
+                        'right': 0x0010,    # MOUSEEVENTF_RIGHTUP
+                        'middle': 0x0040    # MOUSEEVENTF_MIDDLEUP
+                    }
+                    
+                    down_flag = button_down_flags.get(button.lower(), 0x0002)  # Default to left button
+                    up_flag = button_up_flags.get(button.lower(), 0x0004)  # Default to left button
+                    
+                    # Perform the click
+                    user32.mouse_event(down_flag, 0, 0, 0, 0)
+                    time.sleep(0.05)
+                    user32.mouse_event(up_flag, 0, 0, 0, 0)
+                    
+                    if double:
+                        time.sleep(0.05)
+                        user32.mouse_event(down_flag, 0, 0, 0, 0)
+                        time.sleep(0.05)
+                        user32.mouse_event(up_flag, 0, 0, 0, 0)
+                    
+                    success = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Direct Win32 click failed: {e}")
+                    errors.append(f"win32: {str(e)}")
+            
+        if not success:
+            logger.error(f"All click methods failed for {button} button at ({x}, {y}): {errors}")
+            
+        return success
     
     def mouse_drag(self, start: Tuple[int, int], end: Tuple[int, int], 
                  button: str = 'left', duration: float = 0.5) -> bool:
