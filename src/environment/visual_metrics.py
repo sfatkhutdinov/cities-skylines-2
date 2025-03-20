@@ -690,8 +690,12 @@ class VisualMetricsEstimator:
         """
         try:
             # Safety check for None or invalid frames
-            if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            if frame is None or (hasattr(frame, 'numel') and frame.numel() == 0):
                 logger.warning("Invalid frame passed to detect_ui_elements")
+                return []
+                
+            if isinstance(frame, np.ndarray) and frame.size == 0:
+                logger.warning("Empty numpy array passed to detect_ui_elements")
                 return []
                 
             # Get image utils instance safety
@@ -701,19 +705,37 @@ class VisualMetricsEstimator:
             
             # Use ImageUtils to detect UI elements with robust error handling
             try:
-                frame_np = frame
                 # Handle tensor conversion if needed
-                if hasattr(frame, 'detach'):
+                if hasattr(frame, 'detach') and hasattr(frame, 'cpu') and hasattr(frame, 'numpy'):
+                    # It's a PyTorch tensor
                     frame_np = frame.detach().cpu().numpy()
-                    if len(frame_np.shape) == 3 and frame_np.shape[0] == 3:  # CHW format
-                        frame_np = frame_np.transpose(1, 2, 0)  # Convert to HWC
+                    
+                    # Handle different tensor layouts
+                    if len(frame_np.shape) == 3:
+                        if frame_np.shape[0] == 3:  # CHW format
+                            frame_np = np.transpose(frame_np, (1, 2, 0))  # Convert to HWC
+                elif isinstance(frame, np.ndarray):
+                    frame_np = frame
+                else:
+                    logger.warning(f"Unsupported frame type in detect_ui_elements: {type(frame)}")
+                    return []
                 
                 # Ensure proper data type
                 if frame_np.dtype != np.uint8:
-                    if frame_np.max() <= 1.0:
+                    if np.max(frame_np) <= 1.0:
                         frame_np = (frame_np * 255).astype(np.uint8)
                     else:
                         frame_np = frame_np.astype(np.uint8)
+                
+                # Ensure frame has valid dimensions
+                if frame_np.ndim < 2:
+                    logger.warning(f"Invalid frame dimensions: {frame_np.shape}")
+                    return []
+                
+                # Ensure frame is not empty
+                if frame_np.size == 0 or 0 in frame_np.shape:
+                    logger.warning(f"Empty frame dimensions: {frame_np.shape}")
+                    return []
                 
                 # Use ImageUtils to detect UI elements
                 standard_elements = self.image_utils.detect_ui_elements(frame_np)

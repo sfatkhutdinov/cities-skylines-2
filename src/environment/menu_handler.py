@@ -171,6 +171,11 @@ class MenuHandler:
             logger.warning("Received None frame in detect_menu")
             return False, None, 0.0
             
+        # Ensure the frame is valid
+        if isinstance(current_frame, np.ndarray) and current_frame.size == 0:
+            logger.warning("Received empty frame in detect_menu")
+            return False, None, 0.0
+            
         # Force a specific result for testing purposes
         if hasattr(self, '_force_menu_detection_result') and self._force_menu_detection_result is not None:
             forced_result, forced_type, forced_confidence = self._force_menu_detection_result
@@ -321,6 +326,35 @@ class MenuHandler:
                 else:
                     detection_scores["action_vigilance"] = 0.0
 
+                # H. Region-based analysis using specialized methods
+                try:
+                    # Get UI elements if none detected yet
+                    if not 'ui_elements' in locals() or not ui_elements:
+                        ui_elements = self.visual_metrics.detect_ui_elements(current_frame)
+                        
+                    # Use specialized region analysis
+                    region_scores = self._analyze_menu_regions(current_frame, ui_elements)
+                    
+                    # If region_scores is valid, use it for menu type determination
+                    if region_scores and isinstance(region_scores, dict):
+                        for menu_type, score in region_scores.items():
+                            # Add region scores to detection_scores with a specific key
+                            detection_scores[f"region_{menu_type}"] = score
+                            
+                            # If this is the highest menu score so far, update menu_type
+                            if score > 0.5 and (not menu_type or score > region_scores.get(menu_type, 0)):
+                                menu_type = menu_type
+                                detection_scores["region_analysis"] = score
+                    
+                    # Check if any region score is very high - strong indicator
+                    max_region_score = max(region_scores.values()) if region_scores else 0
+                    if max_region_score > 0.7:
+                        detection_scores["strong_region_signal"] = max_region_score
+                except Exception as e:
+                    logger.error(f"Error in region-based analysis: {e}")
+                    detection_scores["region_analysis"] = 0.0
+                    # Don't fail completely if region analysis fails
+                    
                 # Aggregate scores with weights
                 weights = {
                     "direct": 1.0,
@@ -331,7 +365,14 @@ class MenuHandler:
                     "action_vigilance": 0.6,
                     "mouse_freedom": 1.0,  # High weight because this is a very reliable signal
                     "normal_ui_penalty": 0.5,
-                    "version_string": 1.5   # Highest weight - version string is an extremely reliable indicator
+                    "version_string": 1.5,  # Version string is an extremely reliable indicator
+                    "region_analysis": 0.8,  # General region analysis score
+                    "region_main_menu": 0.9,  # More specific region scores
+                    "region_pause_menu": 0.9,
+                    "region_settings_menu": 0.8,
+                    "region_dialog": 0.7,
+                    "region_notification": 0.6,
+                    "strong_region_signal": 1.2  # Very high confidence when a region has a strong signal
                 }
                 
                 # Compute weighted score
@@ -381,15 +422,89 @@ class MenuHandler:
                                 if region_data.size == 0:
                                     continue
                                     
-                                # Simple analysis - for example, calculating intensity stats
-                                if len(region_data.shape) == 3:  # Color image
-                                    # Use simple numpy operations instead of PyTorch
-                                    avg_intensity = np.mean(region_data)
-                                    std_intensity = np.std(region_data)
+                                # Calculate characteristics like mean color, contrast, edge density
+                                if isinstance(region_data, torch.Tensor):
+                                    try:
+                                        # Use proper torch syntax for mean calculation
+                                        region_mean = torch.mean(region_data).item()
+                                        if len(region_data.shape) == 3:
+                                            # Get color channel means for RGB separation analysis
+                                            # Fix: Using dim=(0,1) instead of axis parameter
+                                            channel_means = torch.mean(region_data, dim=(0, 1)).tolist()
+                                        else:
+                                            channel_means = [region_mean, region_mean, region_mean]
+                                        
+                                        # Calculate contrast (standard deviation of pixel values)
+                                        contrast = torch.std(region_data).item()
+                                    except TypeError as e:
+                                        logger.warning(f"TypeError in tensor mean calculation: {e}. Falling back to numpy.")
+                                        # Convert tensor to numpy and use numpy operations instead
+                                        region_np = region_data.detach().cpu().numpy()
+                                        region_mean = np.mean(region_np)
+                                        if len(region_np.shape) == 3:
+                                            channel_means = np.mean(region_np, axis=(0, 1)).tolist()
+                                        else:
+                                            channel_means = [region_mean, region_mean, region_mean]
+                                        contrast = np.std(region_np)
+                                    except Exception as e:
+                                        logger.error(f"Error in tensor mean calculation: {e}")
+                                        # Provide default values if calculation fails
+                                        region_mean = 0.5
+                                        channel_means = [0.5, 0.5, 0.5]
+                                        contrast = 0.1
+                                else:
+                                    try:
+                                        # Fallback to numpy
+                                        region_mean = np.mean(region_data)
+                                        if len(region_data.shape) == 3:
+                                            channel_means = np.mean(region_data, axis=(0, 1)).tolist()
+                                        else:
+                                            channel_means = [region_mean, region_mean, region_mean]
+                                        
+                                        # Calculate contrast (standard deviation of pixel values)
+                                        contrast = np.std(region_data)
+                                    except Exception as e:
+                                        logger.error(f"Error in numpy mean calculation: {e}")
+                                        # Provide default values if calculation fails
+                                        region_mean = 0.5
+                                        channel_means = [0.5, 0.5, 0.5]
+                                        contrast = 0.1
+                                
+                                # Count UI elements in the region
+                                elements_in_region = 0
+                                for element in ui_elements:
+                                    if len(element) >= 4:
+                                        ex, ey, ew, eh = element
+                                        element_center_x = ex + ew/2
+                                        element_center_y = ey + eh/2
+                                        
+                                        if (rx1 <= element_center_x <= rx2 and 
+                                            ry1 <= element_center_y <= ry2):
+                                            elements_in_region += 1
+                                
+                                # Calculate UI density
+                                region_area = (rx2 - rx1) * (ry2 - ry1)
+                                ui_density = elements_in_region / max(1, region_area) * 1000
+                                
+                                # Score based on menu type
+                                if mtype == "main_menu":
+                                    # Main menu usually has characteristic colors
+                                    color_score = abs(channel_means[2] - channel_means[0]) * 2.0  # Blue-red difference
+                                    score = contrast * 2.0 + color_score + ui_density
+                                elif mtype == "pause_menu":
+                                    # Pause menus often have higher contrast
+                                    score = contrast * 3.0 + ui_density
+                                elif mtype == "settings_menu":
+                                    # Settings menus have many UI elements
+                                    score = ui_density * 2.0 + contrast
+                                elif mtype == "dialog":
+                                    # Dialogs typically have high contrast in center
+                                    score = contrast * 4.0 + ui_density
+                                else:  # notification
+                                    # Notifications have small, focused regions
+                                    score = (contrast * 2.0 + ui_density) * 1.5
                                     
-                                    # High contrast might indicate UI elements
-                                    score = min(1.0, std_intensity / 50.0)
-                                    region_scores.append(score)
+                                region_scores.append(score)
                             except Exception as e:
                                 logger.error(f"Error analyzing region for {mtype}: {e}")
                                 
@@ -745,8 +860,8 @@ class MenuHandler:
                 
         return increased_vigilance
         
-    def _analyze_menu_regions(self, frame: np.ndarray, ui_elements: List) -> Dict[str, float]:
-        """Analyze specific regions of the frame for menu elements.
+    def _analyze_menu_regions(self, frame, ui_elements: List) -> Dict[str, float]:
+        """Analyze specific regions of a frame for menu elements.
         
         Args:
             frame: Current frame
@@ -755,6 +870,30 @@ class MenuHandler:
         Returns:
             Dict: Menu type -> confidence score
         """
+        # Emergency fallback for None or empty frames
+        if frame is None:
+            logger.warning("Received None frame in _analyze_menu_regions")
+            return {menu_type: 0.0 for menu_type in self.MENU_TYPES.keys()}
+            
+        # If it looks like a tensor but might not be valid for our operations, handle carefully
+        if hasattr(frame, 'numel') and hasattr(frame, 'shape'):
+            try:
+                # Quick test to see if tensor operations work properly
+                if frame.dim() > 0:
+                    test = torch.mean(frame) if frame.numel() > 0 else 0
+                # If we get here, tensor is usable
+            except (RuntimeError, TypeError) as e:
+                # This is likely not a usable tensor for our operations
+                logger.warning(f"Tensor error in _analyze_menu_regions: {e}. Falling back to numpy processing.")
+                # Convert to numpy if possible, otherwise use fallback
+                try:
+                    if hasattr(frame, 'detach') and hasattr(frame, 'cpu') and hasattr(frame, 'numpy'):
+                        frame_np = frame.detach().cpu().numpy()
+                        return self._analyze_menu_regions_numpy(frame_np, ui_elements)
+                except Exception:
+                    return self._analyze_menu_regions_numpy(frame, ui_elements)
+                return self._analyze_menu_regions_numpy(frame, ui_elements)
+        
         # Convert frame to torch tensor if needed
         if not isinstance(frame, torch.Tensor) and hasattr(torch, 'from_numpy'):
             # Convert numpy array to PyTorch tensor for easier region processing
@@ -778,11 +917,21 @@ class MenuHandler:
                     frame_tensor = frame_tensor.permute(1, 2, 0)
             except Exception as e:
                 logger.error(f"Error converting frame to tensor: {e}")
-                return {}
+                # Fallback to numpy implementation
+                return self._analyze_menu_regions_numpy(frame, ui_elements)
         else:
             frame_tensor = frame
         
         scores = {}
+        
+        # Safety check for tensor
+        if frame_tensor is None:
+            return {}
+        
+        # Make sure we have at least 2 dimensions
+        if not hasattr(frame_tensor, 'shape') or len(frame_tensor.shape) < 2:
+            return {}
+        
         height, width = frame_tensor.shape[:2] if len(frame_tensor.shape) >= 2 else (0, 0)
         
         if height == 0 or width == 0:
@@ -810,46 +959,75 @@ class MenuHandler:
                     # Extract region
                     region = frame_tensor[y1_px:y2_px, x1_px:x2_px]
                     
+                    # Skip if region is empty
+                    if region.numel() == 0:
+                        continue
+                    
                     # Calculate characteristics like mean color, contrast, edge density
                     if isinstance(region, torch.Tensor):
-                        # Use proper torch syntax for mean calculation
-                        region_mean = torch.mean(region).item()
-                        if len(region.shape) == 3:
-                            # Get color channel means for RGB separation analysis
-                            channel_means = torch.mean(region, dim=(0, 1)).tolist()
-                        else:
-                            channel_means = [region_mean, region_mean, region_mean]
+                        try:
+                            # Use proper torch syntax for mean calculation
+                            region_mean = torch.mean(region).item()
+                            if len(region.shape) == 3:
+                                # Get color channel means for RGB separation analysis
+                                # Fix: Using dim=(0,1) instead of axis parameter
+                                channel_means = torch.mean(region, dim=(0, 1)).tolist()
+                            else:
+                                channel_means = [region_mean, region_mean, region_mean]
+                            
+                            # Calculate contrast (standard deviation of pixel values)
+                            contrast = torch.std(region).item()
+                        except TypeError as e:
+                            logger.warning(f"TypeError in tensor mean calculation: {e}. Falling back to numpy.")
+                            # Convert tensor to numpy and use numpy operations instead
+                            region_np = region.detach().cpu().numpy()
+                            region_mean = np.mean(region_np)
+                            if len(region_np.shape) == 3:
+                                channel_means = np.mean(region_np, axis=(0, 1)).tolist()
+                            else:
+                                channel_means = [region_mean, region_mean, region_mean]
+                            contrast = np.std(region_np)
+                        except Exception as e:
+                            logger.error(f"Error in tensor mean calculation: {e}")
+                            # Provide default values if calculation fails
+                            region_mean = 0.5
+                            channel_means = [0.5, 0.5, 0.5]
+                            contrast = 0.1
                     else:
-                        # Fallback to numpy
-                        region_mean = np.mean(region)
-                        if len(region.shape) == 3:
-                            channel_means = np.mean(region, axis=(0, 1)).tolist()
-                        else:
-                            channel_means = [region_mean, region_mean, region_mean]
+                        try:
+                            # Fallback to numpy
+                            region_mean = np.mean(region)
+                            if len(region.shape) == 3:
+                                channel_means = np.mean(region, axis=(0, 1)).tolist()
+                            else:
+                                channel_means = [region_mean, region_mean, region_mean]
+                            
+                            # Calculate contrast (standard deviation of pixel values)
+                            contrast = np.std(region)
+                        except Exception as e:
+                            logger.error(f"Error in numpy mean calculation: {e}")
+                            # Provide default values if calculation fails
+                            region_mean = 0.5
+                            channel_means = [0.5, 0.5, 0.5]
+                            contrast = 0.1
                     
-                    # Calculate contrast (standard deviation of pixel values)
-                    if isinstance(region, torch.Tensor):
-                        contrast = torch.std(region).item()
-                    else:
-                        contrast = np.std(region)
-                    
-                    # Look for UI elements within this region
+                    # Count UI elements in the region
                     elements_in_region = 0
                     for element in ui_elements:
-                        ex, ey, ew, eh = element
-                        element_center_x = ex + ew/2
-                        element_center_y = ey + eh/2
-                        
-                        if (x1_px <= element_center_x <= x2_px and 
-                            y1_px <= element_center_y <= y2_px):
-                            elements_in_region += 1
+                        if len(element) >= 4:
+                            ex, ey, ew, eh = element
+                            element_center_x = ex + ew/2
+                            element_center_y = ey + eh/2
+                            
+                            if (x1_px <= element_center_x <= x2_px and 
+                                y1_px <= element_center_y <= y2_px):
+                                elements_in_region += 1
                     
-                    # Calculate region score based on various factors
-                    # Main menus usually have high contrast, specific colors,
-                    # and specific UI elements
-                    ui_density = elements_in_region / ((x2_px - x1_px) * (y2_px - y1_px)) * 1000
+                    # Calculate UI density
+                    region_area = (x2_px - x1_px) * (y2_px - y1_px)
+                    ui_density = elements_in_region / max(1, region_area) * 1000
                     
-                    # Different scoring for different menu types
+                    # Score based on menu type
                     if menu_type == "main_menu":
                         # Main menu usually has characteristic colors
                         color_score = abs(channel_means[2] - channel_means[0]) * 2.0  # Blue-red difference
@@ -861,7 +1039,7 @@ class MenuHandler:
                         # Settings menus have many UI elements
                         score = ui_density * 2.0 + contrast
                     elif menu_type == "dialog":
-                        # Dialogs typically have a central rectangle with high contrast
+                        # Dialogs typically have high contrast in center
                         score = contrast * 4.0 + ui_density
                     else:  # notification
                         # Notifications have small, focused regions
@@ -1025,4 +1203,146 @@ class MenuHandler:
         
         # Reset the menu stuck time
         self.menu_stuck_time = None
-        logger.info("Forced reset completed") 
+        logger.info("Forced reset completed")
+
+    def _analyze_menu_regions_numpy(self, frame: np.ndarray, ui_elements: List) -> Dict[str, float]:
+        """Numpy version of region analysis for when tensor conversion fails.
+        
+        Args:
+            frame: Current frame as numpy array
+            ui_elements: Detected UI elements
+            
+        Returns:
+            Dict: Menu type -> confidence score
+        """
+        scores = {}
+        
+        # Safety check
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            logger.warning("Invalid frame in _analyze_menu_regions_numpy")
+            # Return empty scores dict instead of failing
+            return {menu_type: 0.0 for menu_type in self.MENU_TYPES.keys()}
+            
+        # Ensure proper data type
+        try:
+            if frame.dtype != np.uint8:
+                if frame.max() <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                else:
+                    frame = frame.astype(np.uint8)
+        except Exception as e:
+            logger.error(f"Error converting frame dtype: {e}")
+            return {menu_type: 0.0 for menu_type in self.MENU_TYPES.keys()}
+        
+        # Get dimensions
+        try:
+            if len(frame.shape) == 3:
+                height, width = frame.shape[:2]
+            else:
+                height, width = frame.shape
+                frame = np.stack([frame, frame, frame], axis=2)  # Convert to 3 channels
+        except Exception as e:
+            logger.error(f"Error determining frame dimensions: {e}")
+            return {menu_type: 0.0 for menu_type in self.MENU_TYPES.keys()}
+        
+        # Safety check for ui_elements
+        if ui_elements is None:
+            ui_elements = []
+        
+        # Process each menu type
+        for menu_type, info in self.MENU_TYPES.items():
+            try:
+                signature_regions = info["signature_regions"]
+                region_scores = []
+                
+                for region_coords in signature_regions:
+                    try:
+                        # Convert normalized coordinates to actual pixel values
+                        x1, y1, x2, y2 = region_coords
+                        x1_px, y1_px = int(x1 * width), int(y1 * height)
+                        x2_px, y2_px = int(x2 * width), int(y2 * height)
+                        
+                        # Ensure coordinates are within bounds
+                        x1_px, y1_px = max(0, x1_px), max(0, y1_px)
+                        x2_px, y2_px = min(width, x2_px), min(height, y2_px)
+                        
+                        if x2_px <= x1_px or y2_px <= y1_px:
+                            continue
+                        
+                        # Extract region
+                        region = frame[y1_px:y2_px, x1_px:x2_px]
+                        
+                        if region.size == 0:
+                            continue
+                        
+                        # Calculate region stats
+                        try:
+                            region_mean = np.mean(region)
+                            if len(region.shape) == 3 and region.shape[2] >= 3:
+                                # Get mean for each channel (up to 3 channels)
+                                channel_means = [
+                                    np.mean(region[:, :, 0]),
+                                    np.mean(region[:, :, 1]),
+                                    np.mean(region[:, :, 2 if region.shape[2] > 2 else 1])
+                                ]
+                            else:
+                                channel_means = [region_mean, region_mean, region_mean]
+                            
+                            contrast = np.std(region)
+                        except Exception as e:
+                            logger.error(f"Error calculating region stats for {menu_type}: {e}")
+                            # Provide reasonable defaults
+                            region_mean = 0.5
+                            channel_means = [0.5, 0.5, 0.5]
+                            contrast = 0.1
+                        
+                        # Count UI elements in the region
+                        elements_in_region = 0
+                        for element in ui_elements:
+                            if len(element) >= 4:  # Make sure it has x, y, w, h components
+                                ex, ey, ew, eh = element
+                                element_center_x = ex + ew/2
+                                element_center_y = ey + eh/2
+                                
+                                if (x1_px <= element_center_x <= x2_px and 
+                                    y1_px <= element_center_y <= y2_px):
+                                    elements_in_region += 1
+                        
+                        # Calculate UI density
+                        region_area = (x2_px - x1_px) * (y2_px - y1_px)
+                        ui_density = elements_in_region / max(1, region_area) * 1000
+                        
+                        # Score based on menu type
+                        if menu_type == "main_menu":
+                            # Main menu usually has characteristic colors
+                            color_score = abs(channel_means[2] - channel_means[0]) * 2.0  # Blue-red difference
+                            score = contrast * 2.0 + color_score + ui_density
+                        elif menu_type == "pause_menu":
+                            # Pause menus often have higher contrast
+                            score = contrast * 3.0 + ui_density
+                        elif menu_type == "settings_menu":
+                            # Settings menus have many UI elements
+                            score = ui_density * 2.0 + contrast
+                        elif menu_type == "dialog":
+                            # Dialogs typically have high contrast in center
+                            score = contrast * 4.0 + ui_density
+                        else:  # notification
+                            # Notifications have small, focused regions
+                            score = (contrast * 2.0 + ui_density) * 1.5
+                            
+                        region_scores.append(score)
+                    except Exception as e:
+                        logger.error(f"Error processing region for {menu_type}: {e}")
+                        continue
+                
+                # Use maximum score from regions
+                if region_scores:
+                    scores[menu_type] = max(min(1.0, s/10.0) for s in region_scores)  # Normalize to 0-1
+                else:
+                    scores[menu_type] = 0.0
+                
+            except Exception as e:
+                logger.error(f"Error analyzing region for {menu_type}: {e}")
+                scores[menu_type] = 0.0
+        
+        return scores 

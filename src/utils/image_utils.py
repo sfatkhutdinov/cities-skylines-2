@@ -125,9 +125,21 @@ class ImageUtils:
                 return []
                 
             if frame.size == 0 or frame.ndim < 2:
-                logger.error(f"Invalid frame shape in detect_ui_elements: {frame.shape}")
+                logger.error(f"Invalid frame shape in detect_ui_elements: {frame.shape if hasattr(frame, 'shape') else 'unknown'}")
                 return []
                 
+            # Ensure frame is in the correct format (HWC or grayscale)
+            if len(frame.shape) == 3 and frame.shape[0] == 3 and len(frame.shape) == 3:
+                # Convert from CHW to HWC
+                frame = np.transpose(frame, (1, 2, 0))
+                
+            # Ensure correct data type
+            if frame.dtype != np.uint8:
+                if np.max(frame) <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                else:
+                    frame = frame.astype(np.uint8)
+                    
             # Convert to grayscale if needed
             try:
                 if frame.ndim == 3:
@@ -160,6 +172,9 @@ class ImageUtils:
                         continue
                         
                 return ui_elements
+            except cv2.error as e:
+                logger.error(f"OpenCV error in detect_ui_elements: {e}")
+                return []
             except Exception as e:
                 logger.error(f"Error in image processing for detect_ui_elements: {e}")
                 return []

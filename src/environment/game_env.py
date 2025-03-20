@@ -207,26 +207,32 @@ class CitiesEnvironment:
             19: {"type": "mouse", "action": "scroll", "direction": 1},
             20: {"type": "mouse", "action": "scroll", "direction": -1},
             
+            # Edge scrolling actions for map navigation
+            21: {"type": "mouse", "action": "edge_scroll", "direction": "up", "duration": 0.5},
+            22: {"type": "mouse", "action": "edge_scroll", "direction": "down", "duration": 0.5},
+            23: {"type": "mouse", "action": "edge_scroll", "direction": "left", "duration": 0.5},
+            24: {"type": "mouse", "action": "edge_scroll", "direction": "right", "duration": 0.5},
+            
             # Basic game controls (no semantic meaning, just key presses)
-            21: {"type": "key", "key": "space", "duration": 0.1},
-            22: {"type": "key", "key": "1", "duration": 0.1},
-            23: {"type": "key", "key": "2", "duration": 0.1},
-            24: {"type": "key", "key": "3", "duration": 0.1},
-            25: {"type": "key", "key": "b", "duration": 0.1},
-            26: {"type": "key", "key": "escape", "duration": 0.1},
+            25: {"type": "key", "key": "space", "duration": 0.1},
+            26: {"type": "key", "key": "1", "duration": 0.1},
+            27: {"type": "key", "key": "2", "duration": 0.1},
+            28: {"type": "key", "key": "3", "duration": 0.1},
+            29: {"type": "key", "key": "b", "duration": 0.1},
+            30: {"type": "key", "key": "escape", "duration": 0.1},
             
             # Basic info keys (no semantic meaning, just key presses)
-            27: {"type": "key", "key": "p", "duration": 0.1},
-            28: {"type": "key", "key": "z", "duration": 0.1},
-            29: {"type": "key", "key": "c", "duration": 0.1},
-            30: {"type": "key", "key": "v", "duration": 0.1},
-            31: {"type": "key", "key": "x", "duration": 0.1},
-            32: {"type": "key", "key": "m", "duration": 0.1},
+            31: {"type": "key", "key": "p", "duration": 0.1},
+            32: {"type": "key", "key": "z", "duration": 0.1},
+            33: {"type": "key", "key": "c", "duration": 0.1},
+            34: {"type": "key", "key": "v", "duration": 0.1},
+            35: {"type": "key", "key": "x", "duration": 0.1},
+            36: {"type": "key", "key": "m", "duration": 0.1},
         }
         
         # Create grid of points across screen (10x10 grid = 100 additional actions)
         grid_size = 10
-        action_offset = 33  # Start after the base actions
+        action_offset = 37  # Start after the base actions
         
         for i in range(grid_size):
             for j in range(grid_size):
@@ -619,21 +625,48 @@ class CitiesEnvironment:
         
         # Execute action
         if action_type == "mouse":
-            target_x, target_y = self.actions[action_idx].get("position", (0.5, 0.5))
-            if isinstance(target_x, tuple) and isinstance(target_y, tuple):
-                x, y = target_x
-            else:
-                # Fallback to normalized coordinates (0.0 to 1.0)
-                x = target_x if isinstance(target_x, (int, float)) else 0.5
-                y = target_y if isinstance(target_y, (int, float)) else 0.5
+            action_subtype = self.actions[action_idx].get("action", "move")
             
-            logger.debug(f"Moving mouse to: ({x}, {y})")
-            self.input_simulator.mouse_move(x, y)
-            
-        elif action_type == "mouse_click":
-            button = self.actions[action_idx].get("button", "left")
-            double = self.actions[action_idx].get("double", False)
-            self.input_simulator.mouse_click(x, y, button=button, double=double)
+            if action_subtype == "move":
+                target_x, target_y = self.actions[action_idx].get("position", (0.5, 0.5))
+                if isinstance(target_x, tuple) and isinstance(target_y, tuple):
+                    x, y = target_x
+                else:
+                    # Fallback to normalized coordinates (0.0 to 1.0)
+                    x = target_x if isinstance(target_x, (int, float)) else 0.5
+                    y = target_y if isinstance(target_y, (int, float)) else 0.5
+                
+                logger.debug(f"Moving mouse to: ({x}, {y})")
+                self.input_simulator.mouse_move(x, y)
+                
+            elif action_subtype == "click":
+                button = self.actions[action_idx].get("button", "left")
+                double = self.actions[action_idx].get("double", False)
+                position = self.actions[action_idx].get("position", None)
+                
+                if position:
+                    x, y = position
+                    self.input_simulator.mouse_click(x, y, button=button, double=double)
+                else:
+                    # Click at current position
+                    current_x, current_y = self.input_simulator.get_mouse_position()
+                    self.input_simulator.mouse_click(current_x, current_y, button=button, double=double)
+                    
+            elif action_subtype == "scroll":
+                direction = self.actions[action_idx].get("direction", -1)
+                self.input_simulator.mouse_scroll(direction)
+                
+            elif action_subtype == "drag":
+                start = self.actions[action_idx].get("start", (0, 0))
+                end = self.actions[action_idx].get("end", (0, 0))
+                button = self.actions[action_idx].get("button", "left")
+                duration = self.actions[action_idx].get("duration", 0.5)
+                self.input_simulator.mouse_drag(start, end, button, duration)
+                
+            elif action_subtype == "edge_scroll":
+                direction = self.actions[action_idx].get("direction", "down")
+                duration = self.actions[action_idx].get("duration", 0.5)
+                self.input_simulator.edge_scroll(direction, duration)
             
         elif action_type == "key":
             key = self.actions[action_idx].get("key", "")
@@ -926,17 +959,19 @@ class CitiesEnvironment:
         
         logger.info(f"Testing mouse freedom across game window ({width}x{height})")
         
-        # Define a grid of test points
+        # Define a grid of test points with edge positions slightly outside bounds
+        # to better trigger edge scrolling in Cities Skylines 2
+        edge_offset = 5  # pixels outside the window to ensure edge scrolling triggers
         test_points = [
-            (0, 0),                    # Top-left
-            (width // 2, 0),           # Top-center
-            (width - 1, 0),            # Top-right
-            (0, height // 2),          # Middle-left
-            (width // 2, height // 2), # Center
-            (width - 1, height // 2),  # Middle-right
-            (0, height - 1),           # Bottom-left
-            (width // 2, height - 1),  # Bottom-center
-            (width - 1, height - 1),   # Bottom-right
+            (-edge_offset, -edge_offset),                # Top-left (outside)
+            (width // 2, -edge_offset),                  # Top-center (outside)
+            (width + edge_offset, -edge_offset),         # Top-right (outside)
+            (-edge_offset, height // 2),                 # Middle-left (outside)
+            (width // 2, height // 2),                   # Center (inside)
+            (width + edge_offset, height // 2),          # Middle-right (outside)
+            (-edge_offset, height + edge_offset),        # Bottom-left (outside)
+            (width // 2, height + edge_offset),          # Bottom-center (outside)
+            (width + edge_offset, height + edge_offset), # Bottom-right (outside)
         ]
         
         # First ensure we can focus the window
@@ -955,19 +990,28 @@ class CitiesEnvironment:
         try:
             # Move to each test point with verification
             for i, (x, y) in enumerate(test_points):
+                # Check if this is an edge position that requires special handling
+                is_edge_position = (x == 0 or x == width - 1 or y == 0 or y == height - 1)
+                
                 # Log if coordinates are outside normal bounds but don't restrict them
                 if x < 0 or x >= width or y < 0 or y >= height:
-                    print(f"Notice: Test point ({x}, {y}) is outside normal screen bounds")
+                    logger.info(f"Notice: Test point ({x}, {y}) is outside normal screen bounds")
                 
-                print(f"Moving to point {i+1}/{len(test_points)}: ({x}, {y})")
+                logger.info(f"Moving to point {i+1}/{len(test_points)}: ({x}, {y})")
                 
                 # First attempt
                 current_pos = win32api.GetCursorPos()
-                print(f"Moving mouse: {current_pos[0]},{current_pos[1]} -> {x},{y}")
+                logger.debug(f"Moving mouse: {current_pos[0]},{current_pos[1]} -> {x},{y}")
                 
                 # Use Win32 direct positioning for reliability
-                self.input_simulator.mouse_move(x, y, use_win32=True)
-                time.sleep(0.2)  # Wait for movement to complete
+                # For edge positions, allow the mouse to go slightly offscreen to trigger edge scrolling
+                self.input_simulator.mouse_move(x, y, use_win32=True, allow_offscreen=is_edge_position)
+                
+                # For edge positions, wait longer to allow the screen to scroll
+                if is_edge_position:
+                    time.sleep(0.5)  # Wait longer for edge scrolling to happen
+                else:
+                    time.sleep(0.2)  # Regular wait for movement to complete
                 
                 # Capture frame after moving mouse to measure visual change
                 new_frame = self.screen_capture.capture_frame()
@@ -995,7 +1039,8 @@ class CitiesEnvironment:
                 logger.info(f"Mouse movement visual change - Avg: {avg_visual_change:.6f}, Max: {max_visual_change:.6f}")
                 
                 # If visual change is very low, likely in a menu
-                if max_visual_change < 0.01:
+                # Increased threshold from 0.01 to 0.03 to better detect actual movement
+                if max_visual_change < 0.03:
                     logger.warning("Very low visual change detected during mouse movement, likely in a menu")
                     # Store this information for the menu detection system
                     self.mouse_freedom_visual_change = max_visual_change

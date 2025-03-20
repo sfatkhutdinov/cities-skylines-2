@@ -264,7 +264,7 @@ class InputSimulator:
         # Return False to indicate failure
         return False
         
-    def mouse_move(self, x: int, y: int, relative: bool = False, use_win32: bool = True):
+    def mouse_move(self, x: int, y: int, relative: bool = False, use_win32: bool = True, allow_offscreen: bool = False):
         """Move the mouse to a position.
         
         Args:
@@ -272,6 +272,7 @@ class InputSimulator:
             y (int): Y coordinate
             relative (bool): If True, move relative to current position
             use_win32 (bool): If True, use win32api for direct positioning
+            allow_offscreen (bool): If True, allow positioning beyond screen boundaries (for edge scrolling)
         """
         # First call ensure_game_window_focused() to make sure we interact with the game
         self.ensure_game_window_focused()
@@ -281,24 +282,51 @@ class InputSimulator:
         
         # Print movement
         if not relative:
-            print(f"Moving mouse: {current_x},{current_y} -> {x},{y}")
+            logger.debug(f"Moving mouse: {current_x},{current_y} -> {x},{y}")
         
-        # Verify the coordinates are within screen bounds
+        # Verify the coordinates are within screen bounds, unless allowing offscreen for edge scrolling
         try:
             screen_width = win32api.GetSystemMetrics(0)
             screen_height = win32api.GetSystemMetrics(1)
             
-            # Adjust to be within screen bounds
-            if not relative:
+            # Get game window position to detect edge scrolling
+            if hasattr(self, 'screen_capture') and self.screen_capture and hasattr(self.screen_capture, 'game_window_position'):
+                window_pos = self.screen_capture.game_window_position
+                is_edge_scroll_position = False
+                
+                if window_pos:
+                    window_left, window_top, window_right, window_bottom = window_pos
+                    window_width = window_right - window_left
+                    window_height = window_bottom - window_top
+                    
+                    # Detect if we're positioning at screen edge (for edge scrolling)
+                    edge_threshold = 5  # pixels from edge
+                    if (x <= window_left + edge_threshold or 
+                        x >= window_right - edge_threshold or 
+                        y <= window_top + edge_threshold or 
+                        y >= window_bottom - edge_threshold):
+                        is_edge_scroll_position = True
+                        logger.debug(f"Detected edge scroll position: ({x}, {y})")
+                        allow_offscreen = True  # Force allow offscreen for edge scrolling
+            
+            # Only adjust coordinates if not allowing offscreen positioning
+            if not allow_offscreen and not relative:
                 x = max(0, min(x, screen_width - 1))
                 y = max(0, min(y, screen_height - 1))
+                
+            # For edge scrolling, positions can go slightly beyond window bounds
+            # The game will interpret this as a command to scroll in that direction
         except Exception as e:
-            print(f"Warning: Error getting screen metrics: {e}")
+            logger.warning(f"Warning: Error getting screen metrics: {e}")
         
         # For absolute positioning, use direct win32 API for reliability
         if use_win32 and not relative:
             try:
                 win32api.SetCursorPos((x, y))
+                # For edge scrolling positions, hold the mouse there slightly longer
+                if allow_offscreen and (x <= 0 or x >= screen_width-1 or y <= 0 or y >= screen_height-1):
+                    time.sleep(0.3)  # Give the game a moment to register edge scrolling
+                
                 # Verify position after setting
                 for attempt in range(3):  # Try up to 3 times
                     time.sleep(0.05)
@@ -310,7 +338,7 @@ class InputSimulator:
                     win32api.SetCursorPos((x, y))
                 return
             except Exception as e:
-                print(f"Win32 mouse positioning error: {e}")
+                logger.error(f"Win32 mouse positioning error: {e}")
                 # Fall back to alternative methods
         
         try:
@@ -326,6 +354,10 @@ class InputSimulator:
             # Move mouse with pyautogui for fallback
             pyautogui.moveTo(target_x, target_y, duration=0.1)
             
+            # For edge scrolling positions, hold the mouse there slightly longer
+            if allow_offscreen and (target_x <= 0 or target_x >= screen_width-1 or target_y <= 0 or target_y >= screen_height-1):
+                time.sleep(0.3)  # Give the game a moment to register edge scrolling
+            
             # Verify final position
             final_x, final_y = win32api.GetCursorPos()
             if abs(final_x - target_x) > 5 or abs(final_y - target_y) > 5:
@@ -336,7 +368,7 @@ class InputSimulator:
                     pass
                     
         except Exception as e:
-            print(f"Error moving mouse: {e}")
+            logger.error(f"Error moving mouse: {e}")
             # Try direct win32 as last resort
             try:
                 win32api.SetCursorPos((x, y))
@@ -1451,3 +1483,78 @@ class InputSimulator:
             # Return center of screen as fallback
             screen_width, screen_height = self._get_screen_dimensions()
             return (screen_width // 2, screen_height // 2)
+
+    def move_mouse(self, x: int, y: int):
+        """Legacy method for mouse movement - redirects to mouse_move."""
+        return self.mouse_move(x, y)
+        
+    def edge_scroll(self, direction: str, duration: float = 0.5) -> bool:
+        """Scroll the screen by moving mouse to the specified edge.
+        
+        Args:
+            direction (str): Direction to scroll ('up', 'down', 'left', 'right')
+            duration (float): Duration to hold at the edge in seconds
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Ensure game window is focused
+            success = self.ensure_game_window_focused()
+            if not success:
+                logger.warning("Failed to focus game window for edge scrolling")
+                return False
+                
+            # Get game window dimensions
+            if hasattr(self, 'screen_capture') and self.screen_capture and hasattr(self.screen_capture, 'game_window_position'):
+                window_pos = self.screen_capture.game_window_position
+                if not window_pos:
+                    # Fallback to full screen dimensions
+                    screen_width = win32api.GetSystemMetrics(0)
+                    screen_height = win32api.GetSystemMetrics(1)
+                    window_left, window_top = 0, 0
+                    window_right, window_bottom = screen_width, screen_height
+                else:
+                    window_left, window_top, window_right, window_bottom = window_pos
+            else:
+                # Fallback to full screen dimensions
+                screen_width = win32api.GetSystemMetrics(0)
+                screen_height = win32api.GetSystemMetrics(1)
+                window_left, window_top = 0, 0
+                window_right, window_bottom = screen_width, screen_height
+                
+            window_width = window_right - window_left
+            window_height = window_bottom - window_top
+            
+            # Calculate edge position based on direction
+            # We go slightly beyond the window edge to ensure edge scrolling triggers
+            edge_offset = 2  # pixels outside the window
+            center_x = window_left + window_width // 2
+            center_y = window_top + window_height // 2
+            
+            if direction == 'up':
+                x, y = center_x, window_top - edge_offset
+            elif direction == 'down':
+                x, y = center_x, window_bottom + edge_offset
+            elif direction == 'left':
+                x, y = window_left - edge_offset, center_y
+            elif direction == 'right':
+                x, y = window_right + edge_offset, center_y
+            else:
+                logger.warning(f"Invalid edge scroll direction: {direction}")
+                return False
+                
+            # Move mouse to the edge position
+            logger.info(f"Edge scrolling {direction} from position ({x}, {y})")
+            self.mouse_move(x, y, use_win32=True, allow_offscreen=True)
+            
+            # Hold position to ensure scrolling occurs
+            time.sleep(duration)
+            
+            # Return to center to stop scrolling
+            self.mouse_move(center_x, center_y)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during edge scrolling: {e}")
+            return False

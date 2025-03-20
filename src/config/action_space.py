@@ -91,6 +91,17 @@ def get_action_space() -> Dict[int, Dict[str, Any]]:
         }
         action_idx += 1
     
+    # Edge scrolling - move mouse to screen edges to scroll map
+    edge_directions = ["up", "down", "left", "right"]
+    for direction in edge_directions:
+        action_space[action_idx] = {
+            "type": "mouse",
+            "action": "edge_scroll",
+            "direction": direction,
+            "duration": 0.5  # Hold at edge for half a second
+        }
+        action_idx += 1
+    
     # Mouse drag (from current position to grid points)
     for y in range(grid_size):
         for x in range(grid_size):
