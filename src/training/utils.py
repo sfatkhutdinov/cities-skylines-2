@@ -36,39 +36,47 @@ def parse_args():
     parser.add_argument("--save_config", type=str, help="Save current configuration to file")
     
     # Training parameters
-    parser.add_argument("--num_episodes", type=int, default=100, help="Number of episodes to train for")
-    parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for updates")
-    parser.add_argument("--learning_rate", type=float, default=0.0003, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--num_episodes", type=int, default=1000, help="Number of episodes to train for")
+    parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps per episode")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for updates")
+    parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=0.995, help="Discount factor")
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
     parser.add_argument("--clip_param", type=float, default=0.2, help="PPO clipping parameter")
     parser.add_argument("--early_stop_reward", type=float, default=None, help="Early stopping reward threshold")
     
     # Checkpointing and resumption
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=10, help="Episodes between checkpoints")
+    parser.add_argument("--checkpoint_interval", type=int, default=5, help="Episodes between checkpoints")
     parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load")
     
-    # Environment settings
-    parser.add_argument("--mock_env", action="store_true", help="Use mock environment instead of real game")
-    parser.add_argument("--skip_game_check", action="store_false", dest="skip_game_check", default=True, help="Check if game is running (default: disabled)")
-    parser.add_argument("--disable_menu_detection", action="store_true", help="Disable menu detection")
-    parser.add_argument("--window_title", type=str, help="Game window title to connect to")
-    parser.add_argument("--game_path", type=str, help="Path to game executable (default: Steam installation path will be checked automatically)")
+    # Environment options
+    parser.add_argument("--mock_env", action="store_true", help="Use mock environment")
+    parser.add_argument("--game_path", type=str, help="Path to Cities Skylines 2 executable")
+    parser.add_argument("--pixel_size", type=int, default=128, help="Size of observation pixels")
     
-    # Hardware settings
-    parser.add_argument("--device", type=str, choices=["cpu", "cuda"], help="Device to use (cpu or cuda)")
-    parser.add_argument("--resolution", type=str, help="Observation resolution, format: WIDTHxHEIGHT")
-    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
+    # Rendering options
+    parser.add_argument("--render", action="store_true", help="Render environment")
+    parser.add_argument("--verbose", action="store_true", help="Print verbose output")
     
-    # Visualization and monitoring
-    parser.add_argument("--render", action="store_true", help="Render environment during training")
-    parser.add_argument("--visualize_performance", action="store_true", help="Visualize performance metrics")
-    parser.add_argument("--monitor_performance", action="store_true", help="Monitor hardware performance")
+    # Hardware options
+    parser.add_argument("--cpu", action="store_true", help="Force CPU usage")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU device to use")
+    parser.add_argument("--mixed_precision", action="store_true", default=True, help="Use mixed precision training")
+    parser.add_argument("--monitor_hardware", action="store_true", default=True, help="Monitor hardware usage")
     
-    args = parser.parse_args()
-    return args
+    # Agent options
+    parser.add_argument("--action_repeat", type=int, default=1, help="Number of times to repeat actions")
+    parser.add_argument("--action_delay", type=float, default=0.25, help="Delay between actions")
+    
+    # Memory options (MANN is enabled by default)
+    parser.add_argument("--disable_memory", action="store_true", help="Disable memory-augmented agent (uses standard PPO)")
+    parser.add_argument("--memory_size", type=int, default=2000, help="Size of episodic memory")
+    parser.add_argument("--memory_use_prob", type=float, default=0.9, help="Probability of using memory during inference")
+    parser.add_argument("--memory_warmup", type=int, default=10, help="Episodes before memory is used")
+    parser.add_argument("--memory_curriculum", action="store_true", default=True, help="Use curriculum learning for memory usage")
+    
+    return parser.parse_args()
 
 def setup_config(args):
     """Set up configuration from command-line arguments and optionally a config file.

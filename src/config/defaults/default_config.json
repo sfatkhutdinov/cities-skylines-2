@@ -100,11 +100,32 @@
         "xavier_init": true,
         "normalize_inputs": true,
         "use_lstm": true,
-        "lstm_hidden_size": 256,
+        "lstm_hidden_size": 384,
         "use_attention": true,
-        "attention_heads": 4,
+        "attention_heads": 8,
         "dropout": 0.1,
-        "sequence_batch_size": 8
+        "sequence_batch_size": 16
+    },
+    "memory": {
+        "enabled": true,
+        "memory_size": 2000,
+        "key_size": 128,
+        "value_size": 256,
+        "retrieval_threshold": 0.5,
+        "warmup_episodes": 10,
+        "use_curriculum": true,
+        "curriculum_phases": {
+            "observation": 10,
+            "retrieval": 30,
+            "integration": 50,
+            "refinement": 100
+        },
+        "memory_use_probability": 0.9,
+        "importance_thresholds": {
+            "reward": 0.5,
+            "novelty": 0.7,
+            "sampling_interval": 100
+        }
     },
     "logging": {
         "level": "INFO",

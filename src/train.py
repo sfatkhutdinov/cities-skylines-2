@@ -15,8 +15,13 @@ from datetime import datetime
 import atexit
 
 # Import directly from utils.py
-from src.training.utils import parse_args, setup_config, setup_hardware_config, setup_environment, setup_agent
+from src.training.utils import parse_args, setup_config, setup_hardware_config, setup_environment
 from src.training.trainer import Trainer
+from src.training.memory_trainer import MemoryTrainer
+from src.agent.core.ppo_agent import PPOAgent
+from src.agent.memory_agent import MemoryAugmentedAgent
+from src.model.optimized_network import OptimizedNetwork
+from src.memory.memory_augmented_network import MemoryAugmentedNetwork
 
 # Configure logging
 logging.basicConfig(
@@ -124,6 +129,75 @@ def focus_game_window(env, max_attempts=5):
     else:
         logger.warning("Environment doesn't support window focusing, input may not work correctly")
 
+def setup_agent(args, hardware_config, observation_space, action_space):
+    """Set up agent using hardware configuration and environment spaces.
+    
+    Args:
+        args: Command-line arguments
+        hardware_config: Hardware configuration
+        observation_space: Environment observation space
+        action_space: Environment action space
+        
+    Returns:
+        Agent instance
+    """
+    logger.info(f"Creating agent with state_dim={observation_space.shape}, action_dim={action_space.n}")
+    
+    # Determine if we should use memory (enabled by default)
+    use_memory = not (hasattr(args, 'disable_memory') and args.disable_memory)
+    memory_size = args.memory_size if hasattr(args, 'memory_size') else 1000
+    
+    # Get device
+    device = hardware_config.get_device()
+    
+    if use_memory:
+        logger.info("Creating memory-augmented network and agent (default)")
+        
+        # Create memory-augmented network
+        policy_network = MemoryAugmentedNetwork(
+            input_shape=observation_space.shape,
+            num_actions=action_space.n,
+            memory_size=memory_size,
+            device=device,
+            use_lstm=True,  # Enable LSTM by default
+            lstm_hidden_size=384,  # Larger hidden size
+            use_attention=True,  # Enable attention by default
+            attention_heads=8  # More attention heads for better learning
+        )
+        
+        # Create memory-augmented agent
+        agent = MemoryAugmentedAgent(
+            policy_network=policy_network,
+            observation_space=observation_space,
+            action_space=action_space,
+            device=device,
+            memory_size=memory_size,
+            memory_use_prob=0.8,
+            lr=hardware_config.learning_rate,
+            gamma=0.99,
+            epsilon=hardware_config.clip_param,
+            value_coef=hardware_config.value_loss_coef,
+            entropy_coef=hardware_config.entropy_coef
+        )
+    else:
+        logger.info("Creating standard PPO agent (memory disabled via flag)")
+        
+        # Extract only parameters accepted by PPOAgent
+        ppo_params = {
+            'state_dim': observation_space.shape,
+            'action_dim': action_space.n,
+            'config': hardware_config,
+            'use_amp': args.mixed_precision if hasattr(args, 'mixed_precision') else False
+        }
+        
+        # Create agent
+        agent = PPOAgent(**ppo_params)
+    
+    agent.to(device)
+    logger.info(f"Agent initialized on {device}")
+    
+    return agent
+
 def main():
     """Main training function."""
     global _trainer, _environment, _exit_requested
@@ -141,6 +215,12 @@ def main():
         
         # Parse command line arguments
         args = parse_args()
+        
+        # Add memory-specific arguments
+        if not hasattr(args, 'disable_memory'):
+            args.disable_memory = False
+        if not hasattr(args, 'memory_size'):
+            args.memory_size = 1000
         
         # Setup configuration
         config = setup_config(args)
@@ -201,7 +281,7 @@ def main():
         hardware_config.max_steps = trainer_config['max_steps']
         hardware_config.learning_rate = trainer_config['learning_rate']
         hardware_config.early_stop_reward = trainer_config['early_stop_reward']
-        hardware_config.mixed_precision = trainer_config['mixed_precision']
+        hardware_config.mixed_precision = trainer_config.get('mixed_precision', True)  # Enable by default
         
         # Add optimizer related attributes 
         hardware_config.optimizer = 'adam'  # Default optimizer
@@ -219,14 +299,44 @@ def main():
         hardware_config.max_memory_usage = 0.9  # Maximum memory usage (90%)
         hardware_config.safeguard_cooldown = 60  # Safeguard cooldown
         
-        # Create trainer
-        _trainer = Trainer(
-            agent=agent,
-            env=_environment,
-            config=hardware_config,
-            checkpoint_dir=trainer_config['checkpoint_dir'],
-            tensorboard_dir=trainer_config['tensorboard_dir']
-        )
+        # Add memory configuration
+        if not hasattr(hardware_config, 'memory'):
+            hardware_config.memory = {
+                'enabled': not args.disable_memory,
+                'memory_size': args.memory_size,
+                'key_size': 128,
+                'value_size': 256,
+                'retrieval_threshold': 0.5,
+                'warmup_episodes': 10,
+                'use_curriculum': True,
+                'curriculum_phases': {
+                    'observation': 10,
+                    'retrieval': 30,
+                    'integration': 50,
+                    'refinement': 100
+                },
+                'memory_use_probability': 0.8
+            }
+        
+        # Create appropriate trainer based on agent type
+        if isinstance(agent, MemoryAugmentedAgent):
+            logger.info("Creating memory-augmented trainer")
+            _trainer = MemoryTrainer(
+                agent=agent,
+                env=_environment,
+                config=hardware_config,
+                checkpoint_dir=trainer_config['checkpoint_dir'],
+                tensorboard_dir=trainer_config['tensorboard_dir']
+            )
+        else:
+            logger.info("Creating standard trainer")
+            _trainer = Trainer(
+                agent=agent,
+                env=_environment,
+                config=hardware_config,
+                checkpoint_dir=trainer_config['checkpoint_dir'],
+                tensorboard_dir=trainer_config['tensorboard_dir']
+            )
         
         # Train the agent
         logger.info("Starting training")
