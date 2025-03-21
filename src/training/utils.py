@@ -36,209 +36,225 @@ def parse_args():
     parser.add_argument("--save_config", type=str, help="Save current configuration to file")
     
     # Training parameters
-    parser.add_argument("--num_episodes", type=int, help="Number of episodes to train for")
-    parser.add_argument("--max_steps", type=int, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, help="Batch size for updates")
-    parser.add_argument("--learning_rate", type=float, help="Learning rate")
-    parser.add_argument("--gamma", type=float, help="Discount factor")
-    parser.add_argument("--gae_lambda", type=float, help="GAE lambda parameter")
-    parser.add_argument("--clip_param", type=float, help="PPO clipping parameter")
+    parser.add_argument("--num_episodes", type=int, default=100, help="Number of episodes to train for")
+    parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for updates")
+    parser.add_argument("--learning_rate", type=float, default=0.0003, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
+    parser.add_argument("--clip_param", type=float, default=0.2, help="PPO clipping parameter")
+    parser.add_argument("--early_stop_reward", type=float, default=None, help="Early stopping reward threshold")
     
     # Checkpointing and resumption
-    parser.add_argument("--checkpoint_dir", type=str, help="Directory to save checkpoints")
-    parser.add_argument("--checkpoint_freq", type=int, help="Episodes between checkpoints")
-    parser.add_argument("--autosave_interval", type=int, help="Minutes between auto-saves (0 to disable)")
-    parser.add_argument("--backup_checkpoints", type=int, help="Number of backup checkpoints to keep")
-    parser.add_argument("--max_checkpoints", type=int, help="Max regular checkpoints to keep")
-    parser.add_argument("--max_disk_usage_gb", type=float, help="Maximum disk usage in GB for logs and checkpoints")
-    parser.add_argument("--fresh_start", action="store_true", help="Force starting training from scratch, ignoring existing checkpoints")
-    parser.add_argument("--use_best", action="store_true", help="Resume training from best checkpoint instead of latest")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--checkpoint_interval", type=int, default=10, help="Episodes between checkpoints")
+    parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load")
     
     # Environment settings
-    parser.add_argument("--mock_env", action="store_true", help="Use mock environment for testing")
+    parser.add_argument("--mock_env", action="store_true", help="Use mock environment instead of real game")
+    parser.add_argument("--skip_game_check", action="store_true", help="Skip checking if game is running")
     parser.add_argument("--disable_menu_detection", action="store_true", help="Disable menu detection")
-    parser.add_argument("--game_path", type=str, help="Path to the game executable")
-    parser.add_argument("--window_title", type=str, help="Window title to search for")
-    parser.add_argument("--skip_game_check", action="store_true", help="Skip game process verification (use when game is already running)")
+    parser.add_argument("--window_title", type=str, help="Game window title to connect to")
+    parser.add_argument("--game_path", type=str, help="Path to game executable")
     
-    # Monitoring and logging
-    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
-    parser.add_argument("--wandb_project", type=str, help="Weights & Biases project name")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    # Hardware settings
+    parser.add_argument("--device", type=str, choices=["cpu", "cuda"], help="Device to use (cpu or cuda)")
+    parser.add_argument("--resolution", type=str, help="Observation resolution, format: WIDTHxHEIGHT")
+    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
+    
+    # Visualization and monitoring
     parser.add_argument("--render", action="store_true", help="Render environment during training")
-    parser.add_argument("--log_dir", type=str, help="Directory for logs")
+    parser.add_argument("--visualize_performance", action="store_true", help="Visualize performance metrics")
+    parser.add_argument("--monitor_performance", action="store_true", help="Monitor hardware performance")
     
-    # Hardware acceleration
-    parser.add_argument("--force_cpu", action="store_true", help="Force CPU usage even if GPU is available")
-    parser.add_argument("--fp16", action="store_true", help="Use mixed precision (FP16) if available")
-    parser.add_argument("--cpu_threads", type=int, help="Number of CPU threads to use (0 for all)")
-    
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
-def setup_config(args) -> ConfigLoader:
-    """Set up configuration from args and config file.
+def setup_config(args):
+    """Set up configuration from command-line arguments and optionally a config file.
     
     Args:
-        args: Parsed arguments
+        args: Parsed command-line arguments
         
     Returns:
-        ConfigLoader: Configuration loader
+        Dictionary containing configuration
     """
-    # Create config loader from file or defaults
-    config_loader = ConfigLoader(args.config)
+    logger = logging.getLogger(__name__)
+    config = {}
     
-    # Convert args to dictionary and merge with config
-    args_dict = args_to_dict(args)
-    config_loader.merge_with_args(args_dict)
+    # Start with defaults
+    config = {
+        "training": {
+            "num_episodes": 100,
+            "max_steps": 1000,
+            "batch_size": 64,
+            "learning_rate": 0.0003,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_param": 0.2,
+            "early_stop_reward": None,
+        },
+        "environment": {
+            "mock_env": False,
+            "disable_menu_detection": False,
+            "skip_game_check": False,
+            "window_title": "Cities: Skylines II",
+        },
+        "hardware": {
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "resolution": "84x84",
+            "mixed_precision": False,
+        },
+        "checkpointing": {
+            "checkpoint_dir": "checkpoints",
+            "checkpoint_interval": 10,
+        }
+    }
     
-    # Validate config
-    errors = config_loader.validate_config()
-    if errors:
-        for error in errors:
-            logger.error(f"Configuration error: {error}")
-        logger.warning("Using default values for invalid configuration entries")
-    
-    # Save config if requested
-    if args.save_config:
-        if config_loader.save(args.save_config):
-            logger.info(f"Configuration saved to {args.save_config}")
-        else:
-            logger.error(f"Failed to save configuration to {args.save_config}")
-    
-    return config_loader
-
-def setup_hardware_config(args, config_loader: Optional[ConfigLoader] = None):
-    """Set up hardware configuration based on arguments and config.
-    
-    Args:
-        args: Parsed arguments
-        config_loader: Optional configuration loader
+    # Override with command-line arguments if provided
+    if args.num_episodes is not None:
+        config["training"]["num_episodes"] = args.num_episodes
+    if args.max_steps is not None:
+        config["training"]["max_steps"] = args.max_steps
+    if args.learning_rate is not None:
+        config["training"]["learning_rate"] = args.learning_rate
+    if args.early_stop_reward is not None:
+        config["training"]["early_stop_reward"] = args.early_stop_reward
         
-    Returns:
-        Hardware configuration
-    """
-    if config_loader is not None:
-        # Use configuration from config loader
-        config = config_loader.get_hardware_config()
+    if args.mock_env:
+        config["environment"]["mock_env"] = True
+    if args.disable_menu_detection:
+        config["environment"]["disable_menu_detection"] = True
+    if args.skip_game_check:
+        config["environment"]["skip_game_check"] = True
+    if args.window_title:
+        config["environment"]["window_title"] = args.window_title
+    if args.game_path:
+        config["environment"]["game_path"] = args.game_path
         
-        # Override with CLI arguments if specified
-        args_dict = args_to_dict(args)
-        if args.force_cpu:
-            config.force_cpu = True
-        if args.fp16:
-            config.use_fp16 = True
-        if args.batch_size:
-            config.batch_size = args.batch_size
-        if args.learning_rate:
-            config.learning_rate = args.learning_rate
-    else:
-        # Fallback to old method if no config loader
-        config = HardwareConfig()
+    if args.device:
+        config["hardware"]["device"] = args.device
+    if args.resolution:
+        config["hardware"]["resolution"] = args.resolution
+    if args.mixed_precision:
+        config["hardware"]["mixed_precision"] = True
         
-        # Configure hardware settings
-        if args.force_cpu:
-            config.force_cpu = True
-        
-        if args.fp16:
-            config.use_fp16 = True
-            
-        if args.batch_size:
-            config.batch_size = args.batch_size
-            
-        if args.learning_rate:
-            config.learning_rate = args.learning_rate
+    if args.checkpoint_dir:
+        config["checkpointing"]["checkpoint_dir"] = args.checkpoint_dir
+    if args.checkpoint_interval:
+        config["checkpointing"]["checkpoint_interval"] = args.checkpoint_interval
     
-    # Log hardware configuration
-    logger.info(f"Hardware configuration: device={config.get_device()}, "
-               f"batch_size={config.batch_size}, fp16={config.use_fp16}")
-    
+    logger.info(f"Configuration: {config}")
     return config
 
-def setup_environment(
-    config: HardwareConfig,
-    args: argparse.Namespace,
-    config_loader: ConfigLoader
-) -> Environment:
-    """Set up the environment.
+def setup_hardware_config(args):
+    """Set up hardware configuration from command-line arguments and configuration.
     
     Args:
-        config: Hardware configuration
-        args: Command-line arguments
-        config_loader: Configuration loader
+        args: Parsed command-line arguments
         
     Returns:
-        Environment: Environment instance
+        HardwareConfig: Hardware configuration
     """
-    # Get environment configuration
-    env_config = config_loader.get_section('environment')
+    from src.config.hardware_config import HardwareConfig
     
-    # Create a wrapper class for HardwareConfig that adds a 'get' method
+    logger = logging.getLogger(__name__)
+    
+    # Parse resolution if provided
+    resolution = None
+    if hasattr(args, 'resolution') and args.resolution:
+        try:
+            width, height = map(int, args.resolution.split('x'))
+            resolution = (width, height)
+        except (ValueError, AttributeError):
+            logger.warning(f"Invalid resolution format: {args.resolution}. Using default.")
+    
+    # Determine device to use
+    device = None
+    if hasattr(args, 'device') and args.device:
+        device = args.device
+    elif hasattr(args, 'force_cpu') and args.force_cpu:
+        device = 'cpu'
+    else:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Create hardware configuration
+    mixed_precision = hasattr(args, 'mixed_precision') and args.mixed_precision
+    batch_size = args.batch_size if hasattr(args, 'batch_size') else 64
+    
+    hardware_config = HardwareConfig(
+        device=device,
+        resolution=resolution,  # If None, will use default from HardwareConfig
+        batch_size=batch_size,
+        use_fp16=mixed_precision
+    )
+    
+    # Log hardware configuration
+    logger.info(f"Hardware configuration:")
+    logger.info(f"  Device: {hardware_config.get_device()}")
+    logger.info(f"  Resolution: {hardware_config.resolution}")
+    logger.info(f"  Batch size: {hardware_config.batch_size}")
+    logger.info(f"  Mixed precision: {hardware_config.use_fp16}")
+    
+    return hardware_config
+
+def setup_environment(args, hardware_config, env_config=None, override_game_path=None, override_window_title=None):
+    """Set up environment using hardware configuration and arguments.
+    
+    Args:
+        args: Command-line arguments
+        hardware_config: Hardware configuration
+        env_config: Optional environment configuration
+        override_game_path: Optional path to game executable
+        override_window_title: Optional window title
+        
+    Returns:
+        Environment instance
+    """
+    from src.environment.core.environment import Environment
+    from src.environment.mock_environment import MockEnvironment
+    import time
+    
+    logger = logging.getLogger(__name__)
+    
+    # Create configuration wrapper for easy access
     class ConfigWrapper:
         def __init__(self, hardware_config, env_config):
             self.hardware_config = hardware_config
-            self.env_config = env_config
-            
-            # Create a dictionary mapping section names to their contents
-            self.sections = {
-                'hardware': hardware_config.to_dict(),
-                'capture': env_config.get('capture', {}),
-                'metrics': env_config.get('metrics', {}),
-                'input': env_config.get('input', {}),
-                'detection': env_config.get('detection', {})
-            }
+            self.env_config = env_config or {}
         
-        def get(self, section, default=None):
-            """Get a configuration section by name.
+        def get_device(self):
+            return self.hardware_config.get_device()
             
-            Args:
-                section: Section name
-                default: Default value if section is not found
-                
-            Returns:
-                Section contents or default value
-            """
-            return self.sections.get(section, default)
+        def get_observation_shape(self):
+            return self.hardware_config.resolution
             
-        # Forward all other hardware config methods
-        def __getattr__(self, name):
-            return getattr(self.hardware_config, name)
+        def get_dtype(self):
+            return self.hardware_config.get_dtype()
+            
+        def get(self, key, default=None):
+            return self.env_config.get(key, default)
     
-    # Use mock environment if requested
-    if args.mock_env:
-        from src.environment.mock_environment import MockEnvironment
-        logger.info("Using mock environment for testing")
-        mock_env_params = {
-            'frame_height': env_config.get('frame_height', 240),
-            'frame_width': env_config.get('frame_width', 320),
-            'max_steps': args.max_steps if args.max_steps else env_config.get('max_steps', 1000),
-            'crash_probability': env_config.get('crash_probability', 0.005),
-            'freeze_probability': env_config.get('freeze_probability', 0.01),
-            'menu_probability': env_config.get('menu_probability', 0.02)
-        }
-        wrapped_config = ConfigWrapper(config, env_config)
-        env = MockEnvironment(config=wrapped_config, **mock_env_params)
+    wrapped_config = ConfigWrapper(hardware_config, env_config or {})
+    
+    # Get environment-specific parameters
+    game_path = override_game_path
+    window_title = override_window_title
+    
+    # If mock environment is requested, use it
+    if hasattr(args, 'mock_env') and args.mock_env:
+        logger.info("Using mock environment")
+        env = MockEnvironment(
+            config=wrapped_config,
+            observation_shape=hardware_config.get_observation_shape(),
+            action_size=137  # Default action space size, should match real env
+        )
     else:
-        # Set up real environment
         logger.info("Setting up real game environment")
+        # Get additional settings
+        env_config = env_config or {}
         
-        # Create a wrapped config that has both HardwareConfig methods and a 'get' method
-        wrapped_config = ConfigWrapper(config, env_config)
-        
-        # Get game path from args or config
-        game_path = args.game_path if hasattr(args, 'game_path') else None
-        if not game_path:
-            game_path = env_config.get('game_path')
-        
-        # Get window title from args or config
-        window_title = args.window_title if hasattr(args, 'window_title') else None
-        if not window_title:
-            window_title = env_config.get('window_title', "Cities: Skylines II")
-        
-        logger.info(f"Game path: {game_path or 'Not specified'}")
-        logger.info(f"Window title: {window_title or 'Using default'}")
-        
-        # Remove arguments that might conflict with env_config
-        # to avoid multiple values error
+        # Prepare environment parameters
         env_kwargs = {
             'config': wrapped_config,
             'disable_menu_detection': args.disable_menu_detection if hasattr(args, 'disable_menu_detection') else False,
@@ -257,76 +273,80 @@ def setup_environment(
         
         # Filter env_config to avoid duplicate parameters
         filtered_env_config = {k: v for k, v in env_config.items() 
-                            if k not in ('game_path', 'window_title', 'disable_menu_detection')}
+                              if k not in ('game_path', 'window_title', 'disable_menu_detection')}
         
         env = Environment(
             **env_kwargs,
             **filtered_env_config
         )
-    
-    # Add additional initialization for improved window focus
-    time.sleep(2)  # Wait for environment initialization
-    
-    # Force window focus with multiple attempts
-    logger.info("Ensuring initial window focus for training")
-    focus_success = False
-    for attempt in range(3):
-        logger.info(f"Focus attempt {attempt+1}/3")
-        if env._ensure_window_focused():
-            focus_success = True
-            logger.info("Window focus successful")
-            break
-        time.sleep(1)
         
-    if not focus_success:
-        logger.warning("Could not get reliable window focus during initialization")
+        # Add additional initialization for improved window focus
+        logger.info("Waiting for environment to initialize...")
+        time.sleep(2)  # Wait for environment initialization
         
-    # Set minimum action delay for more reliable action execution
-    env.min_action_delay = 0.3  # Increased from the default 0.1
-    logger.info(f"Set minimum action delay to {env.min_action_delay}s")
-    
-    # Ensure initial observation is available
-    logger.info("Getting initial observation")
-    try:
-        env.get_observation()
-        logger.info("Initial observation obtained successfully")
-    except Exception as e:
-        logger.warning(f"Error getting initial observation: {e}")
+        # Force window focus with multiple attempts
+        logger.info("Ensuring initial window focus for environment setup")
+        focus_attempts = 3
+        focus_success = False
+        for attempt in range(focus_attempts):
+            logger.info(f"Focus attempt {attempt+1}/{focus_attempts}")
+            try:
+                if env._ensure_window_focused():
+                    focus_success = True
+                    logger.info("Window focus successful")
+                    break
+            except Exception as e:
+                logger.warning(f"Error during focus attempt {attempt+1}: {e}")
+            time.sleep(1)
+            
+        if not focus_success:
+            logger.warning("Could not get reliable window focus during initialization")
+            
+        # Set minimum action delay for more reliable action execution
+        env.min_action_delay = 0.25  # Increased from the default 0.1
+        logger.info(f"Set minimum action delay to {env.min_action_delay}s for environment setup")
+        
+        # Ensure initial observation is available
+        logger.info("Getting initial observation")
+        try:
+            initial_obs = env.reset()
+            logger.info(f"Initial observation obtained successfully: shape={initial_obs.shape}")
+        except Exception as e:
+            logger.warning(f"Error getting initial observation: {e}")
     
     return env
 
-def setup_agent(config, env, args, config_loader: Optional[ConfigLoader] = None):
-    """Set up agent using hardware configuration and environment.
+def setup_agent(args, hardware_config, observation_space, action_space):
+    """Set up agent using hardware configuration and environment spaces.
     
     Args:
-        config: Hardware configuration
-        env: Environment instance
-        args: Parsed arguments
-        config_loader: Optional configuration loader
+        args: Command-line arguments
+        hardware_config: Hardware configuration
+        observation_space: Environment observation space
+        action_space: Environment action space
         
     Returns:
         Agent instance
     """
-    model_config = {}
-    if config_loader:
-        model_config = config_loader.get_section('model')
+    from src.agent.core.ppo_agent import PPOAgent
+    
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"Creating PPO agent with state_dim={observation_space.shape}, action_dim={action_space.n}")
     
     # Extract only parameters accepted by PPOAgent
     ppo_params = {
-        'state_dim': env.observation_space.shape,
-        'action_dim': env.action_space.n,
-        'config': config,
-        'use_amp': model_config.get('use_amp', False)
+        'state_dim': observation_space.shape,
+        'action_dim': action_space.n,
+        'config': hardware_config,
+        'use_amp': args.mixed_precision if hasattr(args, 'mixed_precision') else False
     }
     
     # Create agent
     agent = PPOAgent(**ppo_params)
     
-    agent.to(config.get_device())
-    logger.info(f"Agent initialized on {config.get_device()}")
-    
-    # Log agent configuration
-    logger.info(f"Agent configuration: {str(agent)}")
+    agent.to(hardware_config.get_device())
+    logger.info(f"Agent initialized on {hardware_config.get_device()}")
     
     return agent
 

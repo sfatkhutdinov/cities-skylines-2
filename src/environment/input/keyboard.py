@@ -10,6 +10,7 @@ import ctypes
 from typing import Dict, Optional, Any
 from pynput.keyboard import Key, Controller as KeyboardController
 import pyautogui
+import win32gui
 
 logger = logging.getLogger(__name__)
 
@@ -45,66 +46,60 @@ class KeyboardInput:
         
         logger.info("Keyboard input initialized")
     
-    def key_press(self, key: Any, duration: float = 0.1, force_direct: bool = False) -> bool:
-        """Press a key and hold for specified duration.
+    def key_press(self, key: str, duration: float = 0.1) -> bool:
+        """Press a key on the keyboard.
         
         Args:
-            key: Key to press (string representation or pynput Key object)
-            duration: How long to hold the key in seconds
-            force_direct: Force using direct key press even for special keys
-        
+            key: String representation of the key to press
+            duration: Duration to hold the key down in seconds
+            
         Returns:
             True if successful, False otherwise
         """
+        key_id = str(time.time())[-6:]  # Use last 6 digits of timestamp as key ID
+        logger.info(f"[KEY-{key_id}] Pressing key '{key}' for {duration} seconds")
+        
         try:
-            # Convert to pynput Key if a string is provided
-            actual_key = self.key_map.get(key, key) if isinstance(key, str) else key
-            
-            # Block escape if needed
-            if self.block_escape and ((isinstance(key, str) and key.lower() == 'escape') or actual_key == Key.esc):
-                logger.warning("Escape key press blocked (safety feature)")
-                return False
-                
-            # Try to press the key using pynput
+            # Map string to Key object if needed
             try:
-                # Press key normally (pynput)
-                if not force_direct and isinstance(actual_key, (Key, str)):
-                    self.keyboard.press(actual_key)
-                    time.sleep(duration)
-                    self.keyboard.release(actual_key)
-                    return True
-            except Exception as e:
-                logger.warning(f"Error pressing key using pynput: {e}")
-            
-            # Fallback: try using pyautogui
-            try:
-                # Some special keys have different names in pyautogui
-                key_mapping = {
-                    'escape': 'esc',
-                    Key.esc: 'esc',
-                    'space': 'space',
-                    Key.space: 'space',
-                    'enter': 'enter',
-                    Key.enter: 'enter',
-                    # Add more mappings as needed
-                }
-                
-                # Try to get the mapped key name for pyautogui
-                pyautogui_key = key
-                if isinstance(key, str):
-                    pyautogui_key = key_mapping.get(key.lower(), key.lower())
-                elif isinstance(key, Key):
-                    pyautogui_key = key_mapping.get(key, str(key).replace('Key.', ''))
-                
-                pyautogui.keyDown(pyautogui_key)
-                time.sleep(duration)
-                pyautogui.keyUp(pyautogui_key)
-                return True
-            except Exception as e:
-                logger.error(f"Error pressing key using pyautogui fallback: {e}")
+                mapped_key = self._map_key(key)
+                logger.debug(f"[KEY-{key_id}] Mapped key '{key}' to {mapped_key}")
+            except ValueError as e:
+                logger.error(f"[KEY-{key_id}] Failed to map key '{key}': {e}")
                 return False
+            
+            # Ensure game window is focused
+            game_hwnd = win32gui.FindWindow(None, "Cities: Skylines II")
+            if game_hwnd:
+                # Bring window to foreground
+                win32gui.SetForegroundWindow(game_hwnd)
+                # Wait for window to be ready
+                time.sleep(0.1)
+            
+            # Press key down
+            logger.debug(f"[KEY-{key_id}] Pressing key down")
+            self.keyboard.press(mapped_key)
+            
+            # Wait for specified duration
+            logger.debug(f"[KEY-{key_id}] Waiting for {duration} seconds")
+            time.sleep(duration)
+            
+            # Release key
+            logger.debug(f"[KEY-{key_id}] Releasing key")
+            self.keyboard.release(mapped_key)
+            
+            logger.info(f"[KEY-{key_id}] Successfully pressed key '{key}'")
+            return True
+            
         except Exception as e:
-            logger.error(f"Error in key_press: {e}")
+            logger.error(f"[KEY-{key_id}] Error pressing key '{key}': {e}")
+            # Ensure key is released in case of error
+            try:
+                if 'mapped_key' in locals():
+                    logger.debug(f"[KEY-{key_id}] Attempting to release key after error")
+                    self.keyboard.release(mapped_key)
+            except Exception as release_error:
+                logger.error(f"[KEY-{key_id}] Failed to release key after error: {release_error}")
             return False
     
     def press_key(self, key: str) -> bool:
@@ -185,4 +180,34 @@ class KeyboardInput:
         except Exception as e:
             logger.error(f"Error in keyboard cleanup: {e}")
         
-        logger.info("Keyboard input resources released") 
+        logger.info("Keyboard input resources released")
+    
+    def _map_key(self, key: str) -> Any:
+        """Map a string key representation to a pynput Key object.
+        
+        Args:
+            key: String representation of the key
+            
+        Returns:
+            pynput Key object or string character
+            
+        Raises:
+            ValueError: If the key cannot be mapped
+        """
+        # First check if it's a one-character key (a-z, 0-9, etc.)
+        if len(key) == 1:
+            return key
+            
+        # Check if it's in our key_map
+        if key.lower() in self.key_map:
+            return self.key_map[key.lower()]
+            
+        # Try to find it in Key enum
+        try:
+            if hasattr(Key, key.lower()):
+                return getattr(Key, key.lower())
+        except (AttributeError, TypeError):
+            pass
+            
+        # If we get here, we couldn't map the key
+        raise ValueError(f"Could not map key: {key}") 

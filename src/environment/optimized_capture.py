@@ -401,12 +401,17 @@ class OptimizedScreenCapture:
             numpy.ndarray: Captured frame as numpy array in RGB format,
                           or None if capture failed
         """
+        logger.critical("Starting screen capture")
+        
         if self.use_mock:
+            logger.critical("Using mock mode, generating mock frame")
             # Return a mock frame for testing
-            return self._generate_mock_frame()
+            mock_frame = self._generate_mock_frame()
+            logger.critical(f"Mock frame generated: shape={mock_frame.shape}")
+            return mock_frame
             
         if not self.initialized:
-            logger.error("Screen capture not initialized")
+            logger.critical("ERROR: Screen capture not initialized")
             return None
             
         try:
@@ -414,13 +419,17 @@ class OptimizedScreenCapture:
             if hasattr(self, 'game_hwnd') and self.game_hwnd and WIN32_AVAILABLE:
                 foreground_hwnd = win32gui.GetForegroundWindow()
                 if foreground_hwnd != self.game_hwnd:
-                    logger.warning("Game window not in focus, attempting to refocus")
-                    self.focus_game_window()
+                    logger.critical(f"Game window not in focus (current={foreground_hwnd}, game={self.game_hwnd}), attempting to refocus")
+                    focus_success = self.focus_game_window()
+                    logger.critical(f"Window focus attempt result: {focus_success}")
+                else:
+                    logger.critical("Game window is already in focus")
             
             # Throttle capture rate to target FPS
             current_time = time.time()
             elapsed = current_time - self.last_capture_time
             if elapsed < self.frame_interval:
+                logger.critical(f"Throttling capture: elapsed={elapsed:.4f}s, sleeping for {self.frame_interval - elapsed:.4f}s")
                 time.sleep(self.frame_interval - elapsed)
                 
             # Capture screen
@@ -433,23 +442,36 @@ class OptimizedScreenCapture:
                     "height": bottom - top
                 }
                 
+                logger.critical(f"Capturing screen area: left={left}, top={top}, width={right-left}, height={bottom-top}")
+                
                 # Capture the specified region
+                capture_start = time.time()
                 sct_img = self.sct.grab(monitor)
+                capture_duration = time.time() - capture_start
+                logger.critical(f"Screen capture completed in {capture_duration:.4f}s")
                 
                 # Convert to numpy array (BGRA format)
+                convert_start = time.time()
                 img_np = np.array(sct_img)
                 
                 # Convert BGRA to RGB
                 img_rgb = img_np[:, :, :3][:, :, ::-1]
+                convert_duration = time.time() - convert_start
+                
+                logger.critical(f"Image conversion completed in {convert_duration:.4f}s: shape={img_rgb.shape}, dtype={img_rgb.dtype}")
                 
                 self.last_capture_time = time.time()
                 return img_rgb
             else:
-                logger.error("No valid capture area defined")
+                logger.critical("ERROR: No valid capture area defined")
                 return None
                 
         except Exception as e:
-            logger.error(f"Error capturing frame: {e}")
+            # Log detailed error information
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.critical(f"ERROR capturing frame: {e}")
+            logger.critical(f"Error traceback: {error_trace}")
             return None
     
     def _generate_mock_frame(self) -> np.ndarray:

@@ -80,16 +80,39 @@ class ObservationManager:
         current_time = time.time()
         elapsed = current_time - self.last_capture_time
         if elapsed < self.min_capture_interval:
+            logger.critical(f"Rate limiting: elapsed={elapsed:.4f}s, sleeping for {self.min_capture_interval - elapsed:.4f}s")
             time.sleep(self.min_capture_interval - elapsed)
         
         # Capture raw frame
-        raw_frame = self.screen_capture.capture_frame()
+        logger.critical("Capturing raw frame")
+        try:
+            raw_frame = self.screen_capture.capture_frame()
+            if raw_frame is None:
+                logger.critical("Failed to capture frame: raw_frame is None")
+            else:
+                logger.critical(f"Raw frame captured: shape={raw_frame.shape}, type={type(raw_frame)}")
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.critical(f"Error capturing frame: {e}")
+            logger.critical(f"Error traceback: {error_trace}")
+            raise  # Re-raise to be handled by the Environment class
         
         # Process frame
-        processed_frame = self._process_frame(raw_frame)
+        logger.critical("Processing captured frame")
+        try:
+            processed_frame = self._process_frame(raw_frame)
+            logger.critical(f"Frame processed: shape={processed_frame.shape}, device={processed_frame.device}, dtype={processed_frame.dtype}")
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.critical(f"Error processing frame: {e}")
+            logger.critical(f"Error traceback: {error_trace}")
+            raise  # Re-raise to be handled by the Environment class
         
         # Update history
         self.frame_history.append(processed_frame)
+        logger.critical(f"Frame added to history, current history size: {len(self.frame_history)}")
         
         # Update timing
         self.last_capture_time = time.time()

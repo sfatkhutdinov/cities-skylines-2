@@ -95,6 +95,14 @@ class Environment:
         self.input_simulator = input_simulator
         self.action_executor = input_simulator.get_action_executor()
         
+        # Find and focus game window
+        if not self.mock_mode:
+            logger.info("Finding and focusing game window")
+            if not self.input_simulator.mouse_controller.find_game_window(self.window_title):
+                logger.warning("Failed to find game window, input may not work correctly")
+            else:
+                logger.info("Successfully found and focused game window")
+        
         # Initialize menu handler if not disabled
         self.menu_handler = None
         if not disable_menu_detection:
@@ -185,12 +193,16 @@ class Environment:
         Returns:
             torch.Tensor: Initial observation
         """
-        logger.info("Resetting environment")
+        logger.critical("Resetting environment")
         
         # Reset components
+        logger.critical("Resetting observation manager")
         self.observation_manager.reset()
+        logger.critical("Resetting game state")
         self.game_state.reset()
+        logger.critical("Resetting performance monitor")
         self.performance_monitor.reset()
+        logger.critical("Resetting error recovery state")
         self.error_recovery.reset_error_state()
         
         # Reset counters
@@ -199,13 +211,25 @@ class Environment:
         self.consecutive_errors = 0
         
         # Verify game is running
+        logger.critical("Ensuring game is running")
         self._ensure_game_running()
         
         # Reset game speed
+        logger.critical("Setting game speed")
         self._set_game_speed(1)
         
         # Capture initial observation
-        self.current_frame = self.get_observation()
+        logger.critical("Capturing initial observation")
+        try:
+            self.current_frame = self.get_observation()
+            logger.critical(f"Observation captured successfully with shape {self.current_frame.shape if hasattr(self.current_frame, 'shape') else 'unknown'}")
+        except Exception as e:
+            logger.critical(f"Error capturing initial observation: {e}")
+            import traceback
+            logger.critical(f"Traceback: {traceback.format_exc()}")
+            # Create an empty observation as fallback
+            logger.critical("Creating fallback observation")
+            self.current_frame = torch.zeros(self.observation_space.shape)
         
         return self.current_frame
     
@@ -221,6 +245,20 @@ class Environment:
         # Get action info from action space
         action_info = self._action_space_manager.get_action(action_idx)
         
+        # Add explicit debug logging for the action being executed
+        action_type = action_info.get("type", "unknown")
+        if action_type == "key":
+            key = action_info.get("key", "unknown")
+            duration = action_info.get("duration", 0.1)
+            logger.critical(f"ACTION DEBUG: Executing keyboard action - key={key}, duration={duration}")
+        elif action_type == "mouse":
+            mouse_action = action_info.get("action", "unknown")
+            button = action_info.get("button", "left")
+            position = action_info.get("position", None)
+            direction = action_info.get("direction", None)
+            logger.critical(f"ACTION DEBUG: Executing mouse action - action={mouse_action}, button={button}, position={position}, direction={direction}")
+        logger.critical(f"FULL ACTION INFO: {action_info}")
+        
         # Update step counter
         self.steps_taken += 1
         
@@ -234,111 +272,122 @@ class Environment:
                 'error': True,
                 'error_type': 'game_issue',
                 'steps': self.steps_taken,
-                'action': action_idx
+                'action': action_idx,
+                'success': False,
+                'in_menu': False,
+                'focus_success': False,
+                'action_retries': 0,
+                'fps': self.performance_monitor.get_fps(),
+                'error_stats': self.error_recovery.get_error_stats() if self.consecutive_errors > 0 else {},
+                'action_stats': self.get_action_stats()
             }
             return observation, reward, done, info
         
-        # Ensure game window is focused before interacting with it
-        # Try up to 3 times with increasing force
-        focus_success = False
-        for focus_attempt in range(3):
-            # More aggressive focus on later attempts
-            force_focus = focus_attempt > 0
-            if force_focus:
-                logger.info(f"Retry focus with force=True (attempt {focus_attempt+1}/3)")
-            
-            if self._ensure_window_focused():
-                focus_success = True
-                # The _ensure_window_focused method now includes a delay after successful focus
-                break
-            elif focus_attempt < 2:  # Don't wait after the last attempt
-                time.sleep(0.5)
-        
-        if not focus_success:
-            logger.warning("Failed to focus game window after multiple attempts")
-            # Return an error observation with a negative reward
-            observation = self.get_observation()
-            reward = -1.0  # Penalty for focus failure
-            done = False
-            info = {
-                'error': True,
-                'error_type': 'focus_failure',
-                'steps': self.steps_taken,
-                'action': action_idx
-            }
-            return observation, reward, done, info
-        
-        # Check if we're in a menu
-        menu_detected = False
-        if self.menu_handler and self.steps_taken % 30 == 0:  # Check periodically
-            menu_detected = self.menu_handler.check_menu_state()
-            self.game_state.in_menu = menu_detected
-        
-        # Execute appropriate action based on menu state
-        success = False
-        action_retries = 0
-        max_action_retries = 3  # Keep at 3 for more reliability
-        
-        if menu_detected and self.menu_handler:
-            # In menu - try to recover
-            success = self.menu_handler.handle_menu_recovery()
-            if not success:
-                # If menu recovery failed, try error recovery
-                success = self.error_recovery.handle_menu_detection()
+        # Find and focus the game window using the mouse controller directly first
+        # This is more reliable than the error_recovery method
+        logger.critical("FOCUS DEBUG: Attempting to find and focus game window directly...")
+        window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
+        if not window_found:
+            logger.critical("FOCUS DEBUG: Direct window find failed! Falling back to error recovery...")
+            # Fall back to error_recovery method
+            focus_success = self.error_recovery.focus_game_window()
+            if not focus_success:
+                logger.critical("FOCUS DEBUG: Both window focus methods failed!")
+                self.consecutive_errors += 1
+                
+                # Return negative reward and try to recover
+                observation = self.get_observation()
+                reward = -1.0  # Penalty for focus failure
+                done = self.steps_taken >= self.max_steps or self.consecutive_errors >= self.max_consecutive_errors
+                info = {
+                    'error': True,
+                    'error_type': 'focus_failure',
+                    'steps': self.steps_taken,
+                    'action': action_idx,
+                    'success': False,
+                    'in_menu': False,
+                    'focus_success': False,
+                    'action_retries': 0,
+                    'fps': self.performance_monitor.get_fps(),
+                    'error_stats': self.error_recovery.get_error_stats(),
+                    'action_stats': self.get_action_stats()
+                }
+                return observation, reward, done, info
         else:
-            # In game - execute requested action with retries
-            while not success and action_retries <= max_action_retries:
-                try:
-                    # Ensure minimum time between actions - INCREASED for reliability
-                    elapsed = time.time() - self.last_action_time
-                    min_action_delay = 0.3  # Increased from default 0.1
-                    if elapsed < min_action_delay:
-                        time.sleep(min_action_delay - elapsed)
-                    
-                    # Check if focus was lost and try to regain it before retrying
-                    if action_retries > 0:
-                        logger.info(f"Retrying action execution (attempt {action_retries+1}/{max_action_retries+1})")
-                        # Always refocus on retries
-                        logger.info("Refocusing window before retry")
-                        if not self._ensure_window_focused():
-                            logger.warning("Failed to refocus window during action retry")
-                            time.sleep(0.5)  # Wait a bit and try again anyway
-                        
-                    # Execute action
-                    logger.info(f"Executing action {action_idx}")
-                    success = self.action_executor.execute_action(action_info)
-                    self.last_action_time = time.time()
-                    
-                    # Track action success/failure for statistics
-                    self._track_action_result(action_idx, success)
-                    
-                    # Log success or failure
-                    if success:
-                        logger.info(f"Action {action_idx} executed successfully")
-                        break
-                    else:
-                        logger.warning(f"Action {action_idx} execution failed")
-                    
-                    # If failed but can retry, give a short delay
-                    if not success and action_retries < max_action_retries:
-                        logger.warning(f"Action execution failed, will retry after delay")
-                        time.sleep(1.0)  # Keep 1.0s delay before retry
-                    
-                    action_retries += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error executing action {action_idx}: {e}")
-                    success = False
+            logger.critical("FOCUS DEBUG: Successfully found and focused game window directly")
+            focus_success = True
+        
+        # Add delay between actions to prevent input flooding
+        time_since_last_action = time.time() - self.last_action_time
+        if time_since_last_action < self.min_action_delay:
+            time.sleep(self.min_action_delay - time_since_last_action)
+        
+        # Execute action with retries
+        max_action_retries = 3
+        action_retries = 0
+        success = False
+        menu_detected = False
+        
+        while not success and action_retries < max_action_retries:
+            try:
+                # Ensure window is focused before each attempt - important for retries
+                if action_retries > 0:
+                    logger.critical(f"FOCUS DEBUG: Re-focusing window before retry {action_retries}")
+                    self.input_simulator.mouse_controller.find_game_window(self.window_title)
+                
+                logger.critical(f"ACTION EXEC DEBUG: Attempting to execute action (attempt {action_retries + 1})")
+                
+                # Execute the action
+                if action_type == "key":
+                    success = self.action_executor.execute_action("key_press", key=action_info["key"], duration=action_info.get("duration", 0.1))
+                elif action_type == "mouse":
+                    if action_info["action"] == "click":
+                        if "position" in action_info:
+                            x, y = action_info["position"]
+                            # Convert normalized coordinates to screen coordinates
+                            screen_width, screen_height = self.screen_capture.get_resolution()
+                            x = int(x * screen_width)
+                            y = int(y * screen_height)
+                            logger.critical(f"MOUSE CLICK DEBUG: Clicking at x={x}, y={y}, button={action_info.get('button', 'left')}")
+                            success = self.action_executor.execute_action("mouse_click", x=x, y=y, button=action_info.get("button", "left"))
+                        else:
+                            success = self.action_executor.execute_action("mouse_click", button=action_info.get("button", "left"))
+                    elif action_info["action"] == "scroll":
+                        success = self.action_executor.execute_action("mouse_scroll", direction=action_info["direction"])
+                    elif action_info["action"] == "edge_scroll":
+                        success = self.action_executor.execute_action("edge_scroll", direction=action_info["direction"], duration=action_info.get("duration", 0.5))
+                elif action_type == "speed":
+                    success = self._set_game_speed(action_info["speed"])
+                
+                # Check if action was successful
+                logger.critical(f"ACTION EXEC DEBUG: Action execution {'succeeded' if success else 'failed'}")
+                if not success:
+                    logger.warning(f"Action execution failed (attempt {action_retries + 1}/{max_action_retries})")
                     self.consecutive_errors += 1
                     
                     # If this wasn't the last retry, try again
-                    if action_retries < max_action_retries:
+                    if action_retries < max_action_retries - 1:
                         action_retries += 1
-                        # Try to refocus the window in case the error was caused by lost focus
-                        self._ensure_window_focused()
+                        # Force refocus the window between retries
+                        window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
+                        logger.critical(f"FOCUS DEBUG: Window refocus for retry {'succeeded' if window_found else 'failed'}")
                         time.sleep(1.0)  # Keep 1.0s delay before retry
                     else:
                         break
+                        
+            except Exception as e:
+                logger.error(f"Error executing action: {e}")
+                self.consecutive_errors += 1
+                
+                # If this wasn't the last retry, try again
+                if action_retries < max_action_retries - 1:
+                    action_retries += 1
+                    # Force refocus the window between retries
+                    window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
+                    logger.critical(f"FOCUS DEBUG: Window refocus for retry {'succeeded' if window_found else 'failed'}")
+                    time.sleep(1.0)  # Keep 1.0s delay before retry
+                else:
+                    break
         
         # Get next observation
         next_observation = self.get_observation()
@@ -387,19 +436,39 @@ class Environment:
         Returns:
             torch.Tensor: Current observation
         """
+        logger.critical("Getting observation from environment")
         try:
+            logger.critical("Calling observation_manager.get_observation()")
             observation = self.observation_manager.get_observation()
+            
+            # Log basic information about the observation
+            if observation is not None:
+                logger.critical(f"Observation received successfully: shape={observation.shape}, device={observation.device}, dtype={observation.dtype}")
+                if torch.isnan(observation).any():
+                    logger.critical("WARNING: Observation contains NaN values!")
+                if torch.isinf(observation).any():
+                    logger.critical("WARNING: Observation contains Inf values!")
+            else:
+                logger.critical("Observation is None! This should not happen.")
+                
             return observation
         except Exception as e:
-            # Log the specific error for debugging
-            logger.error(f"Error getting observation: {e}")
+            # Log detailed error information
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.critical(f"ERROR getting observation: {e}")
+            logger.critical(f"Error traceback: {error_trace}")
             self.consecutive_errors += 1
+            
+            logger.critical(f"Consecutive errors: {self.consecutive_errors}")
             
             # Return the previous observation if available, otherwise a blank one
             if self.current_frame is not None:
+                logger.critical("Returning previous frame as fallback")
                 return self.current_frame
                 
             # Create a compatible blank observation
+            logger.critical("Returning blank observation as fallback")
             shape = self.observation_manager.get_observation_shape()
             return torch.zeros(shape, dtype=torch.float32, device=self.device)
     

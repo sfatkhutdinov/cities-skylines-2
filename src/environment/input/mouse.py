@@ -56,7 +56,31 @@ class MouseInput:
             True if found, False otherwise
         """
         try:
+            # Find window by title
+            logger.critical(f"WINDOW DEBUG: Searching for window with title '{window_title}'")
             self.game_hwnd = win32gui.FindWindow(None, window_title)
+            
+            # Try a partial match if exact match fails
+            if self.game_hwnd == 0:
+                logger.critical(f"WINDOW DEBUG: Exact title match failed, trying partial match")
+                # Get all top level windows
+                def callback(hwnd, hwnds):
+                    if win32gui.IsWindowVisible(hwnd):
+                        title = win32gui.GetWindowText(hwnd)
+                        if window_title.lower() in title.lower():
+                            hwnds.append((hwnd, title))
+                    return True
+                
+                hwnds = []
+                win32gui.EnumWindows(callback, hwnds)
+                
+                if hwnds:
+                    # Use the first match
+                    self.game_hwnd, actual_title = hwnds[0]
+                    logger.critical(f"WINDOW DEBUG: Found window via partial match: '{actual_title}'")
+                else:
+                    logger.critical(f"WINDOW DEBUG: No windows matched '{window_title}' (partial match)")
+            
             if self.game_hwnd == 0:
                 logger.warning(f"Game window '{window_title}' not found")
                 return False
@@ -65,16 +89,102 @@ class MouseInput:
             self.game_rect = win32gui.GetWindowRect(self.game_hwnd)
             self.client_rect = win32gui.GetClientRect(self.game_hwnd)
             
-            logger.info(f"Found game window: handle={self.game_hwnd}")
-            logger.info(f"Window rect: {self.game_rect}")
-            logger.info(f"Client rect: {self.client_rect}")
-            return True
+            logger.critical(f"WINDOW DEBUG: Initial window state - rect={self.game_rect}, client={self.client_rect}")
+            
+            # Check if window is minimized or not visible
+            if win32gui.IsIconic(self.game_hwnd):
+                logger.critical("WINDOW DEBUG: Game window is minimized, restoring it")
+                win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                time.sleep(1.0)  # Wait for restore
+            
+            # Maximize window for more reliable input
+            logger.critical("WINDOW DEBUG: Maximizing game window")
+            win32gui.ShowWindow(self.game_hwnd, win32con.SW_MAXIMIZE)
+            time.sleep(0.5)  # Wait for maximize
+            
+            # Try to set focus repeatedly
+            focus_attempts = 0
+            max_focus_attempts = 3
+            while focus_attempts < max_focus_attempts:
+                # Bring window to foreground
+                logger.critical(f"WINDOW DEBUG: Bringing game window to foreground (attempt {focus_attempts+1}/{max_focus_attempts})")
+                
+                # Use different methods to try to focus
+                try:
+                    # Method 1: Standard SetForegroundWindow
+                    win32gui.SetForegroundWindow(self.game_hwnd)
+                except Exception as e:
+                    logger.critical(f"WINDOW DEBUG: SetForegroundWindow failed: {e}")
+                    
+                    try:
+                        # Method 2: Try setting the active window
+                        user32 = ctypes.windll.user32
+                        user32.SetActiveWindow(self.game_hwnd)
+                    except Exception as e2:
+                        logger.critical(f"WINDOW DEBUG: SetActiveWindow failed: {e2}")
+                
+                # Wait for window to be ready
+                time.sleep(0.5)
+                
+                # Verify window is in foreground
+                foreground_hwnd = win32gui.GetForegroundWindow()
+                if foreground_hwnd == self.game_hwnd:
+                    logger.critical("WINDOW DEBUG: Successfully brought window to foreground")
+                    break
+                
+                # If we're still not focused, try alt-tabbing to it
+                if focus_attempts == max_focus_attempts - 1:
+                    logger.critical("WINDOW DEBUG: Last attempt - trying Alt+Tab sequence")
+                    try:
+                        # Simulate Alt+Tab to bring window to foreground
+                        keyboard = ctypes.windll.user32
+                        keyboard.keybd_event(0x12, 0, 0, 0)  # Alt down
+                        keyboard.keybd_event(0x09, 0, 0, 0)  # Tab down
+                        keyboard.keybd_event(0x09, 0, 2, 0)  # Tab up
+                        keyboard.keybd_event(0x12, 0, 2, 0)  # Alt up
+                        time.sleep(0.5)
+                        
+                        # Try SetForegroundWindow again
+                        win32gui.SetForegroundWindow(self.game_hwnd)
+                        time.sleep(0.5)
+                    except Exception as e:
+                        logger.critical(f"WINDOW DEBUG: Alt+Tab sequence failed: {e}")
+                
+                focus_attempts += 1
+            
+            # Final verification of window focus
+            foreground_hwnd = win32gui.GetForegroundWindow()
+            if foreground_hwnd == self.game_hwnd:
+                success = True
+                # Get updated dimensions
+                self.game_rect = win32gui.GetWindowRect(self.game_hwnd)
+                self.client_rect = win32gui.GetClientRect(self.game_hwnd)
+                logger.critical(f"WINDOW DEBUG: Final window state - rect={self.game_rect}, client={self.client_rect}")
+            else:
+                success = False
+                logger.critical(f"WINDOW DEBUG: Failed to focus window after {max_focus_attempts} attempts")
+                
+                # Try to get info about what's actually in the foreground
+                try:
+                    foreground_title = win32gui.GetWindowText(foreground_hwnd)
+                    logger.critical(f"WINDOW DEBUG: Current foreground window is '{foreground_title}' (handle: {foreground_hwnd})")
+                except:
+                    logger.critical("WINDOW DEBUG: Couldn't get foreground window title")
+            
+            if success:
+                logger.info(f"Found and focused game window: handle={self.game_hwnd}")
+                logger.info(f"Window rect: {self.game_rect}")
+                logger.info(f"Client rect: {self.client_rect}")
+            
+            return success
         except Exception as e:
             logger.error(f"Error finding game window: {e}")
+            import traceback
+            logger.critical(f"WINDOW DEBUG: Exception details: {traceback.format_exc()}")
             return False
     
     def mouse_move(self, x: int, y: int, retry_count: int = 2) -> bool:
-        """Move mouse pointer to the specified coordinates.
+        """Move mouse to specified coordinates.
         
         Args:
             x: X coordinate in screen space
@@ -84,69 +194,65 @@ class MouseInput:
         Returns:
             True if successful, False otherwise
         """
-        # Ensure coordinates are integers
-        x, y = int(x), int(y)
+        move_id = str(time.time())[-6:]  # Use last 6 digits of timestamp as move ID
+        logger.info(f"[MOUSE-{move_id}] Moving mouse to coordinates ({x}, {y}) with {retry_count} retries")
         
-        # Verify coordinates are within screen boundaries
-        if x < 0 or x >= self.screen_width or y < 0 or y >= self.screen_height:
-            logger.warning(f"Mouse coordinates ({x}, {y}) outside screen boundaries ({self.screen_width}x{self.screen_height})")
-            
-            # Clamp coordinates to screen boundaries
-            x = max(0, min(x, self.screen_width - 1))
-            y = max(0, min(y, self.screen_height - 1))
-            logger.info(f"Clamped coordinates to ({x}, {y})")
-        
-        # Try different movement methods with retry
         success = False
         errors = []
         
         for attempt in range(retry_count + 1):
             if attempt > 0:
-                logger.info(f"Retrying mouse move to ({x}, {y}), attempt {attempt}/{retry_count}")
+                logger.info(f"[MOUSE-{move_id}] Retrying mouse move to ({x}, {y}), attempt {attempt}/{retry_count}")
                 time.sleep(0.1)  # Short delay between retries
-            
-            # Method 1: Win32 API for direct positioning
+                
+            # Method 1: ctypes win32 API SetCursorPos
             try:
-                win32api.SetCursorPos((x, y))
+                logger.debug(f"[MOUSE-{move_id}] Trying SetCursorPos method to position ({x}, {y})")
+                user32.SetCursorPos(int(x), int(y))
                 
                 # Verify position
+                time.sleep(0.05)  # Wait for OS to process
                 curr_x, curr_y = win32api.GetCursorPos()
                 if abs(curr_x - x) <= 5 and abs(curr_y - y) <= 5:
-                    logger.debug(f"Successfully moved mouse to ({x}, {y}) using win32api")
+                    logger.info(f"[MOUSE-{move_id}] Successfully moved mouse to ({x}, {y}) using SetCursorPos")
+                    logger.debug(f"[MOUSE-{move_id}] Actual position after move: ({curr_x}, {curr_y})")
                     success = True
                     break
                 else:
                     error_msg = f"Mouse position verification failed: requested ({x}, {y}), got ({curr_x}, {curr_y})"
-                    logger.warning(error_msg)
-                    errors.append(f"win32api: {error_msg}")
+                    logger.warning(f"[MOUSE-{move_id}] {error_msg}")
+                    errors.append(f"SetCursorPos: {error_msg}")
             except Exception as e:
-                logger.warning(f"Error moving mouse using win32api: {e}")
-                errors.append(f"win32api: {str(e)}")
-            
-            # Method 2: Fallback to pynput
+                logger.warning(f"[MOUSE-{move_id}] Error moving mouse using SetCursorPos: {e}")
+                errors.append(f"SetCursorPos: {str(e)}")
+                
+            # Method 2: pynput (fallback)
             if not success:
                 try:
+                    logger.debug(f"[MOUSE-{move_id}] Trying pynput method to position ({x}, {y})")
                     self.mouse.position = (x, y)
                     
                     # Verify position
+                    time.sleep(0.05)  # Wait for OS to process
                     curr_x, curr_y = win32api.GetCursorPos()
                     if abs(curr_x - x) <= 5 and abs(curr_y - y) <= 5:
-                        logger.debug(f"Successfully moved mouse to ({x}, {y}) using pynput")
+                        logger.info(f"[MOUSE-{move_id}] Successfully moved mouse to ({x}, {y}) using pynput")
+                        logger.debug(f"[MOUSE-{move_id}] Actual position after move: ({curr_x}, {curr_y})")
                         success = True
                         break
                     else:
                         error_msg = f"Mouse position verification failed: requested ({x}, {y}), got ({curr_x}, {curr_y})"
-                        logger.warning(error_msg)
+                        logger.warning(f"[MOUSE-{move_id}] {error_msg}")
                         errors.append(f"pynput: {error_msg}")
                 except Exception as e:
-                    logger.warning(f"Error moving mouse using pynput: {e}")
+                    logger.warning(f"[MOUSE-{move_id}] Error moving mouse using pynput: {e}")
                     errors.append(f"pynput: {str(e)}")
-            
-            # Method 3: Use Win32 SendInput
+                    
+            # Method 3: Win32 API SendInput (fallback)
             if not success:
                 try:
-                    # Create input event structure
-                    import ctypes
+                    logger.debug(f"[MOUSE-{move_id}] Trying SendInput method to position ({x}, {y})")
+                    # Convert to normalized coordinates
                     x_norm = int(x * 65535 / self.screen_width)
                     y_norm = int(y * 65535 / self.screen_height)
                     
@@ -171,25 +277,27 @@ class MouseInput:
                     
                     pt = MOUSEINPUT(x0, y0, 0, 0x0001 | 0x8000, 0, ctypes.pointer(extra)) # MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE
                     command = INPUT(0, pt, 0)
-                    ctypes.windll.user32.SendInput(1, ctypes.pointer(command), ctypes.sizeof(command))
+                    send_result = ctypes.windll.user32.SendInput(1, ctypes.pointer(command), ctypes.sizeof(command))
+                    logger.debug(f"[MOUSE-{move_id}] SendInput returned: {send_result}")
                     
                     # Verify position
                     time.sleep(0.05)  # Wait for OS to process
                     curr_x, curr_y = win32api.GetCursorPos()
                     if abs(curr_x - x) <= 5 and abs(curr_y - y) <= 5:
-                        logger.debug(f"Successfully moved mouse to ({x}, {y}) using SendInput")
+                        logger.info(f"[MOUSE-{move_id}] Successfully moved mouse to ({x}, {y}) using SendInput")
+                        logger.debug(f"[MOUSE-{move_id}] Actual position after move: ({curr_x}, {curr_y})")
                         success = True
                         break
                     else:
                         error_msg = f"Mouse position verification failed: requested ({x}, {y}), got ({curr_x}, {curr_y})"
-                        logger.warning(error_msg)
+                        logger.warning(f"[MOUSE-{move_id}] {error_msg}")
                         errors.append(f"SendInput: {error_msg}")
                 except Exception as e:
-                    logger.warning(f"Error moving mouse using SendInput: {e}")
+                    logger.warning(f"[MOUSE-{move_id}] Error moving mouse using SendInput: {e}")
                     errors.append(f"SendInput: {str(e)}")
         
         if not success:
-            logger.error(f"All mouse movement methods failed after {retry_count+1} attempts. Errors: {errors}")
+            logger.error(f"[MOUSE-{move_id}] All mouse movement methods failed after {retry_count+1} attempts. Errors: {errors}")
         
         return success
     
@@ -206,16 +314,20 @@ class MouseInput:
         Returns:
             True if successful, False otherwise
         """
+        click_id = str(time.time())[-6:]  # Use last 6 digits of timestamp as click ID
+        logger.info(f"[CLICK-{click_id}] Clicking at ({x}, {y}) with button={button}, double={double}")
+        
         # Ensure mouse is at the target position first
         if not self.mouse_move(x, y):
-            logger.warning(f"Failed to move mouse to ({x}, {y}) for click")
+            logger.warning(f"[CLICK-{click_id}] Failed to move mouse to ({x}, {y}) for click")
             return False
             
         # Get mapped button
         try:
             btn = self.button_map.get(button.lower(), Button.left)
+            logger.debug(f"[CLICK-{click_id}] Mapped button '{button}' to {btn}")
         except Exception as e:
-            logger.error(f"Error mapping button {button}: {e}")
+            logger.error(f"[CLICK-{click_id}] Error mapping button {button}: {e}")
             return False
             
         # Try different click methods with retry
@@ -224,51 +336,61 @@ class MouseInput:
         
         for attempt in range(retry_count + 1):
             if attempt > 0:
-                logger.info(f"Retrying mouse click at ({x}, {y}), attempt {attempt}/{retry_count}")
+                logger.info(f"[CLICK-{click_id}] Retrying mouse click at ({x}, {y}), attempt {attempt}/{retry_count}")
                 # Ensure mouse is still at the position
                 if not self.mouse_move(x, y):
-                    logger.warning(f"Failed to move mouse to position for click retry")
+                    logger.warning(f"[CLICK-{click_id}] Failed to move mouse to position for click retry")
                     continue
                     
                 time.sleep(0.1)  # Short delay between retries
             
             # Method 1: pynput click
             try:
+                logger.debug(f"[CLICK-{click_id}] Trying pynput click method")
                 if double:
+                    logger.debug(f"[CLICK-{click_id}] Executing double click with pynput")
                     self.mouse.click(btn, 2)
                 else:
+                    logger.debug(f"[CLICK-{click_id}] Executing single click with pynput")
                     self.mouse.click(btn)
                 
+                logger.info(f"[CLICK-{click_id}] Click with pynput successful")
                 success = True
                 break
             except Exception as e:
-                logger.warning(f"Error clicking using pynput: {e}")
+                logger.warning(f"[CLICK-{click_id}] Error clicking using pynput: {e}")
                 errors.append(f"pynput: {str(e)}")
             
             # Method 2: pyautogui (fallback)
             if not success:
                 try:
+                    logger.debug(f"[CLICK-{click_id}] Trying pyautogui click method")
                     import pyautogui
                     btn_map = {'left': 'left', 'right': 'right', 'middle': 'middle'}
                     pyautogui_btn = btn_map.get(button.lower(), 'left')
                     
                     # Ensure position is correct in pyautogui as well
+                    logger.debug(f"[CLICK-{click_id}] Moving with pyautogui to ({x}, {y})")
                     pyautogui.moveTo(x, y)
                     
                     if double:
+                        logger.debug(f"[CLICK-{click_id}] Executing double click with pyautogui")
                         pyautogui.doubleClick(button=pyautogui_btn)
                     else:
+                        logger.debug(f"[CLICK-{click_id}] Executing single click with pyautogui")
                         pyautogui.click(button=pyautogui_btn)
                         
+                    logger.info(f"[CLICK-{click_id}] Click with pyautogui successful")
                     success = True
                     break
                 except Exception as e:
-                    logger.warning(f"Error clicking using pyautogui: {e}")
+                    logger.warning(f"[CLICK-{click_id}] Error clicking using pyautogui: {e}")
                     errors.append(f"pyautogui: {str(e)}")
                     
             # Method 3: Direct Win32 API call
             if not success:
                 try:
+                    logger.debug(f"[CLICK-{click_id}] Trying Win32 API mouse_event click method")
                     # Define button down/up event constants
                     button_down_flags = {
                         'left': 0x0002,     # MOUSEEVENTF_LEFTDOWN
@@ -286,25 +408,29 @@ class MouseInput:
                     up_flag = button_up_flags.get(button.lower(), 0x0004)  # Default to left button
                     
                     # Perform the click
+                    logger.debug(f"[CLICK-{click_id}] Sending mouse_event down with flag {down_flag}")
                     user32.mouse_event(down_flag, 0, 0, 0, 0)
                     time.sleep(0.05)
+                    logger.debug(f"[CLICK-{click_id}] Sending mouse_event up with flag {up_flag}")
                     user32.mouse_event(up_flag, 0, 0, 0, 0)
                     
                     if double:
+                        logger.debug(f"[CLICK-{click_id}] Sending second click for double-click")
                         time.sleep(0.05)
                         user32.mouse_event(down_flag, 0, 0, 0, 0)
                         time.sleep(0.05)
                         user32.mouse_event(up_flag, 0, 0, 0, 0)
                     
+                    logger.info(f"[CLICK-{click_id}] Click with mouse_event successful")
                     success = True
                     break
                 except Exception as e:
-                    logger.warning(f"Direct Win32 click failed: {e}")
-                    errors.append(f"win32: {str(e)}")
-            
+                    logger.warning(f"[CLICK-{click_id}] Error clicking using mouse_event: {e}")
+                    errors.append(f"mouse_event: {str(e)}")
+        
         if not success:
-            logger.error(f"All click methods failed for {button} button at ({x}, {y}): {errors}")
-            
+            logger.error(f"[CLICK-{click_id}] All click methods failed after {retry_count+1} attempts. Errors: {errors}")
+        
         return success
     
     def mouse_drag(self, start: Tuple[int, int], end: Tuple[int, int], 

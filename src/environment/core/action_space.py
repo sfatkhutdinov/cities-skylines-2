@@ -137,20 +137,24 @@ class ActionSpace:
         return default_width, default_height
     
     def get_action(self, action_idx: int) -> Dict[str, Any]:
-        """Get action parameters for a given action index.
+        """Get action dictionary for the given action index.
         
         Args:
-            action_idx: Index of the action
+            action_idx: Index of the action to get
             
         Returns:
-            Dict: Action parameters
+            Dict with action parameters
         """
-        # Ensure valid action index
+        # Check if action index is valid
         if action_idx < 0 or action_idx >= self.num_actions:
-            logger.warning(f"Invalid action index: {action_idx}, using no-op action")
-            return self.actions[0]  # Use first action as no-op
+            logger.warning(f"Invalid action index: {action_idx}, using random action")
+            # Return a random action instead
+            action_idx = self.sample()
             
-        return self.actions[action_idx]
+        # Get action info
+        action_info = self.actions[action_idx]
+        logger.critical(f"ACTION SPACE: Returning action for index {action_idx}: {action_info}")
+        return action_info
     
     def sample(self) -> int:
         """Sample a random action from the action space.

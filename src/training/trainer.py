@@ -233,7 +233,9 @@ class Trainer:
         Returns:
             Tuple of (experiences, total_reward, steps)
         """
+        logger.critical("===== STARTING TRAJECTORY COLLECTION =====")
         state = self.env.reset()
+        logger.critical(f"Environment reset complete. Observation shape: {state.shape}")
         
         experiences = []
         done = False
@@ -250,27 +252,33 @@ class Trainer:
         max_crash_wait_steps = 60  # Maximum steps to wait for game restart
         
         for step in range(self.max_steps):
+            logger.critical(f"--- Trajectory Step {step} ---")
             # Check if exit requested
             if is_exit_requested():
                 logger.info("Exit requested during trajectory collection, stopping early")
                 break
                 
             # Select action
+            logger.critical("Selecting action from policy...")
             action, log_prob, value = self.agent.select_action(state)
+            logger.critical(f"Selected action: {action}")
             
             # Record action for visualization
             self.visualizer.record_action_count(action)
             
             # Check if we're in a menu before taking action
             if hasattr(self.env, 'check_menu_state'):
+                logger.critical("Checking menu state before action...")
                 pre_action_in_menu = self.env.check_menu_state()
+                logger.critical(f"Menu state before action: {pre_action_in_menu}")
                 
                 if pre_action_in_menu:
                     consecutive_menu_steps += 1
+                    logger.critical(f"In menu for {consecutive_menu_steps} consecutive steps")
                     
                     # If stuck in menu for too long, try recovery
                     if consecutive_menu_steps >= 3:
-                        logger.info(f"Stuck in menu for {consecutive_menu_steps} steps, attempting recovery")
+                        logger.critical(f"Stuck in menu for {consecutive_menu_steps} steps, attempting recovery")
                         try:
                             self.env.input_simulator.handle_menu_recovery(retries=2)
                         except Exception as e:
@@ -279,13 +287,34 @@ class Trainer:
                         # Re-check menu state after recovery attempt
                         in_menu = self.env.check_menu_state()
                         if not in_menu:
-                            logger.info("Successfully recovered from menu state")
+                            logger.critical("Successfully recovered from menu state")
                             consecutive_menu_steps = 0
                 else:
                     consecutive_menu_steps = 0
             
             # Take action in environment
-            next_state, reward, done, info = self.env.step(action)
+            logger.critical(f"Executing action {action} in environment...")
+            # Try to ensure the window has focus
+            if hasattr(self.env, 'error_recovery') and hasattr(self.env.error_recovery, 'focus_game_window'):
+                logger.critical("Attempting to focus game window before taking action...")
+                focus_success = self.env.error_recovery.focus_game_window()
+                logger.critical(f"Window focus attempt {'succeeded' if focus_success else 'failed'}")
+            
+            try:
+                next_state, reward, done, info = self.env.step(action)
+                logger.critical(f"Step complete with reward: {reward}, done: {done}")
+                if info:
+                    logger.critical(f"Step info: {info}")
+            except Exception as e:
+                logger.critical(f"ERROR during environment step: {e}")
+                import traceback
+                logger.critical(f"Traceback: {traceback.format_exc()}")
+                # Continue with a failed state
+                done = True
+                reward = -10.0
+                next_state = state
+                info = {"error": str(e)}
+                logger.critical("Using fallback state due to error")
             
             # Store in experience buffer
             experience = (state, action, reward, next_state, done, log_prob, value)
@@ -298,26 +327,30 @@ class Trainer:
             
             # Check for menu transitions if supported
             if hasattr(self.env, 'check_menu_state'):
+                logger.critical("Checking menu state after action...")
                 post_action_in_menu = self.env.check_menu_state()
+                logger.critical(f"Menu state after action: {post_action_in_menu}")
                 
                 # Detect menu transitions
                 if post_action_in_menu != in_menu:
                     menu_transition_count += 1
-                    logger.debug(f"Menu transition detected: {in_menu} -> {post_action_in_menu}")
+                    logger.critical(f"Menu transition detected: {in_menu} -> {post_action_in_menu}")
                 
                 in_menu = post_action_in_menu
             
             # Check for game crashes if supported
             if hasattr(self.env, 'check_game_running') and hasattr(self.env, 'restart_game'):
+                logger.critical("Checking if game is running...")
                 game_running = self.env.check_game_running()
+                logger.critical(f"Game running status: {game_running}")
                 
                 if not game_running:
                     game_crash_wait_count += 1
-                    logger.warning(f"Game appears to have crashed or is not responding. Waiting ({game_crash_wait_count}/{max_crash_wait_steps})")
+                    logger.critical(f"Game appears to have crashed or is not responding. Waiting ({game_crash_wait_count}/{max_crash_wait_steps})")
                     
                     # After waiting a bit, try to restart
                     if game_crash_wait_count >= max_crash_wait_steps:
-                        logger.warning("Attempting to restart the game")
+                        logger.critical("Attempting to restart the game")
                         try:
                             self.env.restart_game()
                             # Reset counters and state
@@ -332,8 +365,11 @@ class Trainer:
                 self.env.render()
                 
             if done:
+                logger.critical(f"Episode done after {steps} steps with total reward {total_reward}")
                 break
                 
+        logger.critical(f"===== TRAJECTORY COLLECTION COMPLETE =====")
+        logger.critical(f"Total steps: {steps}, Total reward: {total_reward}")
         return experiences, total_reward, steps
     
     def train_episode(
@@ -352,14 +388,17 @@ class Trainer:
         Returns:
             Dict with episode metrics
         """
+        logger.critical(f"===== STARTING EPISODE {episode_num} =====")
         # Check if using mock environment
         using_mock = hasattr(self.env, '_update_city_state')
+        logger.critical(f"Using mock environment: {using_mock}")
         
         # Set agent to training mode
         self.agent.train()
         
         # Get max steps for this episode
         max_steps = max_steps or self.max_steps
+        logger.critical(f"Episode configured for max_steps={max_steps}")
         
         # Start episode timer
         episode_start_time = time.time()
@@ -369,7 +408,9 @@ class Trainer:
             self.performance_safeguards.reset()
         
         # Reset environment and get initial state
+        logger.critical("About to reset environment...")
         state = self.env.reset()
+        logger.critical(f"Environment reset complete. Observation shape: {state.shape if hasattr(state, 'shape') else 'unknown'}")
         
         # Initialize episode variables
         step = 0
@@ -387,8 +428,10 @@ class Trainer:
         using_mixed_precision = self.config.use_mixed_precision and torch_amp_available
         scaler = torch.cuda.amp.GradScaler() if using_mixed_precision else None
         
+        logger.critical("Starting episode loop...")
         # Main episode loop
         while not done and step < max_steps:
+            logger.critical(f"--- Step {step} ---")
             # Get step start time for timing
             step_start_time = time.time()
             
@@ -397,62 +440,81 @@ class Trainer:
             
             # Check for early termination request
             if is_exit_requested():
-                logger.info("Exit requested, ending episode early")
+                logger.critical("Exit requested, ending episode early")
                 break
             
             # Select action using agent policy
+            logger.critical("Selecting action from policy...")
             with torch.set_grad_enabled(False):
                 action, log_prob, value = self.agent.select_action(state)
+            logger.critical(f"Selected action: {action}")
             
             # Track action distribution
             action_counts[action] = action_counts.get(action, 0) + 1
             
             # Execute action in environment
-            next_state, reward, done, info = self.env.step(action)
-            
-            # Check for invalid observation
-            if not torch.isfinite(next_state).all():
-                logger.warning(f"Episode {episode_num}, step {step}: Invalid observation detected")
+            logger.critical(f"Executing action {action} in environment...")
+            # Force window focus before each step
+            if hasattr(self.env, 'error_recovery') and hasattr(self.env.error_recovery, 'focus_game_window'):
+                focus_success = self.env.error_recovery.focus_game_window()
+                logger.critical(f"Pre-step window focus {'succeeded' if focus_success else 'failed'}")
+                
+            try:
+                next_state, reward, done, info = self.env.step(action)
+                logger.critical(f"Step complete. Reward: {reward}, Done: {done}")
+                if info:
+                    logger.critical(f"Step info: {info}")
+            except Exception as e:
+                logger.critical(f"ERROR during environment step: {e}")
+                import traceback
+                logger.critical(f"Traceback: {traceback.format_exc()}")
+                # Mark observation as invalid for error handling below
                 observation_valid = False
+                next_state = state
+                reward = -10.0
+                done = True
+                info = {"error": str(e)}
                 error_states += 1
-                
-                # If using mock environment, we can recover with the previous state
-                if using_mock:
-                    next_state = state
-                    reward = -1.0  # Penalty for invalid state
-                
-                # In real environment, we'll rely on the error recovery system
-                # which should have already handled the issue
+                logger.critical("Marked state as invalid due to exception")
             
-            # Handle menu detection (if available in info)
-            current_in_menu = info.get('in_menu', False)
-            if current_in_menu:
-                menu_duration += 1
-                
-                # Penalize menu actions in agent (if supported)
-                if hasattr(self.agent, 'register_menu_action') and not in_menu:
-                    # First frame of menu detection
-                    self.agent.register_menu_action(action)
-                
-                # Update menu state
-                if not in_menu:
-                    logger.debug(f"Episode {episode_num}, step {step}: Menu detected")
-                in_menu = True
-            else:
+            # Detect menu or invalid state
+            if hasattr(self.env, 'check_menu_state'):
+                pre_menu = in_menu
+                in_menu = self.env.check_menu_state()
                 if in_menu:
-                    logger.debug(f"Episode {episode_num}, step {step}: Exited menu after {menu_duration} steps")
-                    menu_duration = 0
-                in_menu = False
+                    menu_duration += 1
+                    logger.critical(f"Menu detected. Menu duration: {menu_duration}")
+                
+                # Log menu transitions
+                if pre_menu != in_menu:
+                    logger.critical(f"Menu transition: {pre_menu} -> {in_menu}")
             
-            # Store experience if observation is valid
+            # Handle invalid observations
+            if not observation_valid or (hasattr(self.env, 'is_observation_valid') and not self.env.is_observation_valid(next_state)):
+                error_states += 1
+                done = True
+                reward = -10.0  # Penalty for invalid state
+                logger.critical(f"Invalid observation detected. Error states: {error_states}")
+                if not done:
+                    # If not already done, use the last valid state
+                    next_state = state
+                    logger.critical("Using last valid state due to invalid observation")
+            
+            # Store experience for updates
+            if observation_valid and (not hasattr(self.env, 'is_observation_valid') or self.env.is_observation_valid(next_state)):
+                # Only store valid experiences
+                if step == 0:
+                    logger.critical("Storing first experience for policy update")
+                experience = (state, action, reward, next_state, done, log_prob, value)
+                experiences.append(experience)
+                logger.critical(f"Added experience to buffer. Buffer size now: {len(experiences)}")
+            
+            # Update state for next iteration
             if observation_valid:
-                experiences.append((state, action, reward, next_state, done, log_prob, value))
-                
-                # Update total reward
-                total_reward += reward
-                
-                # Update state
                 state = next_state
+            
+            # Update running totals
+            total_reward += reward
             
             # Increment step counter
             step += 1
@@ -460,6 +522,7 @@ class Trainer:
             
             # Calculate step time
             step_time = time.time() - step_start_time
+            logger.critical(f"Step took {step_time:.3f}s")
             
             # Check for resource limits and throttle if needed
             if self.performance_safeguards and step % 10 == 0:
@@ -468,11 +531,12 @@ class Trainer:
                 # Apply throttling if needed
                 throttle_time = self.performance_safeguards.get_throttle_time()
                 if throttle_time > 0:
-                    logger.debug(f"Throttling for {throttle_time:.2f}s due to resource limits")
+                    logger.critical(f"Throttling for {throttle_time:.2f}s due to resource limits")
                     time.sleep(throttle_time)
             
             # Periodically run updates if we have enough experiences
             if len(experiences) >= self.agent.update_frequency and step % self.agent.update_frequency == 0:
+                logger.critical(f"Updating policy with {len(experiences)} experiences")
                 self._update_policy(experiences, scaler=scaler)
                 experiences = []
                 
@@ -496,10 +560,16 @@ class Trainer:
         
         # Final update with remaining experiences
         if len(experiences) > 0:
+            logger.critical(f"Final policy update with {len(experiences)} experiences")
             self._update_policy(experiences, scaler=scaler)
         
         # Calculate episode duration
         episode_duration = time.time() - episode_start_time
+        
+        logger.critical(f"===== EPISODE {episode_num} COMPLETED =====")
+        logger.critical(f"Total steps: {step}")
+        logger.critical(f"Total reward: {total_reward}")
+        logger.critical(f"Duration: {episode_duration:.2f}s")
         
         # Update stats
         self.episode_rewards.append(total_reward)
@@ -568,20 +638,22 @@ class Trainer:
         """
         self.train_start_time = time.time()
         
-        logger.info(f"Starting training from episode {self.start_episode} to {self.num_episodes}")
+        logger.critical(f"Starting training from episode {self.start_episode} to {self.num_episodes}")
         
         # Training loop
         for episode in range(self.start_episode, self.num_episodes):
             # Check if exit requested
             if is_exit_requested():
-                logger.info("Exit requested, stopping training loop")
+                logger.critical("Exit requested, stopping training loop")
                 break
             
             # Train for one episode
+            logger.critical(f"Calling train_episode for episode {episode}")
             stats = self.train_episode(episode, render)
+            logger.critical(f"train_episode returned stats: {stats}")
             
             # Log episode results
-            logger.info(
+            logger.critical(
                 f"Episode {episode}: reward={stats['reward']:.2f}, steps={stats['steps']}, "
                 f"mean_reward={stats['mean_reward_100']:.2f}, duration={stats['duration']:.2f}s"
             )
@@ -596,11 +668,11 @@ class Trainer:
             
             # Check for autosave
             if self.checkpoint_manager.should_autosave():
-                logger.info("Performing autosave...")
+                logger.critical("Performing autosave...")
                 self._save_checkpoint(episode, is_backup=True)
         
         # Final checkpoint
-        logger.info("Training complete, saving final checkpoint")
+        logger.critical("Training complete, saving final checkpoint")
         self._save_checkpoint(self.num_episodes-1)
         
         # Final visualizations
@@ -621,10 +693,10 @@ class Trainer:
             'duration_formatted': f"{int(hours)}h {int(minutes)}m {seconds:.2f}s"
         }
         
-        logger.info(f"Training completed in {summary['duration_formatted']}")
-        logger.info(f"Total steps: {summary['total_steps']}")
-        logger.info(f"Best reward: {summary['best_reward']}")
-        logger.info(f"Final mean reward: {summary['final_mean_reward']}")
+        logger.critical(f"Training completed in {summary['duration_formatted']}")
+        logger.critical(f"Total steps: {summary['total_steps']}")
+        logger.critical(f"Best reward: {summary['best_reward']}")
+        logger.critical(f"Final mean reward: {summary['final_mean_reward']}")
         
         return summary
     
