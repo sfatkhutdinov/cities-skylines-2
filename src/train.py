@@ -188,6 +188,7 @@ def main():
             'num_episodes': args.num_episodes,
             'max_steps': args.max_steps,
             'checkpoint_dir': args.checkpoint_dir,
+            'tensorboard_dir': 'logs',  # Add explicit tensorboard_dir parameter
             'checkpoint_freq': args.checkpoint_interval if hasattr(args, 'checkpoint_interval') else 10,
             'learning_rate': args.learning_rate if hasattr(args, 'learning_rate') else 0.0003,
             'early_stop_reward': args.early_stop_reward if hasattr(args, 'early_stop_reward') else None,
@@ -223,7 +224,8 @@ def main():
             agent=agent,
             env=_environment,
             config=hardware_config,
-            checkpoint_dir=trainer_config['checkpoint_dir']
+            checkpoint_dir=trainer_config['checkpoint_dir'],
+            tensorboard_dir=trainer_config['tensorboard_dir']
         )
         
         # Train the agent

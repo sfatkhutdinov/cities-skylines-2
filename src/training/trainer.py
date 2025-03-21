@@ -88,7 +88,8 @@ class Trainer:
         self.total_steps = 0
         
         # Initialize metrics visualization
-        self.visualizer = TrainingVisualizer(os.path.join(tensorboard_dir, f"training_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.visualizer = TrainingVisualizer(os.path.join(tensorboard_dir, f"training_{run_timestamp}"))
         
         # PPO parameters
         self.gamma = get_config_value("gamma", 0.99)
@@ -134,16 +135,19 @@ class Trainer:
         
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=os.path.join(checkpoint_dir, "checkpoints"),
+            checkpoint_dir=checkpoint_dir,
             max_checkpoints=get_config_value("max_checkpoints", 5)
         )
         
+        # Load checkpoint if available
+        self._load_checkpoint()
+        
         # Initialize tensorboard writer
-        self.writer = SummaryWriter(log_dir=os.path.join(tensorboard_dir, "logs"))
+        self.writer = SummaryWriter(log_dir=tensorboard_dir)
         
         # Initialize visualizer
         self.visualizer = TrainingVisualizer(
-            log_dir=os.path.join(tensorboard_dir, "logs")
+            log_dir=tensorboard_dir
         )
         
         # Training metrics
@@ -827,6 +831,13 @@ class Trainer:
                 
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+    
+    def request_exit(self):
+        """Request the trainer to exit cleanly.
+        This method is called by signal handlers to request a clean exit."""
+        logger.info("Exit requested for trainer")
+        # Use the signal_handlers module to set the global exit flag
+        request_exit()
             
     def evaluate(self, num_episodes: int = 5, render: bool = True) -> Dict[str, Any]:
         """Evaluate the agent without training.
