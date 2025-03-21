@@ -525,4 +525,102 @@ class HierarchicalTrainer(MemoryTrainer):
             logger.error(f"Error loading checkpoint: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return False 
+            return False
+    
+    def _update_policy(self, experiences, scaler=None):
+        """Update policy with experiences.
+        
+        Args:
+            experiences: List of experiences to update from
+            scaler: Optional GradScaler for mixed precision
+            
+        Returns:
+            Dict with training metrics
+        """
+        # Call the update_policy method which exists in the base class
+        if len(experiences) == 0:
+            return {}
+            
+        # Extract experience components
+        states = [e[0] for e in experiences]
+        actions = torch.tensor([e[1] for e in experiences], device=self.device)
+        rewards = [e[2] for e in experiences]
+        next_states = [e[3] for e in experiences]
+        dones = torch.tensor([e[4] for e in experiences], device=self.device)
+        old_log_probs = torch.tensor([e[5] for e in experiences], device=self.device)
+        old_values = torch.tensor([e[6] for e in experiences], device=self.device) if len(experiences[0]) > 6 else None
+        
+        # Compute returns and advantages
+        returns, advantages = self.compute_returns_and_advantages(rewards, old_values, dones)
+        
+        # Convert to tensors
+        returns = torch.tensor(returns, device=self.device)
+        advantages = torch.tensor(advantages, device=self.device)
+        
+        # Update the policy
+        return self.update_policy(states, actions, old_log_probs, returns, advantages, old_values)
+    
+    def compute_returns_and_advantages(self, rewards, values, dones):
+        """
+        Compute returns and advantages for PPO.
+        
+        Args:
+            rewards (list): List of rewards for each timestep
+            values (list): List of value estimates for each timestep
+            dones (list): List of done flags for each timestep
+            
+        Returns:
+            tuple: (returns, advantages) as lists
+        """
+        # Convert rewards to tensor if not already
+        if not isinstance(rewards, torch.Tensor):
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        
+        # Get parameters for advantage calculation
+        gamma = 0.99  # Default value
+        gae_lambda = 0.95  # Default value
+        normalize_advantages = True  # Default value
+        
+        # Try to get parameters from class attributes if they exist
+        if hasattr(self, 'gamma'):
+            gamma = self.gamma
+        if hasattr(self, 'gae_lambda'):
+            gae_lambda = self.gae_lambda
+        if hasattr(self, 'normalize_advantages'):
+            normalize_advantages = self.normalize_advantages
+        
+        # Initialize arrays for returns and advantages
+        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
+        next_value = 0
+        next_advantage = 0
+        
+        # Make sure dones is a float tensor, not a boolean tensor
+        if isinstance(dones, list):
+            dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        elif dones.dtype == torch.bool:
+            dones = dones.float()
+        
+        # Compute advantages and returns in reverse order
+        for t in reversed(range(len(rewards))):
+            # For the last state, there is no next state, so we bootstrap
+            # with the current value function
+            if t == len(rewards) - 1:
+                next_value = values[t].item()
+            else:
+                next_value = values[t + 1].item()
+            
+            # Compute TD error and advantage
+            delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+            advantages[t] = delta + gamma * gae_lambda * (1 - dones[t]) * next_advantage
+            next_advantage = advantages[t].item()
+            
+            # Compute returns (for PPO update)
+            returns[t] = advantages[t] + values[t]
+        
+        # Normalize advantages if required
+        if normalize_advantages and len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Return as lists for compatibility with update_policy
+        return returns.tolist(), advantages.tolist() 

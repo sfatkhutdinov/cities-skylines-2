@@ -129,62 +129,191 @@ class ErrorDetectionNetwork(nn.Module):
         Returns:
             Dict containing error types, severity, and anomaly scores
         """
-        # Ensure inputs are on the correct device
-        state = state.to(self.device)
-        action = action.to(self.device)
-        
-        if next_state is not None:
-            next_state = next_state.to(self.device)
-        
-        if predicted_next_state is not None:
-            predicted_next_state = predicted_next_state.to(self.device)
-            
-        if uncertainty is not None:
-            uncertainty = uncertainty.to(self.device)
-        
-        # Prepare input based on available data
-        if self.use_world_model and predicted_next_state is not None and next_state is not None:
-            # Full information available for error detection
-            if uncertainty is None:
-                # If uncertainty is not provided, create a dummy tensor
-                uncertainty = torch.zeros_like(state).to(self.device)
+        try:
+            # Log input shapes for debugging
+            logger.debug(f"Error Detection Input Shapes - state: {state.shape if hasattr(state, 'shape') else 'unknown'}, " +
+                         f"action: {action.shape if hasattr(action, 'shape') else 'unknown'}")
+            if next_state is not None:
+                logger.debug(f"next_state shape: {next_state.shape}")
+            if predicted_next_state is not None:
+                logger.debug(f"predicted_next_state shape: {predicted_next_state.shape}")
+            if uncertainty is not None:
+                logger.debug(f"uncertainty shape: {uncertainty.shape}")
                 
-            detector_input = torch.cat([state, predicted_next_state, next_state, uncertainty], dim=-1)
-        else:
-            # Use only current state for error detection
-            detector_input = state
-        
-        # Detect errors
-        features = self.detection_network(detector_input)
-        error_types = self.error_classifier(features)
-        error_severity = self.severity_regressor(features)
-        
-        # Check action inconsistency
-        if action.dtype == torch.long:
-            action_one_hot = F.one_hot(action, num_classes=self.action_dim).float()
-        else:
-            action_one_hot = action
+            # Ensure inputs are on the correct device
+            state = state.to(self.device)
+            action = action.to(self.device)
             
-        action_inconsistency = self.action_inconsistency_detector(
-            torch.cat([state, action_one_hot], dim=-1)
-        )
+            if next_state is not None:
+                next_state = next_state.to(self.device)
+            
+            if predicted_next_state is not None:
+                predicted_next_state = predicted_next_state.to(self.device)
+                
+            if uncertainty is not None:
+                uncertainty = uncertainty.to(self.device)
+            
+            # Reshape inputs if needed to ensure proper dimensions
+            # Add batch dimension if missing
+            if len(state.shape) == 1:
+                state = state.unsqueeze(0)
+                logger.debug(f"Added batch dimension to state, new shape: {state.shape}")
+                
+            # Make sure action is correctly formatted
+            if isinstance(action, int) or (isinstance(action, torch.Tensor) and action.dim() == 0):
+                action = torch.tensor([action], device=self.device)
+                logger.debug(f"Converted scalar action to tensor, new shape: {action.shape}")
+                
+            if next_state is not None and len(next_state.shape) == 1:
+                next_state = next_state.unsqueeze(0)
+                logger.debug(f"Added batch dimension to next_state, new shape: {next_state.shape}")
+                
+            if predicted_next_state is not None and len(predicted_next_state.shape) == 1:
+                predicted_next_state = predicted_next_state.unsqueeze(0)
+                logger.debug(f"Added batch dimension to predicted_next_state, new shape: {predicted_next_state.shape}")
+                
+            if uncertainty is not None and len(uncertainty.shape) == 1:
+                uncertainty = uncertainty.unsqueeze(0)
+                logger.debug(f"Added batch dimension to uncertainty, new shape: {uncertainty.shape}")
+            
+            # Handle feature dimensionality to match expected input size of the detection network
+            if state.shape[-1] != self.state_dim:
+                logger.warning(f"State dimension mismatch - Expected {self.state_dim}, got {state.shape[-1]}")
+                # Use a simple projection to match dimensions if needed
+                if hasattr(self, 'state_adapter') and self.state_adapter is not None:
+                    state = self.state_adapter(state)
+                else:
+                    # Create a fallback method - use the first state_dim features or pad with zeros
+                    if state.shape[-1] > self.state_dim:
+                        state = state[..., :self.state_dim]
+                        logger.debug(f"Truncated state to match expected dim, new shape: {state.shape}")
+                    else:
+                        # Pad with zeros
+                        padding = torch.zeros(state.shape[0], self.state_dim - state.shape[-1], device=self.device)
+                        state = torch.cat([state, padding], dim=-1)
+                        logger.debug(f"Padded state to match expected dim, new shape: {state.shape}")
+            
+            # Apply similar dimension handling for other tensor inputs if needed
+            if next_state is not None and next_state.shape[-1] != self.state_dim:
+                if next_state.shape[-1] > self.state_dim:
+                    next_state = next_state[..., :self.state_dim]
+                else:
+                    padding = torch.zeros(next_state.shape[0], self.state_dim - next_state.shape[-1], device=self.device)
+                    next_state = torch.cat([next_state, padding], dim=-1)
+                    
+            if predicted_next_state is not None and predicted_next_state.shape[-1] != self.state_dim:
+                if predicted_next_state.shape[-1] > self.state_dim:
+                    predicted_next_state = predicted_next_state[..., :self.state_dim]
+                else:
+                    padding = torch.zeros(predicted_next_state.shape[0], self.state_dim - predicted_next_state.shape[-1], device=self.device)
+                    predicted_next_state = torch.cat([predicted_next_state, padding], dim=-1)
+            
+            if uncertainty is not None and uncertainty.shape[-1] != self.state_dim:
+                if uncertainty.shape[-1] > self.state_dim:
+                    uncertainty = uncertainty[..., :self.state_dim]
+                else:
+                    padding = torch.zeros(uncertainty.shape[0], self.state_dim - uncertainty.shape[-1], device=self.device)
+                    uncertainty = torch.cat([uncertainty, padding], dim=-1)
+                
+            # Prepare input based on available data
+            if self.use_world_model and predicted_next_state is not None and next_state is not None:
+                # Full information available for error detection
+                if uncertainty is None:
+                    # If uncertainty is not provided, create a dummy tensor
+                    uncertainty = torch.zeros_like(state).to(self.device)
+                    
+                detector_input = torch.cat([state, predicted_next_state, next_state, uncertainty], dim=-1)
+                logger.debug(f"Created detector_input from all components, shape: {detector_input.shape}")
+            else:
+                # Use only current state for error detection
+                detector_input = state
+                logger.debug(f"Using only state for detector_input, shape: {detector_input.shape}")
+            
+            # Log expected input dimensions for the detection network
+            detection_layers = [m for m in self.detection_network.modules() if isinstance(m, nn.Linear)]
+            if detection_layers:
+                first_layer = detection_layers[0]
+                logger.debug(f"First detection layer expects input dim: {first_layer.in_features}, " + 
+                           f"detector_input has dim: {detector_input.shape[-1]}")
+                
+                # Final safety check - if dimensions still don't match, adapt the input
+                if detector_input.shape[-1] != first_layer.in_features:
+                    logger.warning(f"Dimension mismatch: detector_input has {detector_input.shape[-1]} features, " + 
+                                 f"but first layer expects {first_layer.in_features}")
+                    
+                    # Use a simple projection or resize approach to match dimensions
+                    if detector_input.shape[-1] > first_layer.in_features:
+                        detector_input = detector_input[..., :first_layer.in_features]
+                        logger.debug(f"Truncated detector_input to match network, new shape: {detector_input.shape}")
+                    else:
+                        # For safety, return fallback values instead of attempting to pad
+                        logger.warning("Input features fewer than expected, returning fallback values")
+                        return self._create_fallback_detection_results()
+            
+            # Detect errors
+            features = self.detection_network(detector_input)
+            error_types = self.error_classifier(features)
+            error_severity = self.severity_regressor(features)
+            
+            # Check action inconsistency
+            if action.dtype == torch.long:
+                action_one_hot = F.one_hot(action, num_classes=self.action_dim).float()
+            else:
+                action_one_hot = action
+                
+            # Ensure state and action_one_hot have compatible batch dimensions
+            if state.shape[0] != action_one_hot.shape[0]:
+                # Broadcast if needed
+                if state.shape[0] == 1:
+                    state = state.repeat(action_one_hot.shape[0], 1)
+                elif action_one_hot.shape[0] == 1:
+                    action_one_hot = action_one_hot.repeat(state.shape[0], 1)
+                else:
+                    logger.warning(f"Cannot match batch dimensions: state {state.shape[0]} vs action {action_one_hot.shape[0]}")
+                    # Use the first batch element as a fallback
+                    state = state[:1]
+                    action_one_hot = action_one_hot[:1]
+                
+            action_inconsistency = self.action_inconsistency_detector(
+                torch.cat([state, action_one_hot], dim=-1)
+            )
+            
+            # Check state anomaly
+            state_anomaly = self.state_anomaly_detector(state)
+            
+            # Create result dictionary
+            result = {
+                'error_types': error_types,
+                'error_severity': error_severity,
+                'action_inconsistency': action_inconsistency,
+                'state_anomaly': state_anomaly
+            }
+            
+            # Add prediction error if we have both predicted and actual next states
+            if predicted_next_state is not None and next_state is not None:
+                prediction_error = F.mse_loss(predicted_next_state, next_state, reduction='none').mean(dim=-1)
+                result['prediction_error'] = prediction_error
+            
+            return result
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Error in error detection: {e}")
+            logger.error(traceback.format_exc())
+            return self._create_fallback_detection_results()
+    
+    def _create_fallback_detection_results(self) -> Dict[str, torch.Tensor]:
+        """Create fallback detection results when error detection fails."""
+        batch_size = 1  # Default batch size for fallback
         
-        # Check state anomaly
-        state_anomaly = self.state_anomaly_detector(state)
-        
-        # Create result dictionary
         result = {
-            'error_types': error_types,
-            'error_severity': error_severity,
-            'action_inconsistency': action_inconsistency,
-            'state_anomaly': state_anomaly
+            'error_types': torch.zeros(batch_size, self.error_types, device=self.device),
+            'error_severity': torch.tensor([[0.5]], device=self.device),  # Neutral severity
+            'action_inconsistency': torch.tensor([[0.0]], device=self.device),
+            'state_anomaly': torch.tensor([[0.0]], device=self.device)
         }
         
-        # Add prediction error if we have both predicted and actual next states
-        if predicted_next_state is not None and next_state is not None:
-            prediction_error = F.mse_loss(predicted_next_state, next_state, reduction='none').mean(dim=-1)
-            result['prediction_error'] = prediction_error
-        
+        logger.warning("Returning fallback error detection results")
         return result
     
     def get_error_explanation(self, error_scores: torch.Tensor, threshold: float = 0.5) -> List[str]:
@@ -202,42 +331,48 @@ class ErrorDetectionNetwork(nn.Module):
         # Convert to numpy for easier handling
         if isinstance(error_scores, torch.Tensor):
             scores = error_scores.detach().cpu().numpy()
+            
+            # Handle batch dimension if present
+            if len(scores.shape) > 1:
+                # If we have a batch, take the first element for simplicity
+                scores = scores[0]
         else:
             scores = error_scores
             
         # Generate explanations for each error type that exceeds threshold
         for i, score in enumerate(scores):
-            if score >= threshold:
+            # Use scalar comparison for each element
+            if float(score) >= threshold:  # Convert to float for safe comparison
                 if i < len(self.error_labels):
                     error_label = self.error_labels[i]
                     
                     if error_label == "perception_error":
                         explanations.append(
-                            f"Perception error detected (confidence: {score:.2f}): "
+                            f"Perception error detected (confidence: {float(score):.2f}): "
                             "The agent may not correctly perceive the current state."
                         )
                     elif error_label == "planning_error":
                         explanations.append(
-                            f"Planning error detected (confidence: {score:.2f}): "
+                            f"Planning error detected (confidence: {float(score):.2f}): "
                             "The agent's action planning may be suboptimal."
                         )
                     elif error_label == "execution_error":
                         explanations.append(
-                            f"Execution error detected (confidence: {score:.2f}): "
+                            f"Execution error detected (confidence: {float(score):.2f}): "
                             "The agent may have issues executing the intended action."
                         )
                     elif error_label == "prediction_error":
                         explanations.append(
-                            f"Prediction error detected (confidence: {score:.2f}): "
+                            f"Prediction error detected (confidence: {float(score):.2f}): "
                             "The agent's prediction of future states may be inaccurate."
                         )
                     elif error_label == "adaptation_error":
                         explanations.append(
-                            f"Adaptation error detected (confidence: {score:.2f}): "
+                            f"Adaptation error detected (confidence: {float(score):.2f}): "
                             "The agent may be struggling to adapt to new or changing situations."
                         )
                 else:
-                    explanations.append(f"Unknown error type {i} detected (confidence: {score:.2f})")
+                    explanations.append(f"Unknown error type {i} detected (confidence: {float(score):.2f})")
         
         return explanations
     

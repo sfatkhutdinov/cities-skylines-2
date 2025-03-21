@@ -747,8 +747,11 @@ class Trainer:
         
         logger.critical(f"Starting training from episode {self.start_episode} to {self.num_episodes}")
         
+        # Ensure at least 1 episode always runs by setting end_episode to be at least start_episode + 1
+        end_episode = max(self.start_episode + 1, self.num_episodes)
+        
         # Training loop
-        for episode in range(self.start_episode, self.num_episodes):
+        for episode in range(self.start_episode, end_episode):
             # Check if exit requested
             if is_exit_requested():
                 logger.critical("Exit requested, stopping training loop")
@@ -766,7 +769,7 @@ class Trainer:
             )
             
             # Generate visualizations periodically
-            if episode % 10 == 0 or episode == self.num_episodes - 1:
+            if episode % 10 == 0 or episode == end_episode - 1:
                 self.generate_visualizations()
             
             # Save checkpoint if needed
@@ -780,7 +783,7 @@ class Trainer:
         
         # Final checkpoint
         logger.critical("Training complete, saving final checkpoint")
-        self._save_checkpoint(self.num_episodes-1)
+        self._save_checkpoint(end_episode - 1)
         
         # Final visualizations
         self.generate_visualizations()
@@ -792,7 +795,7 @@ class Trainer:
         
         # Training summary
         summary = {
-            'total_episodes': self.num_episodes - self.start_episode,
+            'total_episodes': end_episode - self.start_episode,
             'total_steps': self.total_steps,
             'best_reward': self.best_reward,
             'final_mean_reward': sum(self.recent_rewards) / len(self.recent_rewards) if self.recent_rewards else 0,
@@ -936,7 +939,7 @@ class Trainer:
         return eval_summary
     
     def _prepare_batches(self, states, actions, log_probs, returns, advantages, values=None):
-        """Prepare batches for training, with support for sequence-based processing for LSTM.
+        """Prepare batches for training with proper sequence handling for LSTM.
         
         Args:
             states: States from experience buffer
@@ -950,9 +953,27 @@ class Trainer:
             List of batches for training
         """
         # Get sequence length from config if using LSTM
-        use_lstm = self.config.get("model", {}).get("use_lstm", False)
-        sequence_length = self.config.get("training", {}).get("sequence_length", 16) if use_lstm else 1
-        batch_size = self.config.get("training", {}).get("batch_size", 64)
+        use_lstm = False  # Default value
+        sequence_length = 1  # Default value
+        batch_size = 64  # Default value
+        
+        # Try to get values from config based on its type
+        if hasattr(self.config, "get"):
+            # Config is a dict-like object
+            use_lstm = self.config.get("model", {}).get("use_lstm", False)
+            sequence_length = self.config.get("training", {}).get("sequence_length", 16) if use_lstm else 1
+            batch_size = self.config.get("training", {}).get("batch_size", 64)
+        else:
+            # Config is likely a HardwareConfig object
+            # Try to access attributes directly
+            if hasattr(self.agent, "use_lstm"):
+                use_lstm = self.agent.use_lstm
+            if hasattr(self, "sequence_length"):
+                sequence_length = self.sequence_length
+            elif use_lstm:
+                sequence_length = 16  # Default for LSTM
+            if hasattr(self, "batch_size"):
+                batch_size = self.batch_size
         
         # Convert to tensors if they aren't already
         if not isinstance(states, torch.Tensor):
@@ -1096,20 +1117,51 @@ class Trainer:
         return batches
     
     def update_policy(self, states, actions, log_probs, returns, advantages, values=None):
-        """Update policy with PPO using properly batched sequences for LSTM.
+        """Update policy using the collected experiences.
         
         Args:
             states: States from experience buffer
-            actions: Actions from experience buffer
+            actions: Actions from experience buffer  
             log_probs: Log probabilities from experience buffer
             returns: Returns from experience buffer
             advantages: Advantages from experience buffer
             values: Values from experience buffer (optional)
             
         Returns:
-            Dict with training metrics
+            Dict of training statistics
         """
-        # Prepare batches with sequence handling for LSTM
+        # Get training hyperparameters
+        # Try to get values from config based on its type
+        clip_param = 0.2  # Default value
+        value_coef = 0.5  # Default value
+        entropy_coef = 0.01  # Default value
+        max_grad_norm = 0.5  # Default value
+        num_epochs = 10  # Default value
+        
+        if hasattr(self.config, "get"):
+            # Config is a dict-like object
+            clip_param = self.config.get("training", {}).get("clip_param", 0.2)
+            value_coef = self.config.get("training", {}).get("value_coef", 0.5)
+            entropy_coef = self.config.get("training", {}).get("entropy_coef", 0.01)
+            max_grad_norm = self.config.get("training", {}).get("max_grad_norm", 0.5)
+            num_epochs = self.config.get("training", {}).get("update_epochs", 10)
+        else:
+            # Config is likely a HardwareConfig object
+            # Try to access attributes directly
+            if hasattr(self, "clip_param"):
+                clip_param = self.clip_param
+            if hasattr(self, "value_coef"):
+                value_coef = self.value_coef
+            if hasattr(self, "entropy_coef"):
+                entropy_coef = self.entropy_coef
+            if hasattr(self, "max_grad_norm"):
+                max_grad_norm = self.max_grad_norm
+            if hasattr(self, "num_epochs"):
+                num_epochs = self.num_epochs
+            elif hasattr(self, "update_epochs"):
+                num_epochs = self.update_epochs
+
+        # Prepare batches for update
         batches = self._prepare_batches(states, actions, log_probs, returns, advantages, values)
         
         # Track metrics
@@ -1127,8 +1179,13 @@ class Trainer:
         update_start = time.time()
         
         # Run multiple epochs of training
-        num_epochs = self.config.get("training", {}).get("update_epochs", 10)
-        use_lstm = self.config.get("model", {}).get("use_lstm", False)
+        use_lstm = False  # Default value
+        if hasattr(self.config, "get"):
+            use_lstm = self.config.get("model", {}).get("use_lstm", False)
+        else:
+            # Config is likely a HardwareConfig object
+            if hasattr(self.agent, "use_lstm"):
+                use_lstm = self.agent.use_lstm
         
         for epoch in range(num_epochs):
             # Process each batch
@@ -1176,14 +1233,14 @@ class Trainer:
                         # PPO loss calculation
                         ratio = torch.exp(new_log_probs - step_old_log_probs)
                         surr1 = ratio * step_advantages
-                        surr2 = torch.clamp(ratio, 1.0 - self.agent.epsilon, 1.0 + self.agent.epsilon) * step_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * step_advantages
                         policy_loss = -torch.min(surr1, surr2).mean()
                         
                         # Value loss
                         value_loss = F.mse_loss(values, step_returns)
                         
                         # Total loss
-                        loss = policy_loss + self.agent.value_coef * value_loss - self.agent.entropy_coef * entropy
+                        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
                         
                         # Accumulate batch loss
                         batch_loss += loss
@@ -1199,8 +1256,8 @@ class Trainer:
                     
                     # Backward pass and update
                     batch_loss.backward()
-                    if self.agent.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), self.agent.max_grad_norm)
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), max_grad_norm)
                     self.agent.optimizer.step()
                     
                     # Update metrics
@@ -1223,19 +1280,19 @@ class Trainer:
                     
                     # Clipped surrogate objective
                     surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - self.agent.epsilon, 1.0 + self.agent.epsilon) * batch_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * batch_advantages
                     policy_loss = -torch.min(surr1, surr2).mean()
                     
                     # Value loss
                     value_loss = F.mse_loss(values, batch_returns)
                     
                     # Total loss
-                    loss = policy_loss + self.agent.value_coef * value_loss - self.agent.entropy_coef * entropy
+                    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
                     
                     # Backward pass and optimize
                     loss.backward()
-                    if self.agent.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), self.agent.max_grad_norm)
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), max_grad_norm)
                     self.agent.optimizer.step()
                     
                     # Update metrics
@@ -1244,12 +1301,15 @@ class Trainer:
                     metrics['entropy'] += entropy.item() / num_epochs
                     approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
                     metrics['approx_kl'] += approx_kl / num_epochs
-                    metrics['clip_fraction'] += ((ratio - 1.0).abs() > self.agent.epsilon).float().mean().item() / num_epochs
+                    metrics['clip_fraction'] += ((ratio - 1.0).abs() > clip_param).float().mean().item() / num_epochs
         
         # Calculate explained variance
         if values is not None:
             var_y = torch.var(returns)
-            explained_var = 1 - torch.var(returns - values) / var_y if var_y > 0 else 0
+            if var_y > 0:
+                explained_var = 1 - torch.var(returns - values) / var_y
+            else:
+                explained_var = torch.tensor(0.0, device=self.device)
             metrics['explained_variance'] = explained_var.item()
             
         # Record update time

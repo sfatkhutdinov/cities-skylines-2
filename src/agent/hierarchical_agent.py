@@ -6,6 +6,7 @@ Integrates multiple specialized neural networks in a hierarchical architecture.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import numpy as np
 import logging
 import time
@@ -159,6 +160,9 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         self.last_error_info = None
         self.last_predicted_next_state = None
         
+        # Initialize optimizer for the policy network
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=0.0003)
+        
         logger.critical(f"Initialized hierarchical agent with components: "
                        f"Visual={use_visual_network}, World={use_world_model}, "
                        f"Error={use_error_detection}")
@@ -289,10 +293,14 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                 log_prob = action_distribution.log_prob(action)
                 
                 # Extract state embedding for potential memory storage
-                state_embedding = self.policy.extract_state_embedding(processed_state, self.hidden_state)
-                
-                # Store info for experience processing
-                self.last_state_embedding = state_embedding
+                try:
+                    state_embedding = self.policy.extract_state_embedding(processed_state, self.hidden_state)
+                    # Store info for experience processing
+                    self.last_state_embedding = state_embedding
+                except Exception as e:
+                    logger.error(f"Error extracting state embedding: {e}")
+                    state_embedding = None
+                    self.last_state_embedding = None
             
             # 4. Use world model to predict the next state if enabled
             predicted_next_state = None
@@ -369,10 +377,19 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                 else:
                     state_tensor = torch.tensor(processed_state, device=self.device).float()
                     
-                state_embedding = self.policy.extract_state_embedding(state_tensor, self.hidden_state)
+                try:
+                    state_embedding = self.policy.extract_state_embedding(state_tensor, self.hidden_state)
+                except Exception as e:
+                    logger.error(f"Error extracting state embedding in process_experience: {e}")
+                    state_embedding = None
             
             # Calculate importance for memory storage
             importance = 0.5  # Default importance
+            
+            # If we still don't have a valid state embedding, skip memory operations
+            if state_embedding is None:
+                logger.warning("Skipping memory operations due to missing state embedding")
+                return False
             
             # Adjust importance based on:
             # 1. World model prediction error

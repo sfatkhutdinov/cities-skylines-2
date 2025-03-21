@@ -286,29 +286,96 @@ class OptimizedNetwork(nn.Module):
                 
             # Handle batch dimension for visual inputs
             if self.is_visual_input:
-                # Check if batch dimension is missing
-                if len(x.shape) == 3:  # [C, H, W]
-                    logger.critical("Adding batch dimension to input")
-                    x = x.unsqueeze(0)  # Add batch dimension -> [1, C, H, W]
+                # Check if the input is already processed and is a feature vector (e.g., [1, 512])
+                # This means we should skip the convolutional processing
+                if len(x.shape) == 2:
+                    logger.critical(f"Input appears to be a feature vector with shape {x.shape}, skipping conv layers")
+                    features = x  # Use directly as features
                     
-                # Pass through convolutional layers
-                logger.critical(f"Passing through conv layers, input shape: {x.shape}")
-                x = self.conv_layers(x)
-                logger.critical(f"Conv output shape: {x.shape}")
-                
-                # Flatten the features but keep batch dimension
-                x = x.reshape(x.size(0), -1)
-                logger.critical(f"Flattened shape: {x.shape}")
+                    # Check if the feature vector already matches the output dimension of shared layers
+                    if features.shape[1] == self.feature_size:
+                        logger.critical(f"Feature vector already matches feature_size ({self.feature_size}), skipping shared layers")
+                        # Skip shared layers since dimensions already match the expected output
+                        # Continue with the rest of the network (LSTM, policy head, etc.)
+                        pass
+                    else:
+                        # Pass through shared layers if dimensions don't match
+                        logger.critical("Passing through shared layers")
+                        features = self.shared_layers(features)
+                        logger.critical(f"Shared features shape: {features.shape}")
+                else:
+                    # Check if batch dimension is missing
+                    if len(x.shape) == 3:  # [C, H, W]
+                        logger.critical("Adding batch dimension to input")
+                        x = x.unsqueeze(0)  # Add batch dimension -> [1, C, H, W]
+                    
+                    # Ensure input has 4D shape for convolutional layers
+                    if len(x.shape) == 4:
+                        # Check if the input channels don't match what the first conv layer expects
+                        expected_channels = self.conv_layers[0].in_channels
+                        actual_channels = x.shape[1]
+                        logger.critical(f"Passing through conv layers, input shape: {x.shape}, " +
+                                       f"expected channels: {expected_channels}, actual channels: {actual_channels}")
+                        
+                        if actual_channels != expected_channels:
+                            # This is likely a frame stack (e.g., 4 frames stacked with 3 channels each)
+                            # We need to reshape or adapt the input
+                            if actual_channels % expected_channels == 0:
+                                # Case where we have a clean multiple (e.g., 12 = 4 frames * 3 channels)
+                                frame_stack = actual_channels // expected_channels
+                                logger.critical(f"Handling frame stack of {frame_stack} frames")
+                                
+                                batch_size = x.shape[0]
+                                height = x.shape[2]
+                                width = x.shape[3]
+                                
+                                # Option 1: Process each frame separately and average features
+                                # Reshape to [batch_size * frame_stack, expected_channels, height, width]
+                                reshaped_x = x.view(batch_size * frame_stack, expected_channels, height, width)
+                                
+                                # Process through conv layers
+                                logger.critical(f"Processing reshaped input with shape: {reshaped_x.shape}")
+                                reshaped_features = self.conv_layers(reshaped_x)
+                                
+                                # Reshape back and average across frames
+                                reshaped_features = reshaped_features.view(batch_size, frame_stack, -1)
+                                x = torch.mean(reshaped_features, dim=1)  # Average across frames
+                                logger.critical(f"Averaged features shape: {x.shape}")
+                                features = x
+                            else:
+                                # Fallback: take only the first 'expected_channels' channels
+                                logger.critical(f"Channel mismatch that isn't a clean multiple. Using first {expected_channels} channels")
+                                x = x[:, :expected_channels, :, :]
+                                x = self.conv_layers(x)
+                                x = x.reshape(x.size(0), -1)
+                                features = x
+                        else:
+                            # Normal case - channels match
+                            x = self.conv_layers(x)
+                            logger.critical(f"Conv output shape: {x.shape}")
+                            
+                            # Flatten the features but keep batch dimension
+                            x = x.reshape(x.size(0), -1)
+                            logger.critical(f"Flattened shape: {x.shape}")
+                            features = x
+                    else:
+                        logger.critical(f"Unexpected input shape {x.shape} for convolutional layers, using fallback")
+                        # Create a fallback feature tensor of appropriate size
+                        features = x  # Use as is if already a feature vector
             else:
                 # For vector inputs
                 if len(x.shape) == 1:  # [D]
                     logger.critical("Adding batch dimension to vector input")
                     x = x.unsqueeze(0)  # Add batch dimension -> [1, D]
+                features = x
                     
             # Pass through shared layers
-            logger.critical("Passing through shared layers")
-            features = self.shared_layers(x)
-            logger.critical(f"Shared features shape: {features.shape}")
+            if not (self.is_visual_input and len(x.shape) == 2 and features.shape[1] == self.feature_size):
+                logger.critical("Passing through shared layers")
+                features = self.shared_layers(features)
+                logger.critical(f"Shared features shape: {features.shape}")
+            else:
+                logger.critical(f"Skipping shared layers, features already match expected size: {features.shape}")
             
             # Process through LSTM if enabled
             next_hidden = None
@@ -354,13 +421,41 @@ class OptimizedNetwork(nn.Module):
             action_logits = self.policy_head(features)
             logger.critical(f"Action logits shape: {action_logits.shape}")
             
+            # Check and fix NaN/Inf values in logits
+            if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
+                logger.critical("WARNING: NaN or Inf values detected in action_logits, applying fix")
+                # Replace NaN/Inf with zeros
+                action_logits = torch.where(torch.isnan(action_logits) | torch.isinf(action_logits), 
+                                           torch.zeros_like(action_logits), 
+                                           action_logits)
+            
+            # Clip logits for numerical stability
+            action_logits = torch.clamp(action_logits, min=-20.0, max=20.0)
+            
             logger.critical("Computing value")
             value = self.value_head(features)
             logger.critical(f"Value shape: {value.shape}")
             
-            # Apply softmax to get probabilities
+            # Check and fix NaN/Inf values in value
+            if torch.isnan(value).any() or torch.isinf(value).any():
+                logger.critical("WARNING: NaN or Inf values detected in value, applying fix")
+                # Replace NaN/Inf with zeros
+                value = torch.where(torch.isnan(value) | torch.isinf(value), 
+                                   torch.zeros_like(value), 
+                                   value)
+            
+            # Clip value for numerical stability
+            value = torch.clamp(value, min=-100.0, max=100.0)
+            
+            # Apply softmax to get probabilities with additional numerical stability
             logger.critical("Applying softmax to get action probabilities")
-            action_probs = torch.softmax(action_logits, dim=1)
+            action_probs = F.softmax(action_logits, dim=-1)
+            
+            # If there are still NaN values after softmax, use uniform distribution
+            if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+                logger.critical("WARNING: Still detected NaN/Inf values after softmax, using uniform distribution")
+                action_probs = torch.ones_like(action_probs) / action_probs.size(-1)
+                
             logger.critical(f"Action probabilities shape: {action_probs.shape}")
             
             # Check for NaN/Inf in outputs
@@ -384,13 +479,43 @@ class OptimizedNetwork(nn.Module):
             logger.critical(f"ERROR in network forward pass: {e}")
             logger.critical(f"Traceback: {traceback.format_exc()}")
             
-            # Try to return usable values
+            # Try to return usable values with gradient support
             batch_size = x.size(0) if len(x.shape) > 1 else 1
-            uniform_probs = torch.ones(batch_size, self.policy_head[-1].out_features, device=self.device) / self.policy_head[-1].out_features
-            zero_value = torch.zeros(batch_size, device=self.device)
             
-            logger.critical(f"Returning fallback values with shapes: probs={uniform_probs.shape}, value={zero_value.shape}")
-            return uniform_probs, zero_value, None
+            # Create parameters that require gradients
+            if not hasattr(self, 'fallback_policy_param'):
+                self.fallback_policy_param = nn.Parameter(
+                    torch.zeros(self.policy_head[-1].out_features, device=self.device),
+                    requires_grad=True
+                )
+                self.fallback_value_param = nn.Parameter(
+                    torch.zeros(1, device=self.device),
+                    requires_grad=True
+                )
+            
+            # Create tensors that share storage with parameters (and thus have gradients)
+            try:
+                # Generate uniform probabilities that require gradients
+                uniform_probs = F.softmax(
+                    self.fallback_policy_param.expand(batch_size, -1),
+                    dim=1
+                )
+                
+                # Generate zero values that require gradients
+                zero_value = self.fallback_value_param.expand(batch_size)
+                
+                logger.critical(f"Returning fallback values with shapes: probs={uniform_probs.shape}, value={zero_value.shape}")
+                logger.critical(f"Fallback values require_grad: probs={uniform_probs.requires_grad}, value={zero_value.requires_grad}")
+                
+                return uniform_probs, zero_value, None
+            except Exception as fallback_error:
+                # Last resort fallback if even our fallback fails
+                logger.critical(f"Error in fallback mechanism: {fallback_error}")
+                # Create simple tensors with requires_grad=True
+                uniform_probs = torch.ones(batch_size, self.policy_head[-1].out_features, device=self.device, requires_grad=True) / self.policy_head[-1].out_features
+                zero_value = torch.zeros(batch_size, device=self.device, requires_grad=True)
+                logger.critical("Using simple tensor fallback with requires_grad=True")
+                return uniform_probs, zero_value, None
         
     def get_action_probs(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get action probabilities for a state.

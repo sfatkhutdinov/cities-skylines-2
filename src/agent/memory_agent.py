@@ -150,10 +150,14 @@ class MemoryAugmentedAgent(PPOAgent):
                 log_prob = action_distribution.log_prob(action)
                 
                 # Extract state embedding for potential memory storage
-                state_embedding = self.policy.extract_state_embedding(state, self.hidden_state)
-                
-                # Store info for experience processing
-                self.last_state_embedding = state_embedding
+                try:
+                    state_embedding = self.policy.extract_state_embedding(state, self.hidden_state)
+                    # Store info for experience processing
+                    self.last_state_embedding = state_embedding
+                except Exception as e:
+                    logger.error(f"Error extracting state embedding: {e}")
+                    state_embedding = None
+                    self.last_state_embedding = None
                 
                 # Create info dictionary
                 info = {
@@ -216,32 +220,37 @@ class MemoryAugmentedAgent(PPOAgent):
                 else:
                     state_tensor = torch.tensor(state, device=self.device).float()
                     
-                state_embedding = self.policy.extract_state_embedding(state_tensor, self.hidden_state)
+                try:
+                    state_embedding = self.policy.extract_state_embedding(state_tensor, self.hidden_state)
+                except Exception as e:
+                    logger.error(f"Error extracting state embedding in process_experience: {e}")
+                    state_embedding = None
             
             # Check if we should store this experience
-            should_store, importance = self.policy.should_store_memory(state_embedding, reward, done)
-            
-            if should_store:
-                # Prepare memory data
-                memory_data = {
-                    'state': state,
-                    'action': action,
-                    'reward': reward,
-                    'next_state': next_state,
-                    'done': done,
-                    'info': info
-                }
+            if state_embedding is not None:
+                should_store, importance = self.policy.should_store_memory(state_embedding, reward, done)
                 
-                # Store in memory
-                success = self.policy.store_memory(state_embedding, memory_data, importance)
-                
-                if success:
-                    self.memory_stats["writes"] += 1
-                    if importance > 0.7:
-                        self.memory_stats["important_experiences"] += 1
+                if should_store:
+                    # Prepare memory data
+                    memory_data = {
+                        'state': state,
+                        'action': action,
+                        'reward': reward,
+                        'next_state': next_state,
+                        'done': done,
+                        'info': info
+                    }
                     
-                    logger.info(f"Stored experience with importance {importance:.2f}")
-                    return True
+                    # Store in memory
+                    success = self.policy.store_memory(state_embedding, memory_data, importance)
+                    
+                    if success:
+                        self.memory_stats["writes"] += 1
+                        if importance > 0.7:
+                            self.memory_stats["important_experiences"] += 1
+                        
+                        logger.info(f"Stored experience with importance {importance:.2f}")
+                        return True
             
             # Add to short-term buffer regardless
             self.experience_buffer.append((state_embedding, {

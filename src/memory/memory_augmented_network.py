@@ -111,42 +111,26 @@ class MemoryAugmentedNetwork(nn.Module):
         # Process through base network first
         action_probs, value, next_hidden = self.base_network(x, hidden_state)
         
-        # Extract features/embeddings from appropriate layer
-        if self.base_network.use_lstm and next_hidden is not None:
-            # Use LSTM hidden state as the state embedding
-            state_embedding = next_hidden[0].squeeze(0)  # Use h, not c
-        else:
-            # If not using LSTM, extract features from the shared layers
-            with torch.no_grad():
-                if self.base_network.is_visual_input:
-                    # For visual inputs
-                    if len(x.shape) == 3:  # [C, H, W]
-                        x_batched = x.unsqueeze(0)
-                    else:
-                        x_batched = x
-                        
-                    features = self.base_network.conv_layers(x_batched)
-                    features = features.reshape(x_batched.size(0), -1)
-                else:
-                    # For vector inputs
-                    if len(x.shape) == 1:
-                        x_batched = x.unsqueeze(0)
-                    else:
-                        x_batched = x
-                    
-                features = self.base_network.shared_layers(x_batched)
-                state_embedding = features.squeeze(0)  # Remove batch dimension
-        
         # Only use memory if explicitly enabled and we have enough steps
         if use_memory and self.total_steps > 100:  # Allow some warm-up time
             try:
+                # Extract state embedding using the method that handles different input shapes
+                state_embedding = self.extract_state_embedding(x, next_hidden)
+                
+                # Ensure state_embedding has the correct shape
+                if len(state_embedding.shape) == 1:
+                    state_embedding = state_embedding.unsqueeze(0)  # Add batch dimension if needed
+                
                 # Get memory-augmented features
                 memory_output = self.memory_controller(state_embedding)
                 
+                # Ensure consistent dimensions for concatenation
+                if len(memory_output.shape) != len(state_embedding.shape):
+                    memory_output = memory_output.view(state_embedding.shape)
+                
                 # Calculate gate value to determine influence of memory
-                # (allows the network to decide how much to rely on memory)
-                gate_input = torch.cat([state_embedding, memory_output], dim=0)
-                gate_value = torch.sigmoid(self.memory_gate(gate_input))
+                gate_input = torch.cat([state_embedding, memory_output], dim=1)
+                gate_value = self.memory_gate(gate_input)
                 
                 # Apply gate to mix original features with memory-augmented features
                 memory_influence = gate_value * memory_output
@@ -154,13 +138,11 @@ class MemoryAugmentedNetwork(nn.Module):
                 # Add memory influence to original embeddings (residual connection)
                 augmented_embedding = state_embedding + memory_influence
                 
-                # Process augmented embedding through the base network's policy and value heads
-                # We'll need to handle this separately because we don't want to re-run the entire network
-                
-                # For now, just use the original outputs
-                # In a more advanced implementation, we would modify the action_probs and value based on memory
+                # We could use augmented embedding for further processing, but for now
+                # we'll keep the original outputs from the base network
                 
                 self.memory_usage_counter += 1
+                
             except Exception as e:
                 logger.error(f"Error in memory augmentation: {e}")
                 import traceback
@@ -231,32 +213,39 @@ class MemoryAugmentedNetwork(nn.Module):
         """
         # Extract features/embeddings from appropriate layer
         with torch.no_grad():
-            if self.base_network.use_lstm:
-                # Run forward pass to get hidden state
-                _, _, next_hidden = self.base_network(x, hidden_state)
+            if self.base_network.use_lstm and hidden_state is not None:
                 # Use LSTM hidden state as the state embedding
-                state_embedding = next_hidden[0].squeeze(0)  # Use h, not c
+                state_embedding = hidden_state[0].squeeze(0)  # Use h, not c
             else:
-                # If not using LSTM, extract features from the shared layers
+                # Process input through the base network feature extractor
+                # Ensure proper batching for convolutional layers
                 if self.base_network.is_visual_input:
-                    # For visual inputs
+                    # For visual inputs, ensure we have a batched 4D tensor
                     if len(x.shape) == 3:  # [C, H, W]
-                        x_batched = x.unsqueeze(0)
-                    else:
-                        x_batched = x
-                        
-                    features = self.base_network.conv_layers(x_batched)
-                    features = features.reshape(x_batched.size(0), -1)
-                else:
-                    # For vector inputs
-                    if len(x.shape) == 1:
-                        x_batched = x.unsqueeze(0)
+                        x_batched = x.unsqueeze(0)  # Add batch dimension -> [1, C, H, W]
                     else:
                         x_batched = x
                     
-                features = self.base_network.shared_layers(x_batched)
-                state_embedding = features.squeeze(0)  # Remove batch dimension
+                    # Use the base network's forward method first, then extract features
+                    with torch.no_grad():
+                        output = self.base_network(x_batched, None)
+                        features = self.base_network.shared_layers(output[0])
+                else:
+                    # For vector inputs
+                    if len(x.shape) == 1:
+                        x_batched = x.unsqueeze(0)  # Add batch dimension
+                    else:
+                        x_batched = x
+                    
+                    # Process vector input
+                    features = self.base_network.shared_layers(x_batched)
                 
+                # Remove batch dimension if needed
+                if len(features.shape) > 1 and features.shape[0] == 1:
+                    state_embedding = features.squeeze(0)
+                else:
+                    state_embedding = features
+        
         return state_embedding
     
     def get_memory_stats(self) -> Dict[str, Any]:
