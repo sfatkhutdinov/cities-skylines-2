@@ -11,6 +11,8 @@ import os
 import numpy as np
 from typing import Dict, Tuple, List, Any, Optional, Union
 from collections import deque
+import time
+import random
 
 from src.model.optimized_network import OptimizedNetwork
 from src.config.hardware_config import HardwareConfig
@@ -85,6 +87,11 @@ class PPOAgent:
         self.steps_taken = 0
         self.episodes_completed = 0
         
+        # Add menu action tracking to help avoid menu transitions
+        self.menu_actions = {}  # Maps action index to count of menu occurrences
+        self.menu_action_memory = 50  # Remember the last 50 menu occurrences
+        self.menu_penalty_factor = 0.5  # Penalty factor for actions that cause menus
+        
         logger.info(f"Initialized PPO agent with state_dim={state_dim}, action_dim={action_dim}, device={self.device}")
     
     def select_action(self, state, log_prob=None, value=None, deterministic: bool = False):
@@ -143,6 +150,32 @@ class PPOAgent:
             
             # Track steps
             self.steps_taken += 1
+            
+            # Apply menu action penalty to reduce likelihood of selecting
+            # actions that have frequently led to menus
+            if self.training and hasattr(self, 'get_menu_action_penalty'):
+                action_probs = info['action_probs'].clone()
+                
+                # Apply penalties to actions known to cause menus
+                for action_idx in range(self.action_dim):
+                    penalty = self.get_menu_action_penalty(action_idx)
+                    if penalty > 0:
+                        action_probs[0, action_idx] *= (1.0 - penalty)
+                        
+                # Renormalize probabilities
+                action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
+                
+                # Create new distribution
+                penalized_distribution = torch.distributions.Categorical(action_probs)
+                
+                # Sample from penalized distribution
+                if deterministic:
+                    action = torch.argmax(action_probs, dim=1)
+                else:
+                    action = penalized_distribution.sample()
+                    
+                # Get log probability from original distribution for learning
+                log_prob = info['log_prob']
             
             # Return action, log_prob, and value
             logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
@@ -576,4 +609,47 @@ class PPOAgent:
         # Update value function parameters
         self.value_function.set_params(gamma=self.gamma, gae_lambda=self.gae_lambda)
         
-        logger.info("Agent state loaded successfully") 
+        logger.info("Agent state loaded successfully")
+    
+    def update_menu_action_tracking(self, action):
+        """Track which actions tend to cause menu transitions.
+        
+        Args:
+            action: The action that led to a menu
+        """
+        if isinstance(action, torch.Tensor):
+            action = action.item()
+            
+        # Initialize counter if this is the first time seeing this action
+        if action not in self.menu_actions:
+            self.menu_actions[action] = deque(maxlen=self.menu_action_memory)
+            
+        # Add timestamp to track recency
+        self.menu_actions[action].append(time.time())
+        
+        logger.info(f"Updated menu action tracking for action {action}: {len(self.menu_actions[action])} occurrences")
+    
+    def get_menu_action_penalty(self, action):
+        """Get penalty for actions that frequently cause menus.
+        
+        Args:
+            action: The action to check
+            
+        Returns:
+            float: Penalty factor (0 to menu_penalty_factor)
+        """
+        if isinstance(action, torch.Tensor):
+            action = action.item()
+            
+        if action not in self.menu_actions or len(self.menu_actions[action]) == 0:
+            return 0.0
+            
+        # Calculate decay based on time since last occurrence
+        now = time.time()
+        recent_count = sum(1 for t in self.menu_actions[action] if now - t < 300)  # Count occurrences in last 5 minutes
+        
+        # Normalize by memory size
+        recent_ratio = recent_count / self.menu_action_memory
+        
+        # Return penalty scaled by factor
+        return recent_ratio * self.menu_penalty_factor 

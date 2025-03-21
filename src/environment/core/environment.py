@@ -649,7 +649,7 @@ class Environment:
             # If in menu, give negative reward
             if menu_detected:
                 logger.debug("Assigning negative reward for being in menu")
-                return -0.2
+                return -1.0  # Significantly higher penalty to create stronger learning signal
                 
             # If action failed, give negative reward
             if not success:

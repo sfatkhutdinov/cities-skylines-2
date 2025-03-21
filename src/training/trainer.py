@@ -574,9 +574,19 @@ class Trainer:
                     menu_duration += 1
                     logger.critical(f"Menu detected. Menu duration: {menu_duration}")
                 
-                # Log menu transitions
+                # Log menu transitions and apply immediate learning feedback
                 if pre_menu != in_menu:
-                    logger.critical(f"Menu transition: {pre_menu} -> {in_menu}")
+                    if in_menu:
+                        logger.critical(f"Menu transition: {pre_menu} -> {in_menu}")
+                        # Apply immediate additional penalty for transitioning to a menu
+                        reward -= 2.0
+                        # Record the action that led to a menu for future avoidance
+                        if hasattr(self.agent, 'update_menu_action_tracking'):
+                            self.agent.update_menu_action_tracking(action)
+                    else:
+                        logger.critical(f"Menu transition: {pre_menu} -> {in_menu}")
+                        # Give small bonus for exiting a menu
+                        reward += 0.5
             
             # Handle invalid observations
             if not observation_valid or (hasattr(self.env, 'is_observation_valid') and not self.env.is_observation_valid(next_state)):
