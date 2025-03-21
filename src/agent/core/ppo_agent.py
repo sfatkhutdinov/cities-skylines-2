@@ -58,8 +58,40 @@ class PPOAgent:
         self.state_dim = state_dim
         self.action_dim = action_dim
         
-        # Create neural network
-        self.network = OptimizedNetwork(state_dim, action_dim, device=self.device)
+        # Create neural network with proper parameters based on state shape
+        if isinstance(state_dim, tuple):
+            if len(state_dim) == 3:  # Visual input (channels, height, width)
+                input_channels = state_dim[0]
+                frame_size = (state_dim[1], state_dim[2])
+                is_visual_input = True
+            elif len(state_dim) == 1:  # Vector input (size,)
+                input_channels = state_dim[0]
+                frame_size = (1, 1)  # Dummy size for vector input
+                is_visual_input = False
+            else:
+                raise ValueError(f"Unsupported state shape: {state_dim}")
+        elif isinstance(state_dim, int):  # Vector input as int
+            input_channels = state_dim
+            frame_size = (1, 1)
+            is_visual_input = False
+        else:
+            raise ValueError(f"Unsupported state_dim type: {type(state_dim)}")
+            
+        logger.info(f"Creating OptimizedNetwork with input_channels={input_channels}, "
+                   f"frame_size={frame_size}, is_visual_input={is_visual_input}")
+        
+        self.network = OptimizedNetwork(
+            input_channels=input_channels,
+            num_actions=action_dim,
+            frame_size=frame_size,
+            feature_size=512,
+            hidden_size=256,
+            use_lstm=True,
+            frames_to_stack=4 if is_visual_input else 1,
+            device=self.device,
+            use_attention=True,
+            is_visual_input=is_visual_input
+        )
         
         # Set up agent components
         self.policy = Policy(self.network, action_dim, self.device)
