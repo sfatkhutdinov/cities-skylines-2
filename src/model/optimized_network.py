@@ -23,10 +23,67 @@ class ConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.activation(self.bn(self.conv(x)))
 
+class SelfAttention(nn.Module):
+    """Self-attention mechanism for temporal and spatial attention."""
+    
+    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        
+        self.query = nn.Linear(embed_dim, embed_dim)
+        self.key = nn.Linear(embed_dim, embed_dim)
+        self.value = nn.Linear(embed_dim, embed_dim)
+        
+        self.attn_dropout = nn.Dropout(dropout)
+        self.output_linear = nn.Linear(embed_dim, embed_dim)
+        self.output_dropout = nn.Dropout(dropout)
+        
+        self.layer_norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, x):
+        """Forward pass for self-attention.
+        
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, embed_dim]
+            
+        Returns:
+            Output tensor of shape [batch_size, seq_len, embed_dim]
+        """
+        batch_size, seq_len, embed_dim = x.shape
+        
+        # Apply layer normalization
+        residual = x
+        x = self.layer_norm(x)
+        
+        # Project to queries, keys, and values
+        q = self.query(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.key(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.value(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, embed_dim)
+        
+        # Final projection and residual connection
+        attn_output = self.output_linear(attn_output)
+        attn_output = self.output_dropout(attn_output)
+        output = residual + attn_output
+        
+        return output
+
 class OptimizedNetwork(nn.Module):
     """Optimized neural network for the PPO agent."""
     
-    def __init__(self, input_shape, num_actions, device=None, use_lstm=True, lstm_hidden_size=256):
+    def __init__(self, input_shape, num_actions, device=None, use_lstm=True, lstm_hidden_size=256, 
+                 use_attention=False, attention_heads=4):
         """Initialize the network.
         
         Args:
@@ -35,6 +92,8 @@ class OptimizedNetwork(nn.Module):
             device: Computation device
             use_lstm: Whether to use LSTM for temporal reasoning
             lstm_hidden_size: Size of LSTM hidden state
+            use_attention: Whether to use self-attention mechanism
+            attention_heads: Number of attention heads if attention is used
         """
         super(OptimizedNetwork, self).__init__()
         
@@ -45,6 +104,11 @@ class OptimizedNetwork(nn.Module):
         self.use_lstm = use_lstm
         self.lstm_hidden_size = lstm_hidden_size
         logger.critical(f"LSTM enabled: {self.use_lstm}, hidden size: {self.lstm_hidden_size}")
+        
+        # Attention configuration
+        self.use_attention = use_attention
+        self.attention_heads = attention_heads
+        logger.critical(f"Attention enabled: {self.use_attention}, heads: {self.attention_heads}")
         
         # Handle different types of input shapes
         if isinstance(input_shape, tuple) and len(input_shape) >= 3:
@@ -140,6 +204,17 @@ class OptimizedNetwork(nn.Module):
             # No LSTM
             self.lstm = None
             self.output_size = self.feature_size
+        
+        # Attention layer after LSTM if enabled
+        if self.use_attention:
+            logger.critical(f"Creating attention layer with {self.attention_heads} heads")
+            self.attention = SelfAttention(
+                embed_dim=self.output_size,
+                num_heads=self.attention_heads,
+                dropout=0.1
+            )
+        else:
+            self.attention = None
             
         # Policy head
         logger.critical(f"Creating policy head with input size {self.output_size}")
@@ -259,11 +334,20 @@ class OptimizedNetwork(nn.Module):
                 
                 features, next_hidden = self.lstm(features, hidden_state)
                 
-                # Remove time dimension if added
-                if features.size(1) == 1:
-                    features = features.squeeze(1)
+                # Process through attention if enabled
+                # Note: We keep the time dimension for attention
+                if self.use_attention:
+                    logger.critical("Processing through attention mechanism")
+                    features = self.attention(features)
                 
-                logger.critical(f"LSTM output shape: {features.shape}")
+                # Remove time dimension if added and not using attention
+                if features.size(1) == 1 and not self.use_attention:
+                    features = features.squeeze(1)
+                elif self.use_attention:
+                    # If using attention, ensure we're using the right dimension
+                    features = features.squeeze(1) if features.size(1) == 1 else features[:, -1]
+                
+                logger.critical(f"LSTM/Attention output shape: {features.shape}")
             
             # Get policy (action probabilities) and value
             logger.critical("Computing action logits")
@@ -354,9 +438,11 @@ class OptimizedNetwork(nn.Module):
             
             features, next_hidden = self.lstm(features, hidden_state)
             
-            # Remove time dimension if added
-            if features.size(1) == 1:
-                features = features.squeeze(1)
+            # Process through attention if enabled
+            if self.use_attention:
+                features = self.attention(features)
+                # If using attention, take the last time step
+                features = features.squeeze(1) if features.size(1) == 1 else features[:, -1]
         
         # Process through policy head
         logits = self.policy_head(features)
@@ -410,9 +496,11 @@ class OptimizedNetwork(nn.Module):
             
             features, next_hidden = self.lstm(features, hidden_state)
             
-            # Remove time dimension if added
-            if features.size(1) == 1:
-                features = features.squeeze(1)
+            # Process through attention if enabled
+            if self.use_attention:
+                features = self.attention(features)
+                # If using attention, take the last time step
+                features = features.squeeze(1) if features.size(1) == 1 else features[:, -1]
         
         # Process through value head
         value = self.value_head(features)
@@ -436,5 +524,8 @@ class OptimizedNetwork(nn.Module):
                 elif 'bias' in name:
                     nn.init.constant_(param, 0.0)
         elif isinstance(module, nn.BatchNorm2d):
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.weight, 1.0)
             nn.init.constant_(module.bias, 0.0) 

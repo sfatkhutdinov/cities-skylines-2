@@ -71,7 +71,7 @@
         "normalize_inputs": true,
         "use_lstm": true,
         "lstm_hidden_size": 256,
-        "use_attention": false,
+        "use_attention": true,
         "attention_heads": 4
     },
     "logging": {
