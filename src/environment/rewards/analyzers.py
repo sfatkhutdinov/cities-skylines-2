@@ -29,6 +29,20 @@ class VisualChangeAnalyzer:
         self.max_change_threshold = self.config.get('max_change_threshold', 0.8)
         self.feature_extractor = VisualFeatureExtractor(config)
         
+        # Initialize tracking variables
+        self.visual_changes = []
+        self.outcomes = []
+        self.history_size = self.config.get('history_size', 1000)
+        self.stats_update_freq = self.config.get('stats_update_freq', 100)
+        self.update_count = 0
+        self.association_threshold = self.config.get('association_threshold', 0.6)
+        
+        # Statistics for normalization
+        self.change_mean = {}
+        self.change_std = {}
+        self.outcome_mean = 0.0
+        self.outcome_std = 1.0
+        
     def get_visual_change_score(self, frame1, frame2):
         """Compute visual change score between two frames.
         
@@ -366,16 +380,32 @@ class VisualFeatureExtractor:
                 if frame_np.ndim == 3 and frame_np.shape[0] == 3:  # CHW format
                     frame_np = np.transpose(frame_np, (1, 2, 0))
             else:
-                frame_np = frame
+                frame_np = frame.copy() if isinstance(frame, np.ndarray) else np.array(frame)
                 
             # Ensure frame is in correct format for OpenCV
             if frame_np.ndim < 2:
                 logger.error(f"Invalid frame shape: {frame_np.shape}")
                 return {'edges': np.array([]), 'color_hist': np.array([])}
+            
+            # Convert float values to uint8 (required for OpenCV)
+            if frame_np.dtype != np.uint8:
+                logger.debug(f"Converting frame from {frame_np.dtype} to uint8. Range: [{np.min(frame_np)}, {np.max(frame_np)}]")
+                # Scale values from [0,1] to [0,255] if they're in float range
+                if np.max(frame_np) <= 1.0:
+                    frame_np = (frame_np * 255).astype(np.uint8)
+                else:
+                    # Otherwise, just convert directly ensuring values are clipped to valid range
+                    frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+                logger.debug(f"Converted frame range: [{np.min(frame_np)}, {np.max(frame_np)}]")
                 
             # Convert to grayscale for edge detection
             if frame_np.ndim == 3 and frame_np.shape[2] == 3:
-                gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+                try:
+                    gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+                except cv2.error as e:
+                    logger.error(f"OpenCV error in RGB2GRAY conversion: {e}. Frame shape: {frame_np.shape}, dtype: {frame_np.dtype}")
+                    # Fall back to simple grayscale conversion
+                    gray = np.mean(frame_np, axis=2).astype(np.uint8)
             elif frame_np.ndim == 2:
                 gray = frame_np
             else:

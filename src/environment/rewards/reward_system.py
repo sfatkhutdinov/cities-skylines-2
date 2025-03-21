@@ -214,7 +214,7 @@ class AutonomousRewardSystem:
                 hardware_accelerated: bool = True,
                 checkpoints_dir: str = "checkpoints/reward_system",
                 feature_dim: int = 512,
-                action_dim: int = 12):
+                action_dim: int = 137):
         """Initialize autonomous reward system.
         
         Args:
@@ -283,73 +283,82 @@ class AutonomousRewardSystem:
     def _init_components(self) -> None:
         """Initialize reward system components."""
         try:
-            # Create feature extractor
-            self.feature_extractor = VisualFeatureExtractor(
-                config={
-                    'edge_threshold': 100,
-                    'histogram_bins': 32
-                }
-            )
+            # Visual feature extractor
+            self.feature_extractor = VisualFeatureExtractor()
             
-            # Create visual change analyzer
-            self.visual_change_analyzer = VisualChangeAnalyzer(
-                config={
-                    'min_change_threshold': 0.05,
-                    'max_change_threshold': 0.8,
-                    'edge_threshold': 100,
-                    'histogram_bins': 32
-                }
-            )
+            # Visual change analyzer
+            self.visual_change_analyzer = VisualChangeAnalyzer()
             
-            # Create density estimator
+            # Reward normalization and scaling
+            self.reward_normalizer = RewardNormalizer(
+                window_size=1000,
+                clip_range=10.0,
+                epsilon=1e-8,
+                update_freq=100
+            )
+            self.reward_scaler = RewardScaler(
+                target_min=-1.0,
+                target_max=1.0,
+                window_size=1000
+            )
+            self.reward_shaper = RewardShaper()
+            
+            # State density estimator
             self.density_estimator = DensityEstimator(
                 feature_dim=self.feature_dim,
                 history_size=1000,
                 device=self.device
             )
             
-            # Create association memory
+            # State novelty memory
             self.association_memory = TemporalAssociationMemory(
                 feature_dim=self.feature_dim,
                 history_size=1000,
                 device=self.device
             )
             
-            # Create world model
+            # World model for prediction
             self.world_model = WorldModelCNN(
-                input_channels=3,
-                action_dim=self.action_dim,
-                embedding_dim=self.feature_dim,
+                action_dim=self.action_dim, 
                 device=self.device
             )
+            self.world_model.to(self.device)
             
-            # Create experience buffer
-            self.experience_buffer = ExperienceBuffer(
-                capacity=10000
-            )
+            # Experience buffer
+            self.experience_buffer = ExperienceBuffer(capacity=10000)
             
-            # Create world model trainer
+            # World model trainer
             self.world_model_trainer = WorldModelTrainer(
                 world_model=self.world_model,
                 experience_buffer=self.experience_buffer,
                 device=self.device
             )
             
-            # Create reward calibration
-            self.reward_normalizer = RewardNormalizer(
-                window_size=1000,
-                update_freq=50
-            )
-            self.reward_scaler = RewardScaler(
-                target_min=-1.0,
-                target_max=1.0
-            )
-            
-            # Create action tracker
+            # Action outcome tracker
             self.action_tracker = ActionOutcomeTracker(
-                action_dim=self.action_dim,
+                action_dim=self.action_dim,  # Now this is already 137
                 memory_size=1000
             )
+            
+            # Component weights
+            self.reward_weights = {
+                'prediction_error': 0.25,
+                'visual_change': 0.35,
+                'density': 0.20,
+                'association': 0.20
+            }
+            
+            # Training parameters
+            self.training_interval = 100  # Steps between world model updates
+            self.steps_since_reset = 0
+            self.last_world_model_update = 0
+            
+            # Error normalization factor for prediction error scaling
+            self.error_normalization_factor = 1.0
+            
+            # Background training thread
+            self.bg_training_thread = None
+            self.stop_bg_training = threading.Event()
             
             logger.info("Reward system components initialized")
         except Exception as e:
@@ -509,6 +518,12 @@ class AutonomousRewardSystem:
             
             # Create tensor versions for PyTorch operations
             current_frame_tensor = torch.tensor(current_frame_np, dtype=torch.float32).unsqueeze(0)
+            
+            # Make sure action_idx is within valid range
+            if action_idx >= self.action_dim:
+                logger.warning(f"Action index {action_idx} is out of bounds for action_dim {self.action_dim}, clipping to valid range")
+                action_idx = min(action_idx, self.action_dim - 1)
+                
             # Convert action_idx to a tensor with correct shape
             action_tensor = torch.zeros(self.action_dim, dtype=torch.float32)
             action_tensor[action_idx] = 1.0  # One-hot encoding
@@ -619,6 +634,9 @@ class AutonomousRewardSystem:
             float: Prediction error reward
         """
         try:
+            # Get device from input tensors
+            device = next_state.device if isinstance(next_state, torch.Tensor) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
             # Ensure we have the right shapes for prediction
             if isinstance(current_state, torch.Tensor) and current_state.dim() < 2:
                 current_state = current_state.unsqueeze(0)  # Add batch dimension
@@ -629,34 +647,50 @@ class AutonomousRewardSystem:
             if isinstance(next_state, torch.Tensor) and next_state.dim() < 2:
                 next_state = next_state.unsqueeze(0)  # Add batch dimension
                 
+            # Ensure all tensors are on the same device
+            current_state = current_state.to(device)
+            action_tensor = action_tensor.to(device)
+            next_state = next_state.to(device)
+            
             # Get world model's prediction
             with torch.no_grad():
-                prediction = self.world_model.predict(current_state, action_tensor)
+                # First encode the current state (if it's not already an embedding)
+                if current_state.dim() > 2:  # If it's an image tensor (batch, channels, height, width)
+                    current_embedding = self.world_model.encode(current_state)
+                else:
+                    current_embedding = current_state
                 
-            # If prediction and next_state have incompatible shapes, reshape them
+                # Predict the next state embedding
+                next_embedding = self.world_model.predict_next(current_embedding, action_tensor)
+                
+                # Ensure next_embedding is on the correct device
+                next_embedding = next_embedding.to(device)
+                
+                # Decode the embedding to get the predicted next frame
+                if next_state.dim() > 2:  # If expected output is an image
+                    prediction = self.world_model.decode(next_embedding)
+                    # Ensure prediction is on the correct device
+                    prediction = prediction.to(device)
+                else:  # If expected output is an embedding
+                    prediction = next_embedding
+            
+            # If prediction and next_state still have incompatible shapes, log and handle
             if prediction.shape != next_state.shape:
-                # If dimensions differ completely, log error and return 0
-                if prediction.dim() != next_state.dim():
-                    logger.error(f"Incompatible tensor dimensions: prediction {prediction.shape} vs next_state {next_state.shape}")
-                    return 0.0
-                    
-                # Otherwise try to align dimensions
-                if prediction.shape[0] != next_state.shape[0]:
-                    if prediction.shape[0] == 1:
-                        prediction = prediction.expand(next_state.shape[0], *prediction.shape[1:])
-                    elif next_state.shape[0] == 1:
-                        next_state = next_state.expand(prediction.shape[0], *next_state.shape[1:])
-                    else:
-                        logger.error(f"Cannot reconcile batch dimensions: {prediction.shape[0]} vs {next_state.shape[0]}")
-                        return 0.0
+                logger.error(f"Incompatible tensor dimensions: prediction {prediction.shape} vs next_state {next_state.shape}")
                 
-                # Adjust feature dimensions if needed by padding or truncating
-                if prediction.dim() > 1 and next_state.dim() > 1:
-                    min_feat_dim = min(prediction.shape[1], next_state.shape[1])
-                    prediction = prediction[:, :min_feat_dim]
-                    next_state = next_state[:, :min_feat_dim]
-                    
-            # Compute prediction error (MSE)
+                # If the dimensions are completely different, we may need different comparison approach
+                if prediction.dim() != next_state.dim():
+                    # If next_state is an image but prediction is an embedding, 
+                    # we should compare embeddings instead
+                    if next_state.dim() > 2 and prediction.dim() == 2:
+                        next_embedding = self.world_model.encode(next_state).to(device)
+                        error = F.mse_loss(next_embedding, next_embedding).item()
+                        reward = 1.0 - min(error / self.error_normalization_factor, 1.0)
+                        return reward
+                    else:
+                        return 0.0  # Can't compare these formats
+            
+            # Normal case - compute prediction error (MSE)
             prediction_error = F.mse_loss(prediction, next_state).item()
             
             # Convert to reward (higher error = lower reward)

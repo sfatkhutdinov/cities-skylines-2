@@ -172,34 +172,43 @@ class Policy:
             return action, log_prob, info
     
     def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate actions for given states.
+        """Evaluate actions in given states.
         
         Args:
             states: Batch of states
-            actions: Batch of actions to evaluate
+            actions: Batch of actions
             
         Returns:
-            Tuple of (action_probs, state_values)
+            action_probs: Action probability distributions
+            state_values: State value estimates
         """
-        logger.critical(f"Evaluating actions: states shape={states.shape}, actions shape={actions.shape}")
-        
         try:
-            # Forward pass through the network
+            # Forward pass through network
+            logger.critical(f"Evaluating actions: states shape={states.shape}, actions shape={actions.shape}")
+            
+            # Get network outputs
             action_probs, state_values = self.network(states)
             
-            # Log critical info
-            logger.critical(f"Network outputs: action_probs shape={action_probs.shape}, state_values shape={state_values.shape}")
-            
-            # Check valid outputs
+            # Process action probabilities
             if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
                 logger.critical("NaN or Inf detected in action_probs")
-                # Use uniform distribution as fallback
-                action_probs = torch.ones_like(action_probs) / action_probs.shape[-1]
+                action_probs = torch.where(
+                    torch.isnan(action_probs) | torch.isinf(action_probs),
+                    torch.ones_like(action_probs) / self.action_dim,
+                    action_probs
+                )
+            
+            # Process state values and ensure they're the right shape
+            if state_values.shape[-1] == 1:
+                state_values = state_values.squeeze(-1)
                 
             if torch.isnan(state_values).any() or torch.isinf(state_values).any():
                 logger.critical("NaN or Inf detected in state_values")
-                # Use zeros as fallback
-                state_values = torch.zeros_like(state_values)
+                state_values = torch.where(
+                    torch.isnan(state_values) | torch.isinf(state_values),
+                    torch.zeros_like(state_values),
+                    state_values
+                )
                 
             return action_probs, state_values
             

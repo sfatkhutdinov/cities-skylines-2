@@ -638,8 +638,15 @@ class ActionExecutor:
             try:
                 if action_str.startswith('key_'):
                     # Handle key_X actions (where X is a key name)
-                    key = action_str[4:]  # Extract key name
-                    logger.info(f"[ACTION-{action_id}] Converting action name '{action_str}' to key press for key '{key}'")
+                    # key = action_str[4:]  # Extract key name - this was wrong
+                    # Instead use the 'key' parameter from kwargs
+                    key = kwargs.get('key', '')
+                    
+                    if not key:
+                        logger.error(f"[ACTION-{action_id}] No key specified for action {action_str}")
+                        return False
+                        
+                    logger.info(f"[ACTION-{action_id}] Executing key press for key '{key}'")
                     # Add a small delay before action to ensure window is ready
                     time.sleep(0.1)
                     result = self.keyboard.key_press(key, kwargs.get('duration', 0.1))

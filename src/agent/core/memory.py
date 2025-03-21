@@ -146,6 +146,18 @@ class Memory:
         values = torch.cat(self.values).to(self.device) if all(isinstance(v, torch.Tensor) for v in self.values) else torch.tensor(self.values, dtype=torch.float32, device=self.device)
         dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
         
+        # Check for NaN or Inf values in rewards and replace them with zeros
+        invalid_reward_mask = torch.isnan(rewards) | torch.isinf(rewards)
+        if invalid_reward_mask.any():
+            logger.critical(f"Found {invalid_reward_mask.sum().item()} NaN/Inf reward values. Replacing with zeros.")
+            rewards = torch.where(invalid_reward_mask, torch.zeros_like(rewards), rewards)
+        
+        # Check for NaN or Inf values in values and replace them with zeros
+        invalid_value_mask = torch.isnan(values) | torch.isinf(values)
+        if invalid_value_mask.any():
+            logger.critical(f"Found {invalid_value_mask.sum().item()} NaN/Inf value estimates. Replacing with zeros.")
+            values = torch.where(invalid_value_mask, torch.zeros_like(values), values)
+        
         # Initialize returns and advantages
         returns = torch.zeros_like(rewards)
         advantages = torch.zeros_like(rewards)
@@ -174,11 +186,24 @@ class Memory:
         
         # Normalize advantages
         if len(advantages) > 1:
+            # Check for NaN or Inf values before normalization
+            if torch.isnan(advantages).any() or torch.isinf(advantages).any():
+                logger.critical("NaN or Inf detected in advantages before normalization. Resetting affected values.")
+                advantages = torch.where(torch.isnan(advantages) | torch.isinf(advantages), 
+                                        torch.zeros_like(advantages), advantages)
+            
+            # Safely normalize with epsilon to avoid div by zero
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # Store computed values
-        self.returns = returns.tolist()
-        self.advantages = advantages.tolist()
+        # Final safety check for NaN/Inf values
+        returns = torch.where(torch.isnan(returns) | torch.isinf(returns), 
+                             torch.zeros_like(returns), returns)
+        advantages = torch.where(torch.isnan(advantages) | torch.isinf(advantages), 
+                                torch.zeros_like(advantages), advantages)
+        
+        # Store computed values and detach for gradient computation
+        self.returns = returns.detach().cpu().tolist()
+        self.advantages = advantages.detach().cpu().tolist()
         
         logger.critical(f"Returns computed: min={min(self.returns):.2f}, max={max(self.returns):.2f}, mean={sum(self.returns)/len(self.returns):.2f}")
         logger.critical(f"Advantages computed: min={min(self.advantages):.2f}, max={max(self.advantages):.2f}, mean={sum(self.advantages)/len(self.advantages):.2f}")
@@ -206,6 +231,23 @@ class Memory:
         advantages = torch.tensor(self.advantages, dtype=torch.float32, device=self.device)
         log_probs = torch.stack(self.log_probs) if all(isinstance(lp, torch.Tensor) for lp in self.log_probs) else torch.tensor(self.log_probs, dtype=torch.float32, device=self.device)
         values = torch.stack(self.values) if all(isinstance(v, torch.Tensor) for v in self.values) else torch.tensor(self.values, dtype=torch.float32, device=self.device)
+        
+        # Check for NaN values and replace with zeros
+        for tensor_name, tensor in [
+            ('returns', returns), 
+            ('advantages', advantages), 
+            ('log_probs', log_probs), 
+            ('values', values)
+        ]:
+            invalid_mask = torch.isnan(tensor) | torch.isinf(tensor)
+            if invalid_mask.any():
+                logger.critical(f"Found {invalid_mask.sum().item()} NaN/Inf values in {tensor_name}. Replacing with zeros.")
+                if tensor_name == 'log_probs':
+                    # For log probs, use a very small probability instead of zero
+                    replacement = torch.ones_like(tensor) * -10.0  # log(~4.5e-5)
+                else:
+                    replacement = torch.zeros_like(tensor)
+                tensor.copy_(torch.where(invalid_mask, replacement, tensor))
         
         # Create dataset size
         dataset_size = len(self.states)
