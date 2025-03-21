@@ -18,10 +18,15 @@ import atexit
 from src.training.utils import parse_args, setup_config, setup_hardware_config, setup_environment
 from src.training.trainer import Trainer
 from src.training.memory_trainer import MemoryTrainer
+from src.training.hierarchical_trainer import HierarchicalTrainer
 from src.agent.core.ppo_agent import PPOAgent
 from src.agent.memory_agent import MemoryAugmentedAgent
+from src.agent.hierarchical_agent import HierarchicalAgent
 from src.model.optimized_network import OptimizedNetwork
 from src.memory.memory_augmented_network import MemoryAugmentedNetwork
+from src.model.visual_understanding_network import VisualUnderstandingNetwork
+from src.model.world_model import WorldModel
+from src.model.error_detection_network import ErrorDetectionNetwork
 
 # Configure logging
 logging.basicConfig(
@@ -143,15 +148,74 @@ def setup_agent(args, hardware_config, observation_space, action_space):
     """
     logger.info(f"Creating agent with state_dim={observation_space.shape}, action_dim={action_space.n}")
     
-    # Determine if we should use memory (enabled by default)
-    use_memory = not (hasattr(args, 'disable_memory') and args.disable_memory)
-    memory_size = args.memory_size if hasattr(args, 'memory_size') else 1000
-    
     # Get device
     device = hardware_config.get_device()
     
-    if use_memory:
-        logger.info("Creating memory-augmented network and agent (default)")
+    # Determine which agent type to use - hierarchical is now default
+    use_memory = not (hasattr(args, 'disable_memory') and args.disable_memory)
+    use_hierarchical = not (hasattr(args, 'disable_hierarchical') and args.disable_hierarchical)
+    memory_size = args.memory_size if hasattr(args, 'memory_size') else 2000  # Increased default memory size
+    
+    if use_hierarchical:
+        logger.info("Creating hierarchical agent with specialized neural networks (default)")
+        
+        # Get hierarchical config from hardware config
+        if not hasattr(hardware_config, 'hierarchical'):
+            hardware_config.hierarchical = {
+                'enabled': True,
+                'feature_dim': 512,
+                'latent_dim': 256,
+                'prediction_horizon': 5,
+                'adaptive_memory_use': True,
+                'adaptive_memory_threshold': 0.7
+            }
+        
+        # Determine which components to use
+        use_visual_network = not (hasattr(args, 'no_visual') and args.no_visual)
+        use_world_model = not (hasattr(args, 'no_world') and args.no_world)
+        use_error_detection = not (hasattr(args, 'no_error') and args.no_error)
+        
+        # Create memory-augmented network as the base policy network
+        policy_network = MemoryAugmentedNetwork(
+            input_shape=observation_space.shape,
+            num_actions=action_space.n,
+            memory_size=memory_size,
+            device=device,
+            use_lstm=True,  # Enable LSTM by default
+            lstm_hidden_size=384,  # Larger hidden size
+            use_attention=True,  # Enable attention by default
+            attention_heads=8  # More attention heads for better learning
+        )
+        
+        # Create hierarchical agent
+        agent = HierarchicalAgent(
+            policy_network=policy_network,
+            observation_space=observation_space,
+            action_space=action_space,
+            device=device,
+            memory_size=memory_size,
+            memory_use_prob=hardware_config.memory.get('memory_use_probability', 0.8),
+            use_visual_network=use_visual_network,
+            use_world_model=use_world_model,
+            use_error_detection=use_error_detection,
+            feature_dim=hardware_config.hierarchical.get('feature_dim', 512),
+            latent_dim=hardware_config.hierarchical.get('latent_dim', 256),
+            prediction_horizon=hardware_config.hierarchical.get('prediction_horizon', 5),
+            lr=hardware_config.learning_rate,
+            gamma=0.99,
+            epsilon=hardware_config.clip_param,
+            value_coef=hardware_config.value_loss_coef,
+            entropy_coef=hardware_config.entropy_coef,
+            adaptive_memory_use=hardware_config.hierarchical.get('adaptive_memory_use', True),
+            adaptive_memory_threshold=hardware_config.hierarchical.get('adaptive_memory_threshold', 0.7)
+        )
+        
+        logger.info(f"Created hierarchical agent with components: "
+                  f"Visual={use_visual_network}, World={use_world_model}, "
+                  f"Error={use_error_detection}")
+    
+    elif use_memory:
+        logger.info("Creating memory-augmented network and agent")
         
         # Create memory-augmented network
         policy_network = MemoryAugmentedNetwork(
@@ -172,7 +236,7 @@ def setup_agent(args, hardware_config, observation_space, action_space):
             action_space=action_space,
             device=device,
             memory_size=memory_size,
-            memory_use_prob=0.8,
+            memory_use_prob=hardware_config.memory.get('memory_use_probability', 0.8),
             lr=hardware_config.learning_rate,
             gamma=0.99,
             epsilon=hardware_config.clip_param,
@@ -182,21 +246,57 @@ def setup_agent(args, hardware_config, observation_space, action_space):
     else:
         logger.info("Creating standard PPO agent (memory disabled via flag)")
         
-        # Extract only parameters accepted by PPOAgent
-        ppo_params = {
-            'state_dim': observation_space.shape,
-            'action_dim': action_space.n,
-            'config': hardware_config,
-            'use_amp': args.mixed_precision if hasattr(args, 'mixed_precision') else False
-        }
+        # Create standard network
+        policy_network = OptimizedNetwork(
+            input_shape=observation_space.shape,
+            num_actions=action_space.n,
+            device=device,
+            use_lstm=True,  # Enable LSTM by default
+            lstm_hidden_size=256  # Standard hidden size
+        )
         
-        # Create agent
-        agent = PPOAgent(**ppo_params)
+        # Create standard PPO agent
+        agent = PPOAgent(
+            policy_network=policy_network,
+            observation_space=observation_space,
+            action_space=action_space,
+            device=device,
+            lr=hardware_config.learning_rate,
+            gamma=0.99,
+            epsilon=hardware_config.clip_param,
+            value_coef=hardware_config.value_loss_coef,
+            entropy_coef=hardware_config.entropy_coef
+        )
     
     agent.to(device)
     logger.info(f"Agent initialized on {device}")
     
     return agent
+
+def extend_parser_args(parser):
+    """Extend the argument parser with hierarchical agent options.
+    
+    Args:
+        parser: Argument parser
+        
+    Returns:
+        Extended argument parser
+    """
+    # Add hierarchical agent arguments - now using disable flags instead
+    parser.add_argument('--disable_hierarchical', action='store_true',
+                       help='Disable hierarchical agent structure (use simpler agent instead)')
+    parser.add_argument('--no_visual', action='store_true',
+                       help='Disable visual understanding network in hierarchical agent')
+    parser.add_argument('--no_world', action='store_true',
+                       help='Disable world model in hierarchical agent')
+    parser.add_argument('--no_error', action='store_true',
+                       help='Disable error detection network in hierarchical agent')
+    parser.add_argument('--memory_size', type=int, default=2000,
+                       help='Size of episodic memory (default: 2000)')
+    parser.add_argument('--mixed_precision', action='store_true', default=True,
+                       help='Enable mixed precision training (default: enabled)')
+    
+    return parser
 
 def main():
     """Main training function."""
@@ -214,13 +314,17 @@ def main():
         log_file = setup_file_logging()
         
         # Parse command line arguments
-        args = parse_args()
+        parser = argparse.ArgumentParser()
+        parser = extend_parser_args(parser)
+        args = parse_args(parser)
         
-        # Add memory-specific arguments
+        # Add memory-specific arguments if not present
         if not hasattr(args, 'disable_memory'):
             args.disable_memory = False
         if not hasattr(args, 'memory_size'):
-            args.memory_size = 1000
+            args.memory_size = 2000  # Increased default memory size
+        if not hasattr(args, 'disable_hierarchical'):
+            args.disable_hierarchical = False
         
         # Setup configuration
         config = setup_config(args)
@@ -273,7 +377,7 @@ def main():
             'learning_rate': args.learning_rate if hasattr(args, 'learning_rate') else 0.0003,
             'early_stop_reward': args.early_stop_reward if hasattr(args, 'early_stop_reward') else None,
             'use_wandb': False,  # Disable wandb for now
-            'mixed_precision': args.mixed_precision if hasattr(args, 'mixed_precision') else False,
+            'mixed_precision': args.mixed_precision if hasattr(args, 'mixed_precision') else True,  # Enable by default
         }
         
         # Update hardware config with trainer config values
@@ -318,8 +422,45 @@ def main():
                 'memory_use_probability': 0.8
             }
         
+        # Add hierarchical configuration if not present - always add it with default values
+        use_hierarchical = not (hasattr(args, 'disable_hierarchical') and args.disable_hierarchical)
+        if not hasattr(hardware_config, 'hierarchical') and use_hierarchical:
+            hardware_config.hierarchical = {
+                'enabled': True,
+                'feature_dim': 512,
+                'latent_dim': 256,
+                'prediction_horizon': 5,
+                'adaptive_memory_use': True,
+                'adaptive_memory_threshold': 0.7,
+                'training_schedules': {
+                    'visual_network': 10,      # Train visual network every 10 steps
+                    'world_model': 5,          # Train world model every 5 steps
+                    'error_detection': 20      # Train error detection every 20 steps
+                },
+                'batch_sizes': {
+                    'visual_network': 32,
+                    'world_model': 64,
+                    'error_detection': 32
+                },
+                'progressive_training': True,
+                'progressive_phases': {
+                    'visual_network': 50,      # Start training visual network after 50 episodes
+                    'world_model': 100,        # Start training world model after 100 episodes
+                    'error_detection': 150     # Start training error detection after 150 episodes
+                }
+            }
+        
         # Create appropriate trainer based on agent type
-        if isinstance(agent, MemoryAugmentedAgent):
+        if isinstance(agent, HierarchicalAgent):
+            logger.info("Creating hierarchical trainer")
+            _trainer = HierarchicalTrainer(
+                agent=agent,
+                env=_environment,
+                config=hardware_config,
+                checkpoint_dir=trainer_config['checkpoint_dir'],
+                tensorboard_dir=trainer_config['tensorboard_dir']
+            )
+        elif isinstance(agent, MemoryAugmentedAgent):
             logger.info("Creating memory-augmented trainer")
             _trainer = MemoryTrainer(
                 agent=agent,
@@ -338,8 +479,17 @@ def main():
                 tensorboard_dir=trainer_config['tensorboard_dir']
             )
         
+        # Resume from checkpoint if specified
+        if hasattr(args, 'resume') and args.resume:
+            logger.info(f"Resuming training from checkpoint: {args.resume}")
+            _trainer.load_checkpoint(args.resume)
+        
+        # Override number of episodes if specified
+        if hasattr(args, 'num_episodes') and args.num_episodes:
+            _trainer.max_episodes = args.num_episodes
+        
         # Train the agent
-        logger.info("Starting training")
+        logger.info(f"Starting training for {_trainer.max_episodes} episodes")
         _trainer.train()
         logger.info("Training completed successfully")
         
