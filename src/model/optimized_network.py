@@ -5,7 +5,7 @@ Optimized neural network for Cities: Skylines 2 agent.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Tuple, Optional
 import numpy as np
 import logging
 
@@ -26,18 +26,25 @@ class ConvBlock(nn.Module):
 class OptimizedNetwork(nn.Module):
     """Optimized neural network for the PPO agent."""
     
-    def __init__(self, input_shape, num_actions, device=None):
+    def __init__(self, input_shape, num_actions, device=None, use_lstm=True, lstm_hidden_size=256):
         """Initialize the network.
         
         Args:
             input_shape: Shape of the input state (channels, height, width) or flattened size
             num_actions: Number of actions in the action space
             device: Computation device
+            use_lstm: Whether to use LSTM for temporal reasoning
+            lstm_hidden_size: Size of LSTM hidden state
         """
         super(OptimizedNetwork, self).__init__()
         
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.critical(f"Initializing network with input_shape={input_shape}, num_actions={num_actions}, device={self.device}")
+        
+        # LSTM configuration
+        self.use_lstm = use_lstm
+        self.lstm_hidden_size = lstm_hidden_size
+        logger.critical(f"LSTM enabled: {self.use_lstm}, hidden size: {self.lstm_hidden_size}")
         
         # Handle different types of input shapes
         if isinstance(input_shape, tuple) and len(input_shape) >= 3:
@@ -97,6 +104,9 @@ class OptimizedNetwork(nn.Module):
                 nn.Linear(conv_output_size, 512),
                 nn.ReLU()
             )
+            
+            # Track the feature size for LSTM
+            self.feature_size = 512
         else:
             # For vector inputs, we won't use conv layers
             logger.critical("Creating linear network for vector input")
@@ -111,18 +121,38 @@ class OptimizedNetwork(nn.Module):
                 nn.ReLU()
             )
             
+            # Track the feature size for LSTM
+            self.feature_size = 512
+            
+        # LSTM layer for temporal reasoning if enabled
+        if self.use_lstm:
+            logger.critical(f"Creating LSTM layer with hidden size {self.lstm_hidden_size}")
+            self.lstm = nn.LSTM(
+                input_size=self.feature_size,
+                hidden_size=self.lstm_hidden_size,
+                num_layers=1,
+                batch_first=True
+            )
+            
+            # Update feature size for heads
+            self.output_size = self.lstm_hidden_size
+        else:
+            # No LSTM
+            self.lstm = None
+            self.output_size = self.feature_size
+            
         # Policy head
-        logger.critical("Creating policy head")
+        logger.critical(f"Creating policy head with input size {self.output_size}")
         self.policy_head = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(self.output_size, 256),
             nn.ReLU(),
             nn.Linear(256, num_actions)
         )
         
         # Value head
-        logger.critical("Creating value head")
+        logger.critical(f"Creating value head with input size {self.output_size}")
         self.value_head = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(self.output_size, 256),
             nn.ReLU(),
             nn.Linear(256, 1)
         )
@@ -157,14 +187,15 @@ class OptimizedNetwork(nn.Module):
         logger.critical(f"Network initialized with {total_params} total parameters ({trainable_params} trainable)")
         logger.critical("Network initialization complete")
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward pass through the network.
         
         Args:
             x (torch.Tensor): Input state tensor
+            hidden_state: Optional hidden state for LSTM (h, c)
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (action_probs, value)
+            Tuple: (action_probs, value, next_hidden_state)
         """
         try:
             logger.critical(f"Network forward called with input shape: {x.shape}, device: {x.device}, dtype: {x.dtype}")
@@ -204,6 +235,36 @@ class OptimizedNetwork(nn.Module):
             features = self.shared_layers(x)
             logger.critical(f"Shared features shape: {features.shape}")
             
+            # Process through LSTM if enabled
+            next_hidden = None
+            if self.use_lstm:
+                if hidden_state is None:
+                    # Initialize hidden state if not provided
+                    h0 = torch.zeros(1, x.size(0), self.lstm_hidden_size, device=self.device)
+                    c0 = torch.zeros(1, x.size(0), self.lstm_hidden_size, device=self.device)
+                    hidden_state = (h0, c0)
+                else:
+                    # Ensure hidden state is on the correct device
+                    h, c = hidden_state
+                    if h.device != self.device:
+                        h = h.to(self.device)
+                    if c.device != self.device:
+                        c = c.to(self.device)
+                    hidden_state = (h, c)
+                
+                logger.critical("Processing through LSTM")
+                # Add time dimension for LSTM if needed
+                if len(features.shape) == 2:  # [B, F]
+                    features = features.unsqueeze(1)  # [B, 1, F]
+                
+                features, next_hidden = self.lstm(features, hidden_state)
+                
+                # Remove time dimension if added
+                if features.size(1) == 1:
+                    features = features.squeeze(1)
+                
+                logger.critical(f"LSTM output shape: {features.shape}")
+            
             # Get policy (action probabilities) and value
             logger.critical("Computing action logits")
             action_logits = self.policy_head(features)
@@ -232,7 +293,7 @@ class OptimizedNetwork(nn.Module):
             value = value.squeeze(-1)
             
             logger.critical("Forward pass completed successfully")
-            return action_probs, value
+            return action_probs, value, next_hidden
             
         except Exception as e:
             import traceback
@@ -245,16 +306,17 @@ class OptimizedNetwork(nn.Module):
             zero_value = torch.zeros(batch_size, device=self.device)
             
             logger.critical(f"Returning fallback values with shapes: probs={uniform_probs.shape}, value={zero_value.shape}")
-            return uniform_probs, zero_value
+            return uniform_probs, zero_value, None
         
-    def get_action_probs(self, x: torch.Tensor) -> torch.Tensor:
+    def get_action_probs(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get action probabilities for a state.
         
         Args:
             x (torch.Tensor): Input state tensor
+            hidden_state: Optional hidden state for LSTM
             
         Returns:
-            torch.Tensor: Action probabilities
+            Tuple: (action_probs, next_hidden_state)
         """
         # Ensure input is on the correct device
         x = x.to(self.device)
@@ -274,21 +336,43 @@ class OptimizedNetwork(nn.Module):
                 x = x.unsqueeze(0)  # Add batch dimension
             features = x
             
-        # Process through shared layers and policy head
-        fc_features = self.shared_layers(features)
-        logits = self.policy_head(fc_features)
+        # Process through shared layers
+        features = self.shared_layers(features)
+        
+        # Process through LSTM if enabled
+        next_hidden = None
+        if self.use_lstm:
+            if hidden_state is None:
+                # Initialize hidden state if not provided
+                h0 = torch.zeros(1, x.size(0), self.lstm_hidden_size, device=self.device)
+                c0 = torch.zeros(1, x.size(0), self.lstm_hidden_size, device=self.device)
+                hidden_state = (h0, c0)
+            
+            # Add time dimension for LSTM
+            if len(features.shape) == 2:  # [B, F]
+                features = features.unsqueeze(1)  # [B, 1, F]
+            
+            features, next_hidden = self.lstm(features, hidden_state)
+            
+            # Remove time dimension if added
+            if features.size(1) == 1:
+                features = features.squeeze(1)
+        
+        # Process through policy head
+        logits = self.policy_head(features)
         
         # Apply softmax to get probabilities
-        return torch.softmax(logits, dim=1)
+        return torch.softmax(logits, dim=1), next_hidden
     
-    def get_value(self, x: torch.Tensor) -> torch.Tensor:
+    def get_value(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get value for a state.
         
         Args:
             x (torch.Tensor): Input state tensor
+            hidden_state: Optional hidden state for LSTM
             
         Returns:
-            torch.Tensor: Value prediction
+            Tuple: (value, next_hidden_state)
         """
         # Ensure input is on the correct device
         x = x.to(self.device)
@@ -308,22 +392,49 @@ class OptimizedNetwork(nn.Module):
                 x = x.unsqueeze(0)  # Add batch dimension
             features = x
             
-        # Process through shared layers and value head
-        fc_features = self.shared_layers(features)
-        value = self.value_head(fc_features)
+        # Process through shared layers
+        features = self.shared_layers(features)
         
-        return value.squeeze(-1)
-
-    def _init_weights(self, m):
+        # Process through LSTM if enabled
+        next_hidden = None
+        if self.use_lstm:
+            if hidden_state is None:
+                # Initialize hidden state if not provided
+                h0 = torch.zeros(1, x.size(0), self.lstm_hidden_size, device=self.device)
+                c0 = torch.zeros(1, x.size(0), self.lstm_hidden_size, device=self.device)
+                hidden_state = (h0, c0)
+            
+            # Add time dimension for LSTM
+            if len(features.shape) == 2:  # [B, F]
+                features = features.unsqueeze(1)  # [B, 1, F]
+            
+            features, next_hidden = self.lstm(features, hidden_state)
+            
+            # Remove time dimension if added
+            if features.size(1) == 1:
+                features = features.squeeze(1)
+        
+        # Process through value head
+        value = self.value_head(features)
+        
+        return value.squeeze(-1), next_hidden
+    
+    def _init_weights(self, module):
         """Initialize network weights.
         
         Args:
-            m: Module to initialize
+            module: Module to initialize weights for
         """
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias) 
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if 'weight' in name:
+                    nn.init.orthogonal_(param, gain=1.0)
+                elif 'bias' in name:
+                    nn.init.constant_(param, 0.0)
+        elif isinstance(module, nn.BatchNorm2d):
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0.0) 

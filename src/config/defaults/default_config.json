@@ -64,16 +64,15 @@
         "curriculum_stages": 5
     },
     "model": {
-        "actor_hidden_sizes": [512, 256],
-        "critic_hidden_sizes": [512, 256],
+        "backbone": "optimized",
+        "hidden_size": 512,
         "activation": "relu",
-        "shared_backbone": true,
-        "backbone_type": "resnet18",
-        "use_lstm": false,
+        "xavier_init": true,
+        "normalize_inputs": true,
+        "use_lstm": true,
         "lstm_hidden_size": 256,
-        "dropout": 0.0,
-        "value_normalization": true,
-        "init_weights": "orthogonal"
+        "use_attention": false,
+        "attention_heads": 4
     },
     "logging": {
         "level": "INFO",

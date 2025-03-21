@@ -92,103 +92,113 @@ class PPOAgent:
         self.menu_action_memory = 50  # Remember the last 50 menu occurrences
         self.menu_penalty_factor = 0.5  # Penalty factor for actions that cause menus
         
+        # Initialize LSTM hidden state
+        self.hidden_state = None
+        self.use_lstm = hasattr(self.policy, 'use_lstm') and self.policy.use_lstm
+        if self.use_lstm:
+            logger.info("LSTM is enabled in the policy network")
+        
         logger.info(f"Initialized PPO agent with state_dim={state_dim}, action_dim={action_dim}, device={self.device}")
     
-    def select_action(self, state, log_prob=None, value=None, deterministic: bool = False):
+    def select_action(self, state, deterministic=False):
         """Select an action based on the current state.
         
         Args:
-            state: Current observation
-            log_prob: Optional log probability of previous action (for continuation)
-            value: Optional value estimate (for continuation)
-            deterministic: Whether to select action deterministically
+            state: Current state
+            deterministic: Whether to select the best action deterministically
             
         Returns:
-            Tuple containing (action, log_prob, value)
+            dict: Containing action, log_prob, value, and other info
         """
-        # Enhanced error logging
-        logger.critical(f"select_action called with state of type {type(state)}")
-        if isinstance(state, torch.Tensor):
-            logger.critical(f"State tensor shape: {state.shape}, device: {state.device}, dtype: {state.dtype}")
-            if torch.isnan(state).any():
-                logger.critical("WARNING: State contains NaN values!")
-            if torch.isinf(state).any():
-                logger.critical("WARNING: State contains Inf values!")
-        elif isinstance(state, np.ndarray):
-            logger.critical(f"State numpy array shape: {state.shape}, dtype: {state.dtype}")
-        else:
-            logger.critical(f"State is of unexpected type: {type(state)}")
-            
+        logger.critical(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
+        
+        # Ensure state is a tensor
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, device=self.device).float()
+        
         try:
-            # Convert state to tensor if needed
-            if not isinstance(state, torch.Tensor):
-                logger.critical("Converting state to tensor")
-                state = torch.tensor(state, dtype=self.dtype, device=self.device)
-            
-            # Ensure state has correct shape
-            if len(state.shape) == 3:  # Add batch dimension if needed
-                logger.critical("Adding batch dimension to state")
-                state = state.unsqueeze(0)
-            
-            # Store last state for continued episodes
-            self.last_state = state
-            
-            # Use automatic mixed precision for forward pass if enabled
-            logger.critical("About to call policy.select_action")
-            if self.use_amp and self.training and torch.is_grad_enabled():
-                with torch.cuda.amp.autocast():
-                    # Select action using policy
-                    action, log_prob, info = self.policy.select_action(state, deterministic)
-            else:
-                # Select action using policy
-                action, log_prob, info = self.policy.select_action(state, deterministic)
-            
-            logger.critical(f"Policy returned action: {action}, log_prob: {log_prob}")
-            
-            # Extract value from info
-            value = info['value']
-            
-            # Track steps
-            self.steps_taken += 1
-            
-            # Apply menu action penalty to reduce likelihood of selecting
-            # actions that have frequently led to menus
-            if self.training and hasattr(self, 'get_menu_action_penalty'):
-                action_probs = info['action_probs'].clone()
+            with torch.no_grad():
+                # Forward pass through policy network
+                # Pass and update hidden_state for LSTM memory
+                if self.use_lstm:
+                    logger.critical("Using LSTM in action selection")
+                    action_probs, value, next_hidden = self.policy(state, self.hidden_state)
+                    # Update hidden state for next time
+                    self.hidden_state = next_hidden
+                else:
+                    action_probs, value, _ = self.policy(state)
                 
-                # Apply penalties to actions known to cause menus
-                for action_idx in range(self.action_dim):
-                    penalty = self.get_menu_action_penalty(action_idx)
-                    if penalty > 0:
-                        action_probs[0, action_idx] *= (1.0 - penalty)
-                        
-                # Renormalize probabilities
-                action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
+                # Create categorical distribution
+                action_distribution = torch.distributions.Categorical(action_probs)
                 
-                # Create new distribution
-                penalized_distribution = torch.distributions.Categorical(action_probs)
-                
-                # Sample from penalized distribution
+                # Choose action
                 if deterministic:
                     action = torch.argmax(action_probs, dim=1)
                 else:
-                    action = penalized_distribution.sample()
+                    action = action_distribution.sample()
+                
+                # Get log probability
+                log_prob = action_distribution.log_prob(action)
+                
+                # Create info dictionary
+                info = {
+                    'action_probs': action_probs,
+                    'action_distribution': action_distribution,
+                    'log_prob': log_prob,
+                    'value': value
+                }
+                
+                # Update steps counter
+                self.steps_taken += 1
+                
+                # Apply menu action penalty to reduce likelihood of selecting
+                # actions that have frequently led to menus
+                if self.training and hasattr(self, 'get_menu_action_penalty'):
+                    action_probs = info['action_probs'].clone()
                     
-                # Get log probability from original distribution for learning
-                log_prob = info['log_prob']
-            
-            # Return action, log_prob, and value
-            logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
-            return action.cpu().numpy().item(), log_prob, value
-            
+                    # Apply penalties to actions known to cause menus
+                    for action_idx in range(self.action_dim):
+                        penalty = self.get_menu_action_penalty(action_idx)
+                        if penalty > 0:
+                            action_probs[0, action_idx] *= (1.0 - penalty)
+                            
+                    # Renormalize probabilities
+                    action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
+                    
+                    # Create new distribution
+                    penalized_distribution = torch.distributions.Categorical(action_probs)
+                    
+                    # Sample from penalized distribution
+                    if deterministic:
+                        action = torch.argmax(action_probs, dim=1)
+                    else:
+                        action = penalized_distribution.sample()
+                        
+                    # Get log probability from original distribution for learning
+                    log_prob = info['log_prob']
+                
+                # Return action, log_prob, and value
+                logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
+                return {
+                    'action': action,
+                    'log_prob': log_prob,
+                    'value': value,
+                    'action_probs': action_probs,
+                }
+                
         except Exception as e:
+            logger.error(f"Error selecting action: {e}")
             import traceback
-            logger.critical(f"ERROR in select_action: {e}")
-            logger.critical(f"Traceback: {traceback.format_exc()}")
-            # Provide a fallback random action in case of error
-            action = np.random.randint(0, self.action_dim)
-            logger.critical(f"Falling back to random action: {action}")
-            return action, torch.tensor(0.0), torch.tensor(0.0)
+            logger.error(traceback.format_exc())
+            
+            # Return a random action as fallback
+            random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
+            return {
+                'action': random_action,
+                'log_prob': torch.tensor(0.0, device=self.device),
+                'value': torch.tensor(0.0, device=self.device),
+                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim,
+            }
     
     def store_experience(self, state: torch.Tensor, 
                         action: torch.Tensor, 
@@ -653,3 +663,20 @@ class PPOAgent:
         
         # Return penalty scaled by factor
         return recent_ratio * self.menu_penalty_factor 
+
+    def reset(self):
+        """Reset agent state between episodes."""
+        logger.critical("Resetting agent state")
+        # Reset LSTM hidden state between episodes
+        if self.use_lstm:
+            logger.critical("Resetting LSTM hidden state")
+            self.hidden_state = None
+        
+        # Other resets if needed
+        self.episodes_completed += 1
+        
+        # Reset menu action tracking
+        self.menu_actions = {}
+        self.menu_actions = deque(maxlen=self.menu_action_memory)
+        
+        logger.info("Agent state reset successfully") 

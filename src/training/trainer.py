@@ -478,6 +478,12 @@ class Trainer:
             Dict with episode metrics
         """
         logger.critical(f"===== STARTING EPISODE {episode_num} =====")
+        
+        # Reset agent's LSTM state at the beginning of each episode
+        if hasattr(self.agent, 'reset'):
+            logger.critical("Resetting agent state for new episode")
+            self.agent.reset()
+        
         # Check if using mock environment
         using_mock = hasattr(self.env, '_update_city_state')
         logger.critical(f"Using mock environment: {using_mock}")
