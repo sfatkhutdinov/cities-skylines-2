@@ -17,6 +17,7 @@ from pathlib import Path
 import contextlib
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+import torch.optim as optim
 
 from .checkpointing import CheckpointManager
 from .signal_handlers import is_exit_requested, request_exit
@@ -57,6 +58,21 @@ class Trainer:
         self.config = config
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        # Episode tracking attributes
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.recent_rewards = []
+        self.best_reward = float('-inf')
+        
+        # Helper method to safely get config values
+        def get_config_value(key, default_value):
+            if hasattr(self.config, "get") and callable(self.config.get):
+                return self.config.get(key, default_value)
+            elif hasattr(self.config, key):
+                return getattr(self.config, key)
+            else:
+                return default_value
+        
         # Set up memory
         self.memory = Memory(self.device)
         
@@ -66,40 +82,68 @@ class Trainer:
         # Set up learning rate scheduler
         self.lr_scheduler = self._create_lr_scheduler()
         
-        # PPO hyperparameters
-        self.gamma = config.gamma
-        self.gae_lambda = config.gae_lambda
-        self.clip_param = config.clip_param
-        self.ppo_epochs = config.ppo_epochs
-        self.batch_size = config.batch_size
-        self.value_loss_coef = config.value_loss_coef
-        self.entropy_coef = config.entropy_coef
-        self.max_grad_norm = config.max_grad_norm
+        # Training parameters
+        self.start_episode = 0
+        self.num_episodes = get_config_value("num_episodes", 1000)
+        self.total_steps = 0
         
-        # Mixed precision training
-        self.use_mixed_precision = config.use_mixed_precision and torch.cuda.is_available()
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
+        # Initialize metrics visualization
+        self.visualizer = TrainingVisualizer(os.path.join(tensorboard_dir, f"training_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+        
+        # PPO parameters
+        self.gamma = get_config_value("gamma", 0.99)
+        self.gae_lambda = get_config_value("gae_lambda", 0.95)
+        self.clip_param = get_config_value("clip_param", 0.2)
+        self.value_loss_coef = get_config_value("value_loss_coef", 0.5)
+        self.entropy_coef = get_config_value("entropy_coef", 0.01)
+        self.max_grad_norm = get_config_value("max_grad_norm", 0.5)
+        self.ppo_epochs = get_config_value("ppo_epochs", 4)
+        self.batch_size = get_config_value("batch_size", 64)
+        self.use_mixed_precision = get_config_value("mixed_precision", False)
+        
+        # Hardware monitoring
+        self.hardware_monitor = HardwareMonitor() if get_config_value("monitor_hardware", False) else None
+        
+        # Performance safeguards
+        self.performance_safeguards = None
+        if get_config_value("enable_performance_safeguards", False):
+            try:
+                self.performance_safeguards = PerformanceSafeguards(config=config)
+                logger.info("Performance safeguards enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize performance safeguards: {e}")
+        
+        # Wandb integration
+        self.use_wandb = get_config_value("use_wandb", False)
+        if self.use_wandb:
+            try:
+                import wandb
+                wandb_config = get_config_value("wandb", {})
+                wandb.init(
+                    project=wandb_config.get("project", "cities-skylines-rl"),
+                    entity=wandb_config.get("entity", None),
+                    config=config,
+                    name=wandb_config.get("run_name", None) or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    tags=wandb_config.get("tags", []),
+                    resume=wandb_config.get("resume", False)
+                )
+                logger.info("Wandb tracking enabled")
+            except ImportError:
+                logger.warning("Wandb tracking requested but wandb not installed")
+                self.use_wandb = False
         
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=checkpoint_dir,
-            max_checkpoints=config.max_checkpoints
+            checkpoint_dir=os.path.join(checkpoint_dir, "checkpoints"),
+            max_checkpoints=get_config_value("max_checkpoints", 5)
         )
         
         # Initialize tensorboard writer
-        self.writer = SummaryWriter(log_dir=tensorboard_dir)
+        self.writer = SummaryWriter(log_dir=os.path.join(tensorboard_dir, "logs"))
         
         # Initialize visualizer
         self.visualizer = TrainingVisualizer(
-            log_dir=tensorboard_dir
-        )
-        
-        # Hardware monitor
-        self.hardware_monitor = HardwareMonitor() if config.monitor_hardware else None
-        
-        # Performance safeguards
-        self.performance_safeguards = PerformanceSafeguards(
-            config=config
+            log_dir=os.path.join(tensorboard_dir, "logs")
         )
         
         # Training metrics
@@ -108,9 +152,7 @@ class Trainer:
         self.best_reward = float('-inf')
         
         # Training parameters
-        self.start_episode = 0  # Start from episode 0
-        self.num_episodes = config.num_episodes if hasattr(config, 'num_episodes') else 100
-        self.max_steps = config.max_steps if hasattr(config, 'max_steps') else 1000
+        self.max_steps = get_config_value("max_steps", 1000)
         self.total_steps = 0  # Initialize total steps counter
         
         # Timing
@@ -128,10 +170,19 @@ class Trainer:
         """
         logger.critical("Creating optimizer")
         
+        # Helper to get config values safely
+        def get_config_value(key, default_value):
+            if hasattr(self.config, "get") and callable(self.config.get):
+                return self.config.get(key, default_value)
+            elif hasattr(self.config, key):
+                return getattr(self.config, key)
+            else:
+                return default_value
+        
         # Get optimizer parameters from config
-        optimizer_type = self.config.optimizer
-        learning_rate = self.config.learning_rate
-        weight_decay = self.config.weight_decay
+        optimizer_type = get_config_value("optimizer", "adam")
+        learning_rate = get_config_value("learning_rate", 3e-4)
+        weight_decay = get_config_value("weight_decay", 0.0)
         
         # Get trainable parameters
         parameters = self.agent.parameters()
@@ -144,7 +195,7 @@ class Trainer:
             logger.critical(f"Using AdamW optimizer with lr={learning_rate}, weight_decay={weight_decay}")
             return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
         elif optimizer_type.lower() == 'sgd':
-            momentum = self.config.momentum if hasattr(self.config, 'momentum') else 0.9
+            momentum = get_config_value("momentum", 0.9)
             logger.critical(f"Using SGD optimizer with lr={learning_rate}, momentum={momentum}, weight_decay={weight_decay}")
             return torch.optim.SGD(parameters, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
         else:
@@ -157,25 +208,34 @@ class Trainer:
         Returns:
             Learning rate scheduler or None
         """
-        if not hasattr(self.config, 'use_lr_scheduler') or not self.config.use_lr_scheduler:
+        # Helper to get config values safely
+        def get_config_value(key, default_value):
+            if hasattr(self.config, "get") and callable(self.config.get):
+                return self.config.get(key, default_value)
+            elif hasattr(self.config, key):
+                return getattr(self.config, key)
+            else:
+                return default_value
+                
+        if not get_config_value("use_lr_scheduler", False):
             logger.critical("Not using learning rate scheduler")
             return None
             
         # Get scheduler parameters from config
-        scheduler_type = self.config.scheduler_type if hasattr(self.config, 'scheduler_type') else 'step'
+        scheduler_type = get_config_value("scheduler_type", "step")
         
         # Create scheduler based on type
         if scheduler_type.lower() == 'step':
-            step_size = self.config.lr_step_size
-            gamma = self.config.lr_gamma
+            step_size = get_config_value("lr_step_size", 100)
+            gamma = get_config_value("lr_gamma", 0.9)
             logger.critical(f"Using StepLR scheduler: step_size={step_size}, gamma={gamma}")
             return torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
         elif scheduler_type.lower() == 'exponential':
-            gamma = self.config.lr_gamma
+            gamma = get_config_value("lr_gamma", 0.9)
             logger.critical(f"Using ExponentialLR scheduler: gamma={gamma}")
             return torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
         elif scheduler_type.lower() == 'cosine':
-            t_max = self.config.cosine_t_max if hasattr(self.config, 'cosine_t_max') else 100
+            t_max = get_config_value("cosine_t_max", 100)
             logger.critical(f"Using CosineAnnealingLR scheduler: T_max={t_max}")
             return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max)
         else:
@@ -187,7 +247,7 @@ class Trainer:
         try:
             # Load checkpoint
             self.start_episode, self.best_reward = self.checkpoint_manager.load_checkpoint(
-                self.agent, self.optimizer, self.scheduler
+                self.agent, self.optimizer, self.lr_scheduler
             )
             
             # Load episode rewards and lengths from checkpoint if available
@@ -234,8 +294,8 @@ class Trainer:
             }
             
             # Add scheduler state if present
-            if self.scheduler is not None:
-                state['scheduler_state'] = self.scheduler.state_dict()
+            if self.lr_scheduler is not None:
+                state['scheduler_state'] = self.lr_scheduler.state_dict()
             
             # Calculate mean recent reward
             mean_reward = None
@@ -846,11 +906,12 @@ class Trainer:
         
         return eval_summary
     
-    def _update_policy(self, experiences: List[Dict]) -> Dict[str, float]:
+    def _update_policy(self, experiences: List[Dict], scaler=None) -> Dict[str, float]:
         """Update policy based on collected experiences.
         
         Args:
-            experiences: List of collected experiences
+            experiences: List of collected experiences (state, action, reward, next_state, done, log_prob, value)
+            scaler: Optional gradient scaler for mixed precision training
             
         Returns:
             Dictionary of statistics from the update
@@ -877,15 +938,19 @@ class Trainer:
         if self.memory.size() == 0:
             logger.critical("Memory is empty, adding experiences")
             for exp in experiences:
+                # Unpack the experience tuple
+                state, action, reward, next_state, done, log_prob, value = exp
+                action_probs = None  # This might not be available in the tuple
+                
                 self.memory.add(
-                    state=exp['state'],
-                    action=exp['action'],
-                    reward=exp['reward'],
-                    next_state=exp['next_state'],
-                    done=exp['done'],
-                    log_prob=exp.get('log_prob'),
-                    value=exp.get('value'),
-                    action_probs=exp.get('action_probs')
+                    state=state,
+                    action=action,
+                    reward=reward,
+                    next_state=next_state,
+                    done=done,
+                    log_prob=log_prob,
+                    value=value,
+                    action_probs=action_probs
                 )
                 
         # Compute returns and advantages
@@ -968,7 +1033,7 @@ class Trainer:
                     
                     # Clip gradients
                     if self.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), self.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.agent.policy.network.parameters(), self.max_grad_norm)
                     
                     # Update parameters
                     self.optimizer.step()

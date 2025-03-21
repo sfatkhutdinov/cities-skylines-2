@@ -659,11 +659,20 @@ class Environment:
             # Get state representation
             if hasattr(self.game_state, 'get_feature_vector'):
                 state = self.game_state.get_feature_vector()
+                # For the reward system, we need raw frames, not feature vectors
+                current_frame = self.observation_manager.get_current_frame() 
+                next_frame = self.observation_manager.get_latest_frame()
             else:
-                state = self.current_frame
+                # Use the raw frames directly
+                current_frame = self.observation_manager.get_current_frame()
+                next_frame = self.observation_manager.get_latest_frame()
                 
             # Compute reward using reward system
-            reward = self.reward_system.compute_reward(state, action_idx)
+            if current_frame is not None and next_frame is not None:
+                reward = self.reward_system.compute_reward(current_frame, action_idx, next_frame)
+            else:
+                logger.warning("Missing frames for reward computation, using default reward")
+                reward = 0.0
             
             return reward
         except Exception as e:

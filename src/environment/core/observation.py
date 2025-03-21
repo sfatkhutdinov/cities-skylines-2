@@ -203,6 +203,16 @@ class ObservationManager:
             return None
         return self.frame_history[-1]
     
+    def get_latest_frame(self) -> Optional[torch.Tensor]:
+        """Get the most recent frame.
+        
+        Returns:
+            torch.Tensor: Most recent frame or None if no frames
+        """
+        if not self.frame_history:
+            return None
+        return self.frame_history[-1]
+    
     def get_previous_frame(self) -> Optional[torch.Tensor]:
         """Get the second most recent frame.
         
