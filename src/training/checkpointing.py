@@ -12,6 +12,11 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import glob
+import re
+from datetime import datetime
+import numpy as np
+
+from src.utils import get_checkpoints_dir, get_logs_dir, get_path, ensure_dir_exists
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +25,7 @@ class CheckpointManager:
     
     def __init__(
         self,
-        checkpoint_dir: str = "checkpoints",
+        checkpoint_dir: Optional[str] = None,
         checkpoint_freq: int = 100,
         autosave_interval: int = 15,
         backup_checkpoints: int = 5,
@@ -32,7 +37,7 @@ class CheckpointManager:
         """Initialize the checkpoint manager.
         
         Args:
-            checkpoint_dir: Directory to save checkpoints
+            checkpoint_dir: Directory to save checkpoints, defaults to 'checkpoints' in project root
             checkpoint_freq: Episodes between checkpoints
             autosave_interval: Minutes between auto-saves
             backup_checkpoints: Number of backup checkpoints to keep
@@ -41,7 +46,12 @@ class CheckpointManager:
             use_best: Resume training from best checkpoint instead of latest
             fresh_start: Force starting training from scratch
         """
-        self.checkpoint_dir = Path(checkpoint_dir)
+        if checkpoint_dir is None:
+            self.checkpoint_dir = get_checkpoints_dir()
+        else:
+            self.checkpoint_dir = get_path(checkpoint_dir)
+            ensure_dir_exists(self.checkpoint_dir)
+            
         self.checkpoint_freq = checkpoint_freq
         self.autosave_interval = autosave_interval
         self.backup_checkpoints = backup_checkpoints
@@ -49,9 +59,6 @@ class CheckpointManager:
         self.max_disk_usage_gb = max_disk_usage_gb
         self.use_best = use_best
         self.fresh_start = fresh_start
-        
-        # Ensure checkpoint directory exists
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
         
         # Track checkpoint times
         self.last_checkpoint_time = time.time()
@@ -337,73 +344,62 @@ class CheckpointManager:
             logger.error(f"Error during checkpoint cleanup: {e}")
     
     def _manage_disk_usage(self):
-        """Check and manage disk usage to prevent running out of space."""
-        try:
-            # Check disk usage of checkpoint and log directories
-            log_dir = Path("logs")
-            
-            # Get size of checkpoint directory
+        """Manage disk usage for logs and checkpoints.
+        
+        Cleans up old checkpoints and logs if they exceed the specified disk usage.
+        """
+        # Check total size of checkpoints
+        checkpoint_size_gb = 0
+        if self.checkpoint_dir.exists():
             checkpoint_size_gb = sum(
                 os.path.getsize(f) for f in self.checkpoint_dir.glob("**/*") if os.path.isfile(f)
-            ) / (1024**3)
+            ) / (1024 ** 3)
+        
+        # Check total size of logs
+        logs_dir = get_logs_dir()
+        log_size_gb = 0
+        if logs_dir.exists():
+            log_size_gb = sum(
+                os.path.getsize(f) for f in logs_dir.glob("**/*") if os.path.isfile(f)
+            ) / (1024 ** 3)
+        
+        total_size_gb = checkpoint_size_gb + log_size_gb
+        logger.debug(
+            f"Current disk usage: {total_size_gb:.2f} GB "
+            f"(checkpoints: {checkpoint_size_gb:.2f} GB, logs: {log_size_gb:.2f} GB)"
+        )
+        
+        # Clean up logs if they're using significant space
+        if logs_dir.exists() and log_size_gb > 0.5:
+            log_files = sorted(
+                logs_dir.glob("*.log"),
+                key=lambda f: os.path.getmtime(f)
+            )
             
-            # Get size of log directory if it exists
-            log_size_gb = 0
-            if log_dir.exists():
-                log_size_gb = sum(
-                    os.path.getsize(f) for f in log_dir.glob("**/*") if os.path.isfile(f)
-                ) / (1024**3)
+            # Keep the 5 most recent logs, remove others
+            if len(log_files) > 5:
+                old_logs = log_files[:-5]
+                for old_log in old_logs:
+                    try:
+                        logger.info(f"Removing old log file: {old_log}")
+                        os.remove(old_log)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove old log file {old_log}: {e}")
+        
+        # If we're approaching the limit, take action
+        if total_size_gb > self.max_disk_usage_gb * 0.9:
+            logger.warning(f"Approaching max disk usage ({total_size_gb:.2f}/{self.max_disk_usage_gb} GB)")
             
-            total_size_gb = checkpoint_size_gb + log_size_gb
+            # First, remove some old checkpoints
+            self._cleanup_old_checkpoints()
             
-            logger.info(f"Current disk usage: {total_size_gb:.2f} GB "
-                       f"(checkpoints: {checkpoint_size_gb:.2f} GB, logs: {log_size_gb:.2f} GB)")
+            # Check if we're still over the threshold after cleanup
+            current_checkpoint_size_gb = sum(
+                os.path.getsize(f) for f in self.checkpoint_dir.glob("**/*") if os.path.isfile(f)
+            ) / (1024 ** 3)
             
-            # If we're approaching the limit, take action
-            if total_size_gb > self.max_disk_usage_gb * 0.9:
-                logger.warning(f"Approaching max disk usage ({total_size_gb:.2f}/{self.max_disk_usage_gb} GB)")
-                
-                # First, remove some old checkpoints
-                self._cleanup_old_checkpoints()
-                
-                # If log directory exists and is using significant space, clean up old logs
-                if log_dir.exists() and log_size_gb > 0.5:
-                    log_files = sorted(
-                        log_dir.glob("*.log"),
-                        key=os.path.getmtime
-                    )
-                    
-                    # Keep the 5 most recent logs, remove others
-                    if len(log_files) > 5:
-                        for old_log in log_files[:-5]:
-                            try:
-                                os.remove(old_log)
-                                logger.info(f"Removed old log file: {old_log}")
-                            except Exception as e:
-                                logger.warning(f"Failed to remove old log file {old_log}: {e}")
-                
-                # Check if we're still over the threshold
-                if total_size_gb > self.max_disk_usage_gb:
-                    logger.critical(f"Disk usage critical: {total_size_gb:.2f}/{self.max_disk_usage_gb} GB")
-                    # In a critical situation, we might want to take more drastic action
-                    # like removing all but the most recent checkpoint
-                    # This is a last resort to avoid running out of disk space
-                    
-                    # Keep only the two most recent checkpoints and the best one
-                    latest_checkpoints = sorted(
-                        [f for f in self.checkpoint_dir.glob("checkpoint_*.pt") 
-                         if not str(f).endswith("checkpoint_best.pt")],
-                        key=os.path.getmtime
-                    )
-                    
-                    if len(latest_checkpoints) > 2:
-                        for checkpoint in latest_checkpoints[:-2]:
-                            if not str(checkpoint).endswith("checkpoint_best.pt"):
-                                try:
-                                    os.remove(checkpoint)
-                                    logger.warning(f"Emergency cleanup: removed {checkpoint}")
-                                except Exception as e:
-                                    logger.error(f"Failed to remove checkpoint during emergency cleanup: {e}")
+            if current_checkpoint_size_gb + log_size_gb > self.max_disk_usage_gb:
+                logger.warning("Still over disk usage threshold after cleanup. Consider increasing limit.")
             
         except Exception as e:
             logger.error(f"Error checking disk usage: {e}") 

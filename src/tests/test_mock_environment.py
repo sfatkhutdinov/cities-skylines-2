@@ -11,13 +11,16 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+import time
 
 # Add project root to path
-project_root = Path(__file__).parent.parent.parent
+current_dir = Path(__file__).parent
+project_root = current_dir.parent.parent
 sys.path.append(str(project_root))
 
 from src.environment.mock_environment import MockEnvironment
 from src.config.hardware_config import HardwareConfig
+from src.utils import get_output_dir
 
 def test_basic_functionality():
     """Test basic functionality of the mock environment."""
@@ -127,35 +130,33 @@ def test_error_conditions():
     print("Error condition test passed!")
 
 def test_visualization():
-    """Test visualization of the environment."""
-    env = MockEnvironment()
-    observation = env.reset()
+    """Test visualization of environment states."""
+    print("Testing visualization...")
     
-    # Create figure with subplots
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    axes = axes.flatten()
+    # Create environment
+    env = MockEnvironment(
+        render=False,
+        mock_rewards='constant',
+        mock_crashes=False,
+        mock_freezes=False,
+        mock_menus=False
+    )
     
-    # Collect frames for different actions
+    # Run through a few steps
+    env.reset()
     frames = []
-    for action in [0, 5, 10, 15]:
-        observation, _, _, _ = env.step(action)
-        frames.append(env.render())
+    titles = []
     
-    # Generate a menu frame
-    env.in_menu = True
-    frames.append(env._generate_menu_frame().permute(1, 2, 0).cpu().numpy())
+    # Collect frames from different actions
+    for action_name in ["build_residential", "build_commercial", "build_industrial", "build_road"]:
+        action = env.action_space.actions_by_name[action_name]
+        _, _, _, _ = env.step(action)
+        frame = env.render()
+        frames.append(frame)
+        titles.append(f"Action: {action_name}")
     
-    # Generate a crash frame (black screen)
-    black_screen = np.zeros((240, 320, 3), dtype=np.uint8)
-    frames.append(black_screen)
-    
-    # Plot frames
-    titles = [
-        "Road Action", "Residential Action", 
-        "Commercial Action", "Services Action",
-        "Menu Screen", "Crash Screen"
-    ]
-    
+    # Create a visualization
+    fig, axes = plt.subplots(1, len(frames), figsize=(16, 4))
     for i, (frame, title) in enumerate(zip(frames, titles)):
         axes[i].imshow(frame)
         axes[i].set_title(title)
@@ -164,8 +165,7 @@ def test_visualization():
     plt.tight_layout()
     
     # Save the figure
-    output_dir = project_root / "output"
-    output_dir.mkdir(exist_ok=True)
+    output_dir = get_output_dir()
     plt.savefig(output_dir / "mock_environment_visualization.png")
     
     plt.close()

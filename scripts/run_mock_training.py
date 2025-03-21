@@ -1,61 +1,51 @@
 #!/usr/bin/env python
 """
-Convenience script for running training with the mock environment.
+Script to run training with the mock environment.
 
-This script provides a simplified interface for running training using
-the mock environment for testing and development.
+This script provides a simplified interface for running training with the mock environment,
+which is useful for development and testing.
 """
 
 import os
 import sys
-import argparse
 import logging
+import argparse
+from pathlib import Path
+from datetime import datetime
 
-# Add project root to path
+# Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Import trainer components
-from src.training.utils import setup_config, setup_hardware_config, setup_environment, setup_agent
-from src.training.trainer import Trainer
-from src.utils.hardware_monitor import HardwareMonitor
-from src.utils.performance_safeguards import PerformanceSafeguards
+from src.train import main as train_main
+from src.utils import get_output_dir, get_path, ensure_dir_exists
 
 def parse_args():
-    """Parse command line arguments for training."""
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run training with mock environment")
     
-    # Training parameters
-    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes to train")
-    parser.add_argument("--steps", type=int, default=500, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for updates")
-    
-    # Output and visualization
-    parser.add_argument("--output_dir", type=str, default="output/mock_training", help="Output directory")
-    parser.add_argument("--render", action="store_true", help="Render visualization during training")
-    parser.add_argument("--no_save", action="store_true", help="Don't save checkpoints")
-    
-    # Environment configuration
-    parser.add_argument("--crash_prob", type=float, default=0.005, help="Probability of simulated crash")
-    parser.add_argument("--freeze_prob", type=float, default=0.01, help="Probability of simulated freeze")
-    parser.add_argument("--menu_prob", type=float, default=0.02, help="Probability of simulated menu")
-    
-    # Hardware acceleration
+    parser.add_argument("--episodes", type=int, default=10, help="Number of episodes to train")
+    parser.add_argument("--steps", type=int, default=200, help="Maximum steps per episode")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--learning-rate", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--render", action="store_true", help="Render environment")
     parser.add_argument("--gpu", action="store_true", help="Force GPU usage")
     parser.add_argument("--cpu", action="store_true", help="Force CPU usage")
-    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision")
+    parser.add_argument("--mixed-precision", action="store_true", help="Use mixed precision")
+    parser.add_argument("--no-save", action="store_true", help="Don't save checkpoints")
+    parser.add_argument("--output_dir", type=str, default="output/mock_training", help="Output directory")
     
     return parser.parse_args()
 
 def setup_logging():
-    """Set up logging for the script."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger(__name__)
+    """Set up logging configuration."""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(console_handler)
+    
+    return logger
 
 def main():
     """Main function to run training with mock environment."""
@@ -66,8 +56,9 @@ def main():
     logger = setup_logging()
     logger.info("Starting mock environment training")
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Create output directory using path utilities
+    output_path = get_path(args.output_dir)
+    ensure_dir_exists(output_path)
     
     # Set up configuration
     config_dict = {
@@ -78,19 +69,15 @@ def main():
             "batch_size": args.batch_size
         },
         "environment": {
-            "max_steps": args.steps,
-            "mock_settings": {
-                "crash_probability": args.crash_prob,
-                "freeze_probability": args.freeze_prob,
-                "menu_probability": args.menu_prob
-            }
+            "mock": True,
+            "render": args.render
         },
         "training": {
             "num_episodes": args.episodes,
             "max_steps": args.steps,
+            "learning_rate": args.learning_rate,
             "checkpoint_dir": os.path.join(args.output_dir, "checkpoints") if not args.no_save else None,
-            "checkpoint_freq": max(1, args.episodes // 10),  # Save 10 checkpoints
-            "render": args.render
+            "early_stop_reward": None  # Don't use early stopping for mock training
         }
     }
     

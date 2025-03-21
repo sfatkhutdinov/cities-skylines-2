@@ -13,6 +13,7 @@ import argparse
 import traceback
 from datetime import datetime
 import atexit
+from pathlib import Path
 
 # Import directly from utils.py
 from src.training.utils import parse_args, setup_config, setup_hardware_config, setup_environment
@@ -27,6 +28,12 @@ from src.memory.memory_augmented_network import MemoryAugmentedNetwork
 from src.model.visual_understanding_network import VisualUnderstandingNetwork
 from src.model.world_model import WorldModel
 from src.model.error_detection_network import ErrorDetectionNetwork
+from src.utils import (
+    get_logs_dir, 
+    get_output_dir, 
+    get_checkpoints_dir,
+    get_path
+)
 
 # Configure logging
 logging.basicConfig(
@@ -47,13 +54,12 @@ _exit_requested = False
 # Default game path for Steam installation
 DEFAULT_GAME_PATH = r"C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2.exe"
 
-def setup_file_logging(log_dir="logs"):
-    """Configure logging to write to a timestamped file in the specified directory."""
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+def setup_file_logging():
+    """Configure logging to write to a timestamped file in the logs directory."""
+    logs_dir = get_logs_dir()
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"training_{timestamp}.log")
+    log_file = logs_dir / f"training_{timestamp}.log"
     
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.DEBUG)

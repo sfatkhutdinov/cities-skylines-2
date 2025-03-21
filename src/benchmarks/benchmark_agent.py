@@ -16,16 +16,24 @@ import argparse
 import json
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
+import logging
 
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.append(str(project_root))
+# Add parent directory to path to import modules
+sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
 from src.environment.mock_environment import MockEnvironment
-from src.agent.ppo_agent import PPOAgent
+from src.agent.core.ppo_agent import PPOAgent
 from src.config.hardware_config import HardwareConfig
 from src.config.training_config import TrainingConfig
-from src.monitoring.hardware_monitor import HardwareMonitor
+from src.utils.hardware_monitor import HardwareMonitor
+from src.utils import get_output_dir, get_path
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Get project root directory
+project_root = Path(__file__).parent.parent.parent
 
 def parse_args():
     """Parse command line arguments."""
@@ -304,38 +312,41 @@ def save_results(results: Dict[str, Any], output_dir: Path) -> None:
         f.write(f"  GPU Memory: {serializable_results['hardware_metrics_summary']['gpu_memory_used_avg']:.2f} MB\n")
 
 def main():
-    """Main function to run the benchmark."""
+    """Run benchmark with command line arguments."""
     args = parse_args()
     
-    # Load configuration
-    if args.config:
-        with open(args.config, "r") as f:
-            config_data = json.load(f)
-        hardware_config = HardwareConfig(**config_data.get("hardware", {}))
-        training_config = TrainingConfig(**config_data.get("training", {}))
-    else:
-        # Use default configuration with command line overrides
-        hardware_config = HardwareConfig(
-            use_gpu=args.gpu,
-            use_cpu=args.cpu,
-            use_mixed_precision=args.mixed_precision
-        )
-        training_config = TrainingConfig()
+    # Configure hardware
+    hardware_config = setup_hardware_config(args)
     
-    # Initialize hardware monitor
-    hardware_monitor = HardwareMonitor(hardware_config)
+    # Configure training parameters
+    training_config = {
+        'num_episodes': args.episodes,
+        'max_steps': args.steps,
+        'batch_size': 64,
+        'learning_rate': 3e-4,
+        'gamma': 0.99,
+        'lambda_gae': 0.95,
+        'entropy_coef': 0.01,
+        'value_loss_coef': 0.5,
+        'clip_param': 0.2,
+        'max_grad_norm': 0.5,
+        'update_epochs': 4,
+        'early_stop_reward': 500
+    }
     
-    # Initialize environment
+    # Setup hardware monitor if enabled
+    hardware_monitor = HardwareMonitor(enabled=True, logging_interval=2)
+    
+    # Create mock environment
     env = MockEnvironment(
-        config=hardware_config,
-        max_steps=args.steps,
-        # Reduce error probabilities for benchmark
-        crash_probability=0.01,
-        freeze_probability=0.02,
-        menu_probability=0.05
+        render=False,
+        mock_rewards='realistic',
+        mock_crashes=False,
+        mock_freezes=False,
+        mock_menus=False
     )
     
-    # Initialize agent
+    # Create agent
     agent = PPOAgent(
         observation_space=env.observation_space,
         action_space=env.action_space,
@@ -345,7 +356,9 @@ def main():
     
     # Setup output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = project_root / "output" / args.output / timestamp
+    output_parent = get_output_dir() / args.output
+    output_dir = output_parent / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     print("Starting benchmark with the following configuration:")
     print(f"  Episodes: {args.episodes}")

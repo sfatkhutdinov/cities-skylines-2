@@ -22,6 +22,10 @@ The project uses a deep reinforcement learning approach with the following compo
 - **Agent**: Implements the PPO (Proximal Policy Optimization) reinforcement learning algorithm.
   - `agent/core`: Core agent components (policy, value, memory, updater)
 
+- **Memory**: Implements memory-augmented architectures for enhanced agent capabilities.
+  - `memory/memory_augmented_network.py`: Neural memory architecture
+  - `memory/episodic_memory.py`: Episodic memory functionality
+
 - **Model**: Neural network architecture for policy and value functions.
   - `model/optimized_network.py`: Optimized CNN network for visual processing
 
@@ -30,10 +34,11 @@ The project uses a deep reinforcement learning approach with the following compo
   - `training/checkpointing.py`: Checkpoint saving and loading
   - `training/signal_handlers.py`: Handles interrupts and signals
 
-- **Utils**: Utility functions and services.
+- **Utils**: Utility functions and services including monitoring capabilities.
   - `utils/image_utils.py`: Image processing utilities
   - `utils/hardware_monitor.py`: System resource monitoring
   - `utils/performance_safeguards.py`: Ensures stable performance
+  - `utils/visualization.py`: Visualization tools
 
 - **Config**: Configuration for hardware and action space.
   - `config/hardware_config.py`: Hardware configuration
@@ -63,19 +68,24 @@ cities-skylines-2/
 │   │   ├── menu/           # Menu handling
 │   │   ├── rewards/        # Reward computation
 │   │   └── mock_environment.py  # Simulated environment
+│   ├── memory/             # Memory-augmented architectures
 │   ├── model/              # Neural network models
-│   ├── monitoring/         # Performance monitoring
 │   ├── training/           # Training infrastructure
 │   ├── tests/              # Test scripts
-│   └── utils/              # Utility functions
+│   └── utils/              # Utility functions and monitoring
 ├── docs/                   # Documentation
-├── logs/                   # Log files
-├── output/                 # Generated outputs and visualizations
 ├── scripts/                # Utility scripts
 ├── venv/                   # Virtual environment
 ├── README.md               # Main README
 └── requirements.txt        # Python dependencies
 ```
+
+**Note**: The following directories are created at runtime:
+- `logs/`: Generated log files and tensorboard data
+- `output/`: Generated outputs, visualizations, and benchmark results
+- `checkpoints/`: Model checkpoints during and after training
+
+These directories are automatically created in the project root when needed by the application. All paths are managed by the path utilities in `src/utils/path_utils.py`, ensuring consistent file locations regardless of which directory you run the scripts from.
 
 ## 🚀 Installation
 
