@@ -11,111 +11,84 @@ import cv2
 import logging
 import os
 import pickle
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 
 logger = logging.getLogger(__name__)
 
 class VisualChangeAnalyzer:
     """Analyzes visual changes between frames and learns to associate them with outcomes."""
     
-    def __init__(self, 
-                 history_size: int = 1000, 
-                 association_threshold: float = 0.6,
-                 device: Optional[torch.device] = None):
+    def __init__(self, config=None):
         """Initialize visual change analyzer.
         
         Args:
-            history_size: Maximum number of visual change samples to keep
-            association_threshold: Minimum correlation to consider changes associated
-            device: Compute device to use
+            config: Configuration for visual change analysis
         """
-        self.history_size = history_size
-        self.association_threshold = association_threshold
-        self.device = device
+        self.config = config or {}
+        self.min_change_threshold = self.config.get('min_change_threshold', 0.05)
+        self.max_change_threshold = self.config.get('max_change_threshold', 0.8)
+        self.feature_extractor = VisualFeatureExtractor(config)
         
-        # Storage for visual change patterns and their outcomes
-        self.visual_changes = []  # List of visual change metrics
-        self.outcomes = []        # List of corresponding outcomes/rewards
-        
-        # Statistical trackers
-        self.change_mean = None
-        self.change_std = None
-        self.outcome_mean = 0.0
-        self.outcome_std = 1.0
-        
-        # State variables
-        self.update_count = 0
-        self.stats_update_freq = 50
-        
-    def get_visual_change_score(self, 
-                                frame1: np.ndarray, 
-                                frame2: np.ndarray) -> float:
-        """Calculate a score indicating degree of visual change between frames.
+    def get_visual_change_score(self, frame1, frame2):
+        """Compute visual change score between two frames.
         
         Args:
-            frame1: First frame (RGB format)
-            frame2: Second frame (RGB format)
+            frame1: First frame (numpy array or torch tensor)
+            frame2: Second frame (numpy array or torch tensor)
             
         Returns:
-            float: Visual change score (0-1 range)
+            float: Visual change score
+            dict: Detailed metrics
         """
         try:
-            # Convert to grayscale
-            if frame1.ndim == 3:
-                gray1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+            # Convert tensors to numpy arrays if needed
+            if isinstance(frame1, torch.Tensor):
+                frame1_np = frame1.detach().cpu().numpy()
+                if frame1_np.ndim == 3 and frame1_np.shape[0] == 3:  # CHW format
+                    frame1_np = np.transpose(frame1_np, (1, 2, 0))
             else:
-                gray1 = frame1
+                frame1_np = frame1
                 
-            if frame2.ndim == 3:
-                gray2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
+            if isinstance(frame2, torch.Tensor):
+                frame2_np = frame2.detach().cpu().numpy()
+                if frame2_np.ndim == 3 and frame2_np.shape[0] == 3:  # CHW format
+                    frame2_np = np.transpose(frame2_np, (1, 2, 0))
             else:
-                gray2 = frame2
-                
-            # Ensure same shape
-            if gray1.shape != gray2.shape:
-                logger.warning(f"Frame shapes differ: {gray1.shape} vs {gray2.shape}")
-                gray2 = cv2.resize(gray2, (gray1.shape[1], gray1.shape[0]))
-                
-            # Compute absolute difference
-            diff = cv2.absdiff(gray1, gray2)
+                frame2_np = frame2
             
-            # Apply threshold to identify changed pixels
-            _, thresholded = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+            # Extract features from frames
+            features1 = self.feature_extractor.extract_features(frame1_np)
+            features2 = self.feature_extractor.extract_features(frame2_np)
             
-            # Count changed pixels
-            change_pixels = np.count_nonzero(thresholded)
-            total_pixels = thresholded.size
+            # Compute feature differences
+            feature_diff = self.feature_extractor.compute_feature_difference(features1, features2)
             
-            # Calculate change percentage
-            change_percentage = change_pixels / total_pixels
+            # Compute feature importance weights
+            importance_weights = self.feature_extractor.get_feature_importance(feature_diff)
             
-            # Compute additional metrics
-            change_metrics = {
-                'pixel_change_ratio': change_percentage,
-                'mean_intensity_diff': np.mean(diff) / 255,
-                'max_intensity_diff': np.max(diff) / 255,
-                'std_intensity_diff': np.std(diff) / 255
+            # Compute weighted change score
+            total_importance = sum(importance_weights.values()) or 1.0
+            weighted_diff = sum(feature_diff[k] * importance_weights.get(k, 1.0) 
+                               for k in feature_diff)
+            change_score = weighted_diff / total_importance
+            
+            # Normalize change score to 0-1 range
+            normalized_score = min(1.0, max(0.0, 
+                                           (change_score - self.min_change_threshold) / 
+                                           (self.max_change_threshold - self.min_change_threshold)))
+            
+            # Return score and detailed metrics
+            metrics = {
+                'raw_score': float(change_score),
+                'normalized_score': float(normalized_score),
+                **feature_diff
             }
             
-            # Compute weighted score
-            weights = {
-                'pixel_change_ratio': 0.5,
-                'mean_intensity_diff': 0.2,
-                'max_intensity_diff': 0.1,
-                'std_intensity_diff': 0.2
-            }
-            
-            weighted_score = sum(metric * weights[name] 
-                                 for name, metric in change_metrics.items())
-            
-            # Scale to 0-1 range
-            scaled_score = min(1.0, weighted_score * 5.0)
-            
-            return scaled_score, change_metrics
+            return normalized_score, metrics
             
         except Exception as e:
-            logger.error(f"Error computing visual change: {e}")
-            return 0.0, {}
+            logger.error(f"Error computing visual change score: {e}")
+            return 0.0, {'error': str(e)}
             
     def update_with_outcome(self, 
                            change_metrics: Dict[str, float], 
@@ -358,107 +331,132 @@ class VisualChangeAnalyzer:
 
 
 class VisualFeatureExtractor:
-    """Extracts meaningful features from frames for reward analysis."""
+    """Extract meaningful features from frames for reward analysis."""
     
-    def __init__(self, device: Optional[torch.device] = None):
+    def __init__(self, config=None):
         """Initialize feature extractor.
         
         Args:
-            device: Compute device to use
+            config: Configuration for feature extraction
         """
-        self.device = device
+        self.config = config or {}
+        self.feature_history = []
+        self.edge_threshold = self.config.get('edge_threshold', 100)
+        self.hist_bins = self.config.get('histogram_bins', 32)
         
-        # Feature extraction parameters
-        self.edge_threshold1 = 50
-        self.edge_threshold2 = 150
-        self.hist_bins = 32
-        self.hist_channels = [0, 1, 2]  # RGB channels
-        self.hist_ranges = [0, 256, 0, 256, 0, 256]
-        
-    def extract_features(self, frame: np.ndarray) -> Dict[str, np.ndarray]:
+    def extract_features(self, frame):
         """Extract visual features from a frame.
         
         Args:
-            frame: Input frame (RGB format)
+            frame: Input frame as numpy array or PyTorch tensor
             
         Returns:
-            Dict: Visual features extracted from frame
+            dict: Extracted features
         """
-        features = {}
-        
         try:
-            # Convert to grayscale for edge detection
-            if frame.ndim == 3:
-                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            # Ensure frame is a valid numpy array
+            if frame is None:
+                logger.warning("Received None frame in extract_features")
+                return {'edges': np.array([]), 'color_hist': np.array([])}
+                
+            # Convert from tensor if needed
+            if isinstance(frame, torch.Tensor):
+                frame_np = frame.detach().cpu().numpy()
+                # Handle different tensor formats (CHW vs HWC)
+                if frame_np.ndim == 3 and frame_np.shape[0] == 3:  # CHW format
+                    frame_np = np.transpose(frame_np, (1, 2, 0))
             else:
-                gray = frame
+                frame_np = frame
+                
+            # Ensure frame is in correct format for OpenCV
+            if frame_np.ndim < 2:
+                logger.error(f"Invalid frame shape: {frame_np.shape}")
+                return {'edges': np.array([]), 'color_hist': np.array([])}
+                
+            # Convert to grayscale for edge detection
+            if frame_np.ndim == 3 and frame_np.shape[2] == 3:
+                gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+            elif frame_np.ndim == 2:
+                gray = frame_np
+            else:
+                logger.error(f"Unexpected frame format: {frame_np.shape}")
+                return {'edges': np.array([]), 'color_hist': np.array([])}
                 
             # Edge detection
-            edges = cv2.Canny(gray, self.edge_threshold1, self.edge_threshold2)
-            features['edges'] = edges
+            edges = cv2.Canny(gray, self.edge_threshold, self.edge_threshold * 2)
+            edge_pixels = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1])
             
-            # Color histogram
-            if frame.ndim == 3:
-                hist = cv2.calcHist([frame], self.hist_channels, None, 
-                                    [self.hist_bins, self.hist_bins, self.hist_bins], 
-                                    self.hist_ranges)
-                hist = cv2.normalize(hist, hist).flatten()
-                features['color_hist'] = hist
-                
-            # Calculate image stats
-            features['mean_intensity'] = np.mean(gray)
-            features['std_intensity'] = np.std(gray)
+            # Color histogram (if color image)
+            if frame_np.ndim == 3 and frame_np.shape[2] == 3:
+                hsv = cv2.cvtColor(frame_np, cv2.COLOR_RGB2HSV)
+                hist = cv2.calcHist([hsv], [0, 1], None, [self.hist_bins, self.hist_bins], 
+                                    [0, 180, 0, 256])
+                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                hist_flat = hist.flatten()
+            else:
+                # For grayscale, create a simple intensity histogram
+                hist = cv2.calcHist([gray], [0], None, [self.hist_bins], [0, 256])
+                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                hist_flat = hist.flatten()
             
-            # Edge density
-            features['edge_density'] = np.count_nonzero(edges) / edges.size
+            # Store features
+            features = {
+                'edges': edge_pixels,
+                'color_hist': hist_flat
+            }
+            
+            # Add to history if needed
+            if len(self.feature_history) >= 10:
+                self.feature_history.pop(0)
+            self.feature_history.append(features)
             
             return features
             
         except Exception as e:
             logger.error(f"Error extracting visual features: {e}")
-            return {}
-            
-    def compute_feature_difference(self, 
-                                  features1: Dict[str, np.ndarray], 
-                                  features2: Dict[str, np.ndarray]) -> Dict[str, float]:
-        """Compute difference metrics between two sets of features.
+            return {'edges': np.array([]), 'color_hist': np.array([])}
+    
+    def compute_feature_difference(self, features1, features2):
+        """Compute difference between feature sets.
         
         Args:
-            features1: First set of features
-            features2: Second set of features
+            features1: First feature set
+            features2: Second feature set
             
         Returns:
-            Dict: Difference metrics
+            dict: Feature differences
         """
-        diff_metrics = {}
-        
         try:
+            if not features1 or not features2:
+                return {'edge_diff': 0.0, 'color_diff': 0.0}
+                
             # Edge difference
-            if 'edges' in features1 and 'edges' in features2:
-                edge_diff = cv2.absdiff(features1['edges'], features2['edges'])
-                diff_metrics['edge_change'] = np.count_nonzero(edge_diff) / edge_diff.size
-                
-            # Histogram difference
-            if 'color_hist' in features1 and 'color_hist' in features2:
-                hist_diff = cv2.compareHist(
-                    features1['color_hist'], features2['color_hist'], cv2.HISTCMP_BHATTACHARYYA)
-                diff_metrics['hist_diff'] = hist_diff
-                
-            # Mean intensity change
-            if 'mean_intensity' in features1 and 'mean_intensity' in features2:
-                intensity_diff = abs(features1['mean_intensity'] - features2['mean_intensity'])
-                diff_metrics['intensity_change'] = intensity_diff / 255.0
-                
-            # Edge density change
-            if 'edge_density' in features1 and 'edge_density' in features2:
-                density_diff = abs(features1['edge_density'] - features2['edge_density'])
-                diff_metrics['edge_density_change'] = density_diff
-                
-            return diff_metrics
+            edge_diff = abs(features1['edges'] - features2['edges'])
             
+            # Color histogram difference
+            hist1 = features1['color_hist']
+            hist2 = features2['color_hist']
+            
+            if hist1.size == 0 or hist2.size == 0:
+                color_diff = 0.0
+            elif hist1.shape != hist2.shape:
+                logger.warning(f"Histogram shapes don't match: {hist1.shape} vs {hist2.shape}")
+                # Resize smaller histogram to match larger one
+                if hist1.size < hist2.size:
+                    hist1 = np.resize(hist1, hist2.shape)
+                else:
+                    hist2 = np.resize(hist2, hist1.shape)
+                color_diff = np.sum(cv2.absdiff(hist1, hist2)) / max(hist1.size, 1)
+            else:
+                color_diff = np.sum(cv2.absdiff(hist1, hist2)) / max(hist1.size, 1)
+            
+            return {
+                'edge_diff': float(edge_diff),
+                'color_diff': float(color_diff)
+            }
         except Exception as e:
             logger.error(f"Error computing feature difference: {e}")
-            return {}
+            return {'edge_diff': 0.0, 'color_diff': 0.0}
             
     def get_feature_importance(self, diff_metrics: Dict[str, float]) -> Dict[str, float]:
         """Get importance weights for different feature differences.

@@ -5,8 +5,9 @@ This module provides a reward system that learns to provide rewards
 without explicit game metrics, based on visual changes and predictions.
 """
 
-import torch
 import numpy as np
+import torch
+import torch.nn.functional as F
 import logging
 import time
 import os
@@ -21,6 +22,7 @@ from src.environment.rewards.analyzers import VisualChangeAnalyzer, VisualFeatur
 from src.environment.rewards.calibration import RewardNormalizer, RewardScaler, RewardShaper
 from src.environment.rewards.world_model import WorldModelCNN, ExperienceBuffer, WorldModelTrainer
 
+# Configure logger
 logger = logging.getLogger(__name__)
 
 class ActionOutcomeTracker:
@@ -280,73 +282,79 @@ class AutonomousRewardSystem:
         
     def _init_components(self) -> None:
         """Initialize reward system components."""
-        # Initialize world model
-        self.world_model = WorldModelCNN(
-            input_channels=3,
-            embedding_dim=self.feature_dim,
-            action_dim=self.action_dim,
-            device=self.device
-        )
-        
-        # Initialize experience buffer
-        self.experience_buffer = ExperienceBuffer(
-            capacity=self.config.get("experience_buffer_size", 10000)
-        )
-        
-        # Initialize world model trainer
-        self.world_model_trainer = WorldModelTrainer(
-            world_model=self.world_model,
-            experience_buffer=self.experience_buffer,
-            learning_rate=self.config.get("world_model_lr", 0.001),
-            batch_size=self.config.get("world_model_batch_size", 64),
-            device=self.device
-        )
-        
-        # Initialize density estimator
-        self.density_estimator = DensityEstimator(
-            feature_dim=self.feature_dim,
-            history_size=self.config.get("density_history_size", 2000),
-            device=self.device
-        )
-        
-        # Initialize temporal association memory
-        self.association_memory = TemporalAssociationMemory(
-            feature_dim=self.feature_dim,
-            history_size=self.config.get("association_history_size", 1000),
-            device=self.device
-        )
-        
-        # Initialize visual change analyzer
-        self.visual_change_analyzer = VisualChangeAnalyzer(
-            history_size=self.config.get("visual_change_history_size", 1000),
-            device=self.device
-        )
-        
-        # Initialize visual feature extractor
-        self.feature_extractor = VisualFeatureExtractor(
-            device=self.device
-        )
-        
-        # Initialize reward normalizer
-        self.reward_normalizer = RewardNormalizer(
-            window_size=self.config.get("reward_window_size", 10000),
-            clip_range=self.config.get("reward_clip_range", 10.0)
-        )
-        
-        # Initialize reward scaler
-        self.reward_scaler = RewardScaler(
-            target_min=self.config.get("reward_target_min", -1.0),
-            target_max=self.config.get("reward_target_max", 1.0)
-        )
-        
-        # Initialize reward shaper
-        self.reward_shaper = RewardShaper()
-        
-        # Initialize action outcome tracker
-        self.action_tracker = ActionOutcomeTracker(
-            action_dim=self.action_dim,
-            memory_size=self.config.get("action_memory_size", 1000)
-        )
+        try:
+            # Create feature extractor
+            self.feature_extractor = VisualFeatureExtractor(
+                config={
+                    'edge_threshold': 100,
+                    'histogram_bins': 32
+                }
+            )
+            
+            # Create visual change analyzer
+            self.visual_change_analyzer = VisualChangeAnalyzer(
+                config={
+                    'min_change_threshold': 0.05,
+                    'max_change_threshold': 0.8,
+                    'edge_threshold': 100,
+                    'histogram_bins': 32
+                }
+            )
+            
+            # Create density estimator
+            self.density_estimator = DensityEstimator(
+                feature_dim=self.feature_dim,
+                history_size=1000,
+                device=self.device
+            )
+            
+            # Create association memory
+            self.association_memory = TemporalAssociationMemory(
+                feature_dim=self.feature_dim,
+                history_size=1000,
+                device=self.device
+            )
+            
+            # Create world model
+            self.world_model = WorldModelCNN(
+                input_channels=3,
+                action_dim=self.action_dim,
+                embedding_dim=self.feature_dim,
+                device=self.device
+            )
+            
+            # Create experience buffer
+            self.experience_buffer = ExperienceBuffer(
+                capacity=10000
+            )
+            
+            # Create world model trainer
+            self.world_model_trainer = WorldModelTrainer(
+                world_model=self.world_model,
+                experience_buffer=self.experience_buffer,
+                device=self.device
+            )
+            
+            # Create reward calibration
+            self.reward_normalizer = RewardNormalizer(
+                window_size=1000,
+                update_freq=50
+            )
+            self.reward_scaler = RewardScaler(
+                target_min=-1.0,
+                target_max=1.0
+            )
+            
+            # Create action tracker
+            self.action_tracker = ActionOutcomeTracker(
+                action_dim=self.action_dim,
+                memory_size=1000
+            )
+            
+            logger.info("Reward system components initialized")
+        except Exception as e:
+            logger.error(f"Error initializing reward system components: {e}")
+            raise
         
     def save_state(self, save_dir: Optional[str] = None) -> None:
         """Save reward system state to disk.
@@ -468,32 +476,59 @@ class AutonomousRewardSystem:
             logger.error(f"Error loading reward system state: {e}")
             
     def compute_reward(self, 
-                      current_frame: np.ndarray,
-                      action: np.ndarray,
-                      next_frame: np.ndarray) -> float:
+                      current_frame: torch.Tensor,
+                      action_idx: int,
+                      next_frame: torch.Tensor) -> float:
         """Compute reward based on visual changes between frames.
         
         Args:
-            current_frame: Current frame observation
-            action: Action taken
-            next_frame: Next frame observation
+            current_frame: Current frame observation (PyTorch tensor)
+            action_idx: Index of action taken
+            next_frame: Next frame observation (PyTorch tensor)
             
         Returns:
             float: Computed reward
         """
         try:
-            # Extract state embedding
-            current_frame_tensor = torch.tensor(current_frame, dtype=torch.float32).unsqueeze(0)
-            action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-            next_frame_tensor = torch.tensor(next_frame, dtype=torch.float32).unsqueeze(0)
+            # Convert PyTorch tensors to numpy arrays for OpenCV operations
+            if isinstance(current_frame, torch.Tensor):
+                current_frame_np = current_frame.detach().cpu().numpy()
+                # If tensor is in CHW format, convert to HWC for OpenCV
+                if current_frame_np.shape[0] == 3:  # CHW format
+                    current_frame_np = np.transpose(current_frame_np, (1, 2, 0))
+            else:
+                current_frame_np = current_frame
+                
+            if isinstance(next_frame, torch.Tensor):
+                next_frame_np = next_frame.detach().cpu().numpy()
+                # If tensor is in CHW format, convert to HWC for OpenCV
+                if next_frame_np.shape[0] == 3:  # CHW format
+                    next_frame_np = np.transpose(next_frame_np, (1, 2, 0))
+            else:
+                next_frame_np = next_frame
+            
+            # Create tensor versions for PyTorch operations
+            current_frame_tensor = torch.tensor(current_frame_np, dtype=torch.float32).unsqueeze(0)
+            # Convert action_idx to a tensor with correct shape
+            action_tensor = torch.zeros(self.action_dim, dtype=torch.float32)
+            action_tensor[action_idx] = 1.0  # One-hot encoding
+            action_tensor = action_tensor.unsqueeze(0)  # Add batch dimension
+            next_frame_tensor = torch.tensor(next_frame_np, dtype=torch.float32).unsqueeze(0)
+            
+            # Ensure frames are in correct format (B, C, H, W)
+            if current_frame_tensor.dim() == 4 and current_frame_tensor.shape[1] != 3:
+                # Move channel dimension to correct position if needed
+                current_frame_tensor = current_frame_tensor.permute(0, 3, 1, 2)
+            if next_frame_tensor.dim() == 4 and next_frame_tensor.shape[1] != 3:
+                next_frame_tensor = next_frame_tensor.permute(0, 3, 1, 2)
             
             # Get state embedding
             with torch.no_grad():
                 current_state_embedding = self.world_model.encode(current_frame_tensor)
                 
-            # Extract visual features
-            current_features = self.feature_extractor.extract_features(current_frame)
-            next_features = self.feature_extractor.extract_features(next_frame)
+            # Extract visual features - use numpy arrays for OpenCV compatibility
+            current_features = self.feature_extractor.extract_features(current_frame_np)
+            next_features = self.feature_extractor.extract_features(next_frame_np)
             
             # Compute feature differences
             feature_diff = self.feature_extractor.compute_feature_difference(
@@ -501,15 +536,15 @@ class AutonomousRewardSystem:
                 
             # Compute visual change score
             visual_change_score, change_metrics = self.visual_change_analyzer.get_visual_change_score(
-                current_frame, next_frame)
+                current_frame_np, next_frame_np)
                 
             # Add to experience buffer for world model training
             self.experience_buffer.add(
-                current_frame, action, next_frame, 0.0)  # Reward will be updated later
+                current_frame_np, action_idx, next_frame_np, 0.0)  # Reward will be updated later
                 
             # Compute prediction error component
             prediction_error = self._compute_prediction_error_reward(
-                current_frame_tensor, action_tensor, next_frame_tensor)
+                current_state_embedding, action_tensor, next_frame_tensor)
                 
             # Compute visual change component
             visual_change_reward = self._compute_visual_change_reward(
@@ -543,16 +578,15 @@ class AutonomousRewardSystem:
             self.cumulative_reward += scaled_reward
             self.steps_since_reset += 1
             
-            # Update action tracker
-            action_idx = np.argmax(action) if action.size > 1 else 0
+            # Update action tracker - action_idx is already a scalar
             self.action_tracker.update_action_tracking(action_idx, scaled_reward)
             
             # Update association memory
             self.association_memory.store(current_state_embedding.cpu(), scaled_reward)
             
             # Store for next iteration
-            self.last_frame = current_frame
-            self.last_action = action
+            self.last_frame = current_frame_np
+            self.last_action = action_idx
             self.last_state_embedding = current_state_embedding
             self.last_visual_features = current_features
             
@@ -573,37 +607,62 @@ class AutonomousRewardSystem:
             logger.error(f"Error computing reward: {e}")
             return 0.0
             
-    def _compute_prediction_error_reward(self, 
-                                        current_frame: torch.Tensor,
-                                        action: torch.Tensor,
-                                        next_frame: torch.Tensor) -> float:
-        """Compute reward component based on world model prediction error.
+    def _compute_prediction_error_reward(self, current_state, action_tensor, next_state):
+        """Compute reward based on prediction error.
         
         Args:
-            current_frame: Current frame tensor
-            action: Action tensor
-            next_frame: Next frame tensor
+            current_state: Current state tensor
+            action_tensor: Action tensor
+            next_state: Next state tensor
             
         Returns:
             float: Prediction error reward
         """
         try:
+            # Ensure we have the right shapes for prediction
+            if isinstance(current_state, torch.Tensor) and current_state.dim() < 2:
+                current_state = current_state.unsqueeze(0)  # Add batch dimension
+                
+            if isinstance(action_tensor, torch.Tensor) and action_tensor.dim() < 2:
+                action_tensor = action_tensor.unsqueeze(0)  # Add batch dimension
+                
+            if isinstance(next_state, torch.Tensor) and next_state.dim() < 2:
+                next_state = next_state.unsqueeze(0)  # Add batch dimension
+                
+            # Get world model's prediction
             with torch.no_grad():
-                # Get world model prediction
-                predicted_next, _ = self.world_model(current_frame, action)
+                prediction = self.world_model.predict(current_state, action_tensor)
                 
-                # Compute prediction error
-                error = self.world_model.compute_prediction_error(predicted_next, next_frame)
-                error = error.item()
+            # If prediction and next_state have incompatible shapes, reshape them
+            if prediction.shape != next_state.shape:
+                # If dimensions differ completely, log error and return 0
+                if prediction.dim() != next_state.dim():
+                    logger.error(f"Incompatible tensor dimensions: prediction {prediction.shape} vs next_state {next_state.shape}")
+                    return 0.0
+                    
+                # Otherwise try to align dimensions
+                if prediction.shape[0] != next_state.shape[0]:
+                    if prediction.shape[0] == 1:
+                        prediction = prediction.expand(next_state.shape[0], *prediction.shape[1:])
+                    elif next_state.shape[0] == 1:
+                        next_state = next_state.expand(prediction.shape[0], *next_state.shape[1:])
+                    else:
+                        logger.error(f"Cannot reconcile batch dimensions: {prediction.shape[0]} vs {next_state.shape[0]}")
+                        return 0.0
                 
-                # Convert to reward (higher error = lower reward)
-                reward = 1.0 - min(1.0, error * 10.0)  # Scale error to 0-1 range
-                
-                # Store error for monitoring
-                self.last_error = error
-                
-                return reward
-                
+                # Adjust feature dimensions if needed by padding or truncating
+                if prediction.dim() > 1 and next_state.dim() > 1:
+                    min_feat_dim = min(prediction.shape[1], next_state.shape[1])
+                    prediction = prediction[:, :min_feat_dim]
+                    next_state = next_state[:, :min_feat_dim]
+                    
+            # Compute prediction error (MSE)
+            prediction_error = F.mse_loss(prediction, next_state).item()
+            
+            # Convert to reward (higher error = lower reward)
+            reward = 1.0 - min(prediction_error / self.error_normalization_factor, 1.0)
+            
+            return reward
         except Exception as e:
             logger.error(f"Error computing prediction error reward: {e}")
             return 0.0
