@@ -348,58 +348,58 @@ class CheckpointManager:
         
         Cleans up old checkpoints and logs if they exceed the specified disk usage.
         """
-        # Check total size of checkpoints
-        checkpoint_size_gb = 0
-        if self.checkpoint_dir.exists():
-            checkpoint_size_gb = sum(
-                os.path.getsize(f) for f in self.checkpoint_dir.glob("**/*") if os.path.isfile(f)
-            ) / (1024 ** 3)
-        
-        # Check total size of logs
-        logs_dir = get_logs_dir()
-        log_size_gb = 0
-        if logs_dir.exists():
-            log_size_gb = sum(
-                os.path.getsize(f) for f in logs_dir.glob("**/*") if os.path.isfile(f)
-            ) / (1024 ** 3)
-        
-        total_size_gb = checkpoint_size_gb + log_size_gb
-        logger.debug(
-            f"Current disk usage: {total_size_gb:.2f} GB "
-            f"(checkpoints: {checkpoint_size_gb:.2f} GB, logs: {log_size_gb:.2f} GB)"
-        )
-        
-        # Clean up logs if they're using significant space
-        if logs_dir.exists() and log_size_gb > 0.5:
-            log_files = sorted(
-                logs_dir.glob("*.log"),
-                key=lambda f: os.path.getmtime(f)
+        try:
+            # Check total size of checkpoints
+            checkpoint_size_gb = 0
+            if self.checkpoint_dir.exists():
+                checkpoint_size_gb = sum(
+                    os.path.getsize(f) for f in self.checkpoint_dir.glob("**/*") if os.path.isfile(f)
+                ) / (1024 ** 3)
+            
+            # Check total size of logs
+            logs_dir = get_logs_dir()
+            log_size_gb = 0
+            if logs_dir.exists():
+                log_size_gb = sum(
+                    os.path.getsize(f) for f in logs_dir.glob("**/*") if os.path.isfile(f)
+                ) / (1024 ** 3)
+            
+            total_size_gb = checkpoint_size_gb + log_size_gb
+            logger.debug(
+                f"Current disk usage: {total_size_gb:.2f} GB "
+                f"(checkpoints: {checkpoint_size_gb:.2f} GB, logs: {log_size_gb:.2f} GB)"
             )
             
-            # Keep the 5 most recent logs, remove others
-            if len(log_files) > 5:
-                old_logs = log_files[:-5]
-                for old_log in old_logs:
-                    try:
-                        logger.info(f"Removing old log file: {old_log}")
-                        os.remove(old_log)
-                    except Exception as e:
-                        logger.warning(f"Failed to remove old log file {old_log}: {e}")
-        
-        # If we're approaching the limit, take action
-        if total_size_gb > self.max_disk_usage_gb * 0.9:
-            logger.warning(f"Approaching max disk usage ({total_size_gb:.2f}/{self.max_disk_usage_gb} GB)")
+            # Clean up logs if they're using significant space
+            if logs_dir.exists() and log_size_gb > 0.5:
+                log_files = sorted(
+                    logs_dir.glob("*.log"),
+                    key=lambda f: os.path.getmtime(f)
+                )
+                
+                # Keep the 5 most recent logs, remove others
+                if len(log_files) > 5:
+                    old_logs = log_files[:-5]
+                    for old_log in old_logs:
+                        try:
+                            logger.info(f"Removing old log file: {old_log}")
+                            os.remove(old_log)
+                        except Exception as e:
+                            logger.warning(f"Failed to remove old log file {old_log}: {e}")
             
-            # First, remove some old checkpoints
-            self._cleanup_old_checkpoints()
-            
-            # Check if we're still over the threshold after cleanup
-            current_checkpoint_size_gb = sum(
-                os.path.getsize(f) for f in self.checkpoint_dir.glob("**/*") if os.path.isfile(f)
-            ) / (1024 ** 3)
-            
-            if current_checkpoint_size_gb + log_size_gb > self.max_disk_usage_gb:
-                logger.warning("Still over disk usage threshold after cleanup. Consider increasing limit.")
-            
+            # If we're approaching the limit, take action
+            if total_size_gb > self.max_disk_usage_gb * 0.9:
+                logger.warning(f"Approaching max disk usage ({total_size_gb:.2f}/{self.max_disk_usage_gb} GB)")
+                
+                # First, remove some old checkpoints
+                self._cleanup_old_checkpoints()
+                
+                # Check if we're still over the threshold after cleanup
+                current_checkpoint_size_gb = sum(
+                    os.path.getsize(f) for f in self.checkpoint_dir.glob("**/*") if os.path.isfile(f)
+                ) / (1024 ** 3)
+                
+                if current_checkpoint_size_gb + log_size_gb > self.max_disk_usage_gb:
+                    logger.warning("Still over disk usage threshold after cleanup. Consider increasing limit.")
         except Exception as e:
             logger.error(f"Error checking disk usage: {e}") 

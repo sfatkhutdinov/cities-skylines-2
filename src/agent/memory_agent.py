@@ -58,9 +58,31 @@ class MemoryAugmentedAgent(PPOAgent):
                 attention_heads=getattr(policy_network, 'attention_heads', 4)
             )
             policy_network = memory_network
+        
+        # Extract state_dim and action_dim for PPOAgent
+        if hasattr(observation_space, 'shape'):
+            state_dim = observation_space.shape
+        else:
+            state_dim = observation_space
             
-        # Initialize base PPO agent
-        super().__init__(policy_network, observation_space, action_space, device, **kwargs)
+        if hasattr(action_space, 'n'):
+            action_dim = action_space.n
+        else:
+            action_dim = action_space
+            
+        # Create a hardware config with the device if not already in kwargs
+        from src.config.hardware_config import HardwareConfig
+        config = kwargs.pop('config', None)
+        if config is None:
+            config = HardwareConfig()
+            if device is not None:
+                config.device = str(device).split(':')[0]  # Extract 'cuda' or 'cpu' from the device
+
+        # Initialize base PPO agent with the appropriate parameters
+        super().__init__(state_dim, action_dim, config, **kwargs)
+        
+        # Store the policy network
+        self.policy = policy_network
         
         self.memory_use_prob = memory_use_prob
         self.memory_enabled = True

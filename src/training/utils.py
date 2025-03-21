@@ -23,58 +23,84 @@ from src.environment.core import Environment
 
 logger = logging.getLogger(__name__)
 
-def parse_args():
+def parse_args(parser=None):
     """Parse command line arguments for training.
+    
+    Args:
+        parser: Optional ArgumentParser instance
     
     Returns:
         Parsed arguments
     """
-    parser = argparse.ArgumentParser(description="Train reinforcement learning agent")
+    if parser is None:
+        parser = argparse.ArgumentParser(description="Train reinforcement learning agent")
+    
+    def add_argument_if_not_exists(parser, *args, **kwargs):
+        """Add argument only if it doesn't already exist."""
+        dest = kwargs.get('dest')
+        if not dest:
+            # Extract dest from the argument name
+            for arg in args:
+                if arg.startswith('--'):
+                    dest = arg[2:].replace('-', '_')
+                    break
+        
+        # Check if argument already exists
+        if dest and any(action.dest == dest for action in parser._actions):
+            return
+        
+        # Add the argument
+        parser.add_argument(*args, **kwargs)
     
     # Config file options
-    parser.add_argument("--config", type=str, help="Path to configuration file")
-    parser.add_argument("--save_config", type=str, help="Save current configuration to file")
+    add_argument_if_not_exists(parser, "--config", type=str, help="Path to configuration file")
+    add_argument_if_not_exists(parser, "--save_config", type=str, help="Save current configuration to file")
     
     # Training parameters
-    parser.add_argument("--num_episodes", type=int, default=1000, help="Number of episodes to train for")
-    parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps per episode")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for updates")
-    parser.add_argument("--learning_rate", type=float, default=0.0001, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.995, help="Discount factor")
-    parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
-    parser.add_argument("--clip_param", type=float, default=0.2, help="PPO clipping parameter")
-    parser.add_argument("--early_stop_reward", type=float, default=None, help="Early stopping reward threshold")
+    add_argument_if_not_exists(parser, "--num_episodes", type=int, default=1000, help="Number of episodes to train for")
+    add_argument_if_not_exists(parser, "--max_steps", type=int, default=2000, help="Maximum steps per episode")
+    add_argument_if_not_exists(parser, "--batch_size", type=int, default=128, help="Batch size for updates")
+    add_argument_if_not_exists(parser, "--learning_rate", type=float, default=0.0001, help="Learning rate")
+    add_argument_if_not_exists(parser, "--gamma", type=float, default=0.995, help="Discount factor")
+    add_argument_if_not_exists(parser, "--gae_lambda", type=float, default=0.95, help="GAE lambda parameter")
+    add_argument_if_not_exists(parser, "--clip_param", type=float, default=0.2, help="PPO clipping parameter")
+    add_argument_if_not_exists(parser, "--early_stop_reward", type=float, default=None, help="Early stopping reward threshold")
     
     # Checkpointing and resumption
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=5, help="Episodes between checkpoints")
-    parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load")
+    add_argument_if_not_exists(parser, "--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    add_argument_if_not_exists(parser, "--checkpoint_interval", type=int, default=5, help="Episodes between checkpoints")
+    add_argument_if_not_exists(parser, "--load_checkpoint", type=str, help="Path to checkpoint to load")
     
     # Environment options
-    parser.add_argument("--mock_env", action="store_true", help="Use mock environment")
-    parser.add_argument("--game_path", type=str, help="Path to Cities Skylines 2 executable")
-    parser.add_argument("--pixel_size", type=int, default=128, help="Size of observation pixels")
+    add_argument_if_not_exists(parser, "--mock_env", action="store_true", help="Use mock environment")
+    add_argument_if_not_exists(parser, "--game_path", type=str, help="Path to Cities Skylines 2 executable")
+    add_argument_if_not_exists(parser, "--pixel_size", type=int, default=128, help="Size of observation pixels")
+    add_argument_if_not_exists(parser, "--disable_menu_detection", action="store_true", help="Disable menu detection")
+    add_argument_if_not_exists(parser, "--skip_game_check", action="store_true", default=True, help="Skip game presence check")
+    add_argument_if_not_exists(parser, "--window_title", type=str, default="Cities: Skylines II", help="Game window title")
     
     # Rendering options
-    parser.add_argument("--render", action="store_true", help="Render environment")
-    parser.add_argument("--verbose", action="store_true", help="Print verbose output")
+    add_argument_if_not_exists(parser, "--render", action="store_true", help="Render environment")
+    add_argument_if_not_exists(parser, "--verbose", action="store_true", help="Print verbose output")
     
     # Hardware options
-    parser.add_argument("--cpu", action="store_true", help="Force CPU usage")
-    parser.add_argument("--gpu", type=int, default=0, help="GPU device to use")
-    parser.add_argument("--mixed_precision", action="store_true", default=True, help="Use mixed precision training")
-    parser.add_argument("--monitor_hardware", action="store_true", default=True, help="Monitor hardware usage")
+    add_argument_if_not_exists(parser, "--cpu", action="store_true", help="Force CPU usage")
+    add_argument_if_not_exists(parser, "--gpu", type=int, default=0, help="GPU device to use")
+    add_argument_if_not_exists(parser, "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (cuda/cpu)")
+    add_argument_if_not_exists(parser, "--resolution", type=str, default="84x84", help="Observation resolution")
+    add_argument_if_not_exists(parser, "--mixed_precision", action="store_true", default=True, help="Use mixed precision training")
+    add_argument_if_not_exists(parser, "--monitor_hardware", action="store_true", default=True, help="Monitor hardware usage")
     
     # Agent options
-    parser.add_argument("--action_repeat", type=int, default=1, help="Number of times to repeat actions")
-    parser.add_argument("--action_delay", type=float, default=0.25, help="Delay between actions")
+    add_argument_if_not_exists(parser, "--action_repeat", type=int, default=1, help="Number of times to repeat actions")
+    add_argument_if_not_exists(parser, "--action_delay", type=float, default=0.25, help="Delay between actions")
     
     # Memory options (MANN is enabled by default)
-    parser.add_argument("--disable_memory", action="store_true", help="Disable memory-augmented agent (uses standard PPO)")
-    parser.add_argument("--memory_size", type=int, default=2000, help="Size of episodic memory")
-    parser.add_argument("--memory_use_prob", type=float, default=0.9, help="Probability of using memory during inference")
-    parser.add_argument("--memory_warmup", type=int, default=10, help="Episodes before memory is used")
-    parser.add_argument("--memory_curriculum", action="store_true", default=True, help="Use curriculum learning for memory usage")
+    add_argument_if_not_exists(parser, "--disable_memory", action="store_true", help="Disable memory-augmented agent (uses standard PPO)")
+    add_argument_if_not_exists(parser, "--memory_size", type=int, default=2000, help="Size of episodic memory")
+    add_argument_if_not_exists(parser, "--memory_use_prob", type=float, default=0.9, help="Probability of using memory during inference")
+    add_argument_if_not_exists(parser, "--memory_warmup", type=int, default=10, help="Episodes before memory is used")
+    add_argument_if_not_exists(parser, "--memory_curriculum", action="store_true", default=True, help="Use curriculum learning for memory usage")
     
     return parser.parse_args()
 
@@ -196,8 +222,30 @@ def setup_hardware_config(args):
         use_fp16=mixed_precision
     )
     
+    # Add memory configuration
+    hardware_config.memory = {
+        'enabled': not (hasattr(args, 'disable_memory') and args.disable_memory),
+        'memory_size': args.memory_size if hasattr(args, 'memory_size') else 2000,
+        'memory_use_probability': args.memory_use_prob if hasattr(args, 'memory_use_prob') else 0.9,
+        'key_size': 128,
+        'value_size': 256,
+        'retrieval_threshold': 0.5,
+        'warmup_episodes': args.memory_warmup if hasattr(args, 'memory_warmup') else 10,
+        'use_curriculum': True,
+    }
+    
+    # Add required configuration attributes
+    hardware_config.clip_param = args.clip_param if hasattr(args, 'clip_param') else 0.2
+    hardware_config.value_loss_coef = 0.5
+    hardware_config.entropy_coef = 0.01
+    hardware_config.learning_rate = args.learning_rate if hasattr(args, 'learning_rate') else 0.0001
+    hardware_config.num_episodes = args.num_episodes if hasattr(args, 'num_episodes') else 1000
+    hardware_config.max_steps = args.max_steps if hasattr(args, 'max_steps') else 2000
+    hardware_config.max_checkpoints = 5
+    hardware_config.max_grad_norm = 0.5
+    
     # Log hardware configuration
-    logger.info(f"Hardware configuration:")
+    logger.info(f"Hardware configuration initialized - Device: {device}, Resolution: {resolution}, Batch size: {batch_size}, FP16: {mixed_precision}")
     logger.info(f"  Device: {hardware_config.get_device()}")
     logger.info(f"  Resolution: {hardware_config.resolution}")
     logger.info(f"  Batch size: {hardware_config.batch_size}")

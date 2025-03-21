@@ -18,9 +18,13 @@ The project uses a deep reinforcement learning approach with the following compo
   - `environment/menu`: Menu detection and navigation
   - `environment/rewards`: Reward computation based on visual changes
   - `environment/mock_environment.py`: Simulated environment for testing without the game
+  - `environment/optimized_capture.py`: Optimized screen capture implementation
+  - `environment/visual_metrics.py`: Visual metrics and measurements
 
 - **Agent**: Implements the PPO (Proximal Policy Optimization) reinforcement learning algorithm.
   - `agent/core`: Core agent components (policy, value, memory, updater)
+  - `agent/memory_agent.py`: Memory-augmented agent implementation
+  - `agent/hierarchical_agent.py`: Hierarchical agent architecture
 
 - **Memory**: Implements memory-augmented architectures for enhanced agent capabilities.
   - `memory/memory_augmented_network.py`: Neural memory architecture
@@ -28,56 +32,125 @@ The project uses a deep reinforcement learning approach with the following compo
 
 - **Model**: Neural network architecture for policy and value functions.
   - `model/optimized_network.py`: Optimized CNN network for visual processing
+  - `model/visual_understanding_network.py`: Visual scene understanding
+  - `model/world_model.py`: World modeling for predictions
+  - `model/error_detection_network.py`: Error detection for the game
 
 - **Training**: Manages the training process, checkpoints, and signal handling.
   - `training/trainer.py`: Training loop and management
   - `training/checkpointing.py`: Checkpoint saving and loading
   - `training/signal_handlers.py`: Handles interrupts and signals
+  - `training/memory_trainer.py`: Trainer for memory-augmented agent
+  - `training/hierarchical_trainer.py`: Trainer for hierarchical agent
 
 - **Utils**: Utility functions and services including monitoring capabilities.
   - `utils/image_utils.py`: Image processing utilities
   - `utils/hardware_monitor.py`: System resource monitoring
   - `utils/performance_safeguards.py`: Ensures stable performance
   - `utils/visualization.py`: Visualization tools
+  - `utils/path_utils.py`: Path management for consistent file locations
 
 - **Config**: Configuration for hardware and action space.
   - `config/hardware_config.py`: Hardware configuration
   - `config/action_space.py`: Action space definition
   - `config/training_config.py`: Training parameters and settings
+  - `config/config_loader.py`: Configuration loading utilities
 
 - **Benchmarks**: Tools for performance analysis and optimization.
   - `benchmarks/benchmark_agent.py`: Measures agent performance metrics
-  - `benchmarks/hardware_benchmark.py`: Tests system capabilities
 
 - **Tests**: Automated testing infrastructure.
   - `tests/test_mock_environment.py`: Tests for the mock environment
-  - `tests/test_agent.py`: Validates agent functionality
 
 ### Project Structure
 
 ```
 cities-skylines-2/
-├── src/
-│   ├── agent/              # Agent modules
-│   │   └── core/           # Core agent components
-│   ├── benchmarks/         # Benchmarking tools
-│   ├── config/             # Configuration
-│   ├── environment/        # Environment modules
-│   │   ├── core/           # Core environment components
-│   │   ├── input/          # Input simulation
-│   │   ├── menu/           # Menu handling
-│   │   ├── rewards/        # Reward computation
-│   │   └── mock_environment.py  # Simulated environment
-│   ├── memory/             # Memory-augmented architectures
-│   ├── model/              # Neural network models
-│   ├── training/           # Training infrastructure
-│   ├── tests/              # Test scripts
-│   └── utils/              # Utility functions and monitoring
-├── docs/                   # Documentation
-├── scripts/                # Utility scripts
-├── venv/                   # Virtual environment
-├── README.md               # Main README
-└── requirements.txt        # Python dependencies
+├── src/                                # Source code directory
+│   ├── agent/                          # Agent modules
+│   │   ├── core/                       # Core agent components
+│   │   │   ├── memory.py               # Memory buffer implementation
+│   │   │   ├── policy.py               # Policy network and action selection
+│   │   │   ├── ppo_agent.py            # PPO algorithm implementation
+│   │   │   ├── updater.py              # Network update logic
+│   │   │   └── value.py                # Value function implementation
+│   │   ├── hierarchical_agent.py       # Hierarchical agent architecture
+│   │   └── memory_agent.py             # Memory-augmented agent implementation
+│   │
+│   ├── benchmarks/                     # Benchmarking tools
+│   │   └── benchmark_agent.py          # Agent performance evaluation
+│   │
+│   ├── config/                         # Configuration
+│   │   ├── defaults/                   # Default configuration files
+│   │   ├── action_space.py             # Action space definition
+│   │   ├── config_loader.py            # Configuration loading utilities
+│   │   ├── example_config.json         # Example configuration file
+│   │   ├── hardware_config.py          # Hardware-specific configuration
+│   │   └── training_config.py          # Training parameters and settings
+│   │
+│   ├── environment/                    # Environment modules
+│   │   ├── core/                       # Core environment components
+│   │   ├── input/                      # Keyboard and mouse input simulation
+│   │   ├── menu/                       # Menu detection and navigation
+│   │   ├── rewards/                    # Reward computation
+│   │   ├── mock_environment.py         # Simulated environment
+│   │   ├── optimized_capture.py        # Screen capture optimization
+│   │   └── visual_metrics.py           # Visual-based metrics calculation
+│   │
+│   ├── memory/                         # Memory-augmented architectures
+│   │   ├── episodic_memory.py          # Episodic memory implementation
+│   │   └── memory_augmented_network.py # Neural network with memory capabilities
+│   │
+│   ├── model/                          # Neural network models
+│   │   ├── error_detection_network.py  # Error detection for the game
+│   │   ├── optimized_network.py        # Optimized CNN architecture
+│   │   ├── visual_understanding_network.py # Visual scene understanding
+│   │   └── world_model.py              # World modeling for predictions
+│   │
+│   ├── training/                       # Training infrastructure
+│   │   ├── checkpointing.py            # Model checkpoint management
+│   │   ├── hierarchical_trainer.py     # Trainer for hierarchical agent
+│   │   ├── memory_trainer.py           # Trainer for memory-augmented agent
+│   │   ├── signal_handlers.py          # Handles system signals during training
+│   │   ├── trainer.py                  # Base trainer implementation
+│   │   └── utils.py                    # Training utility functions
+│   │
+│   ├── tests/                          # Test scripts
+│   │   └── test_mock_environment.py    # Tests for the mock environment
+│   │
+│   ├── utils/                          # Utility functions and monitoring
+│   │   ├── hardware_monitor.py         # System resource monitoring
+│   │   ├── image_utils.py              # Image processing utilities
+│   │   ├── path_utils.py               # Path management for consistent file locations
+│   │   ├── performance_safeguards.py   # Ensures stable performance
+│   │   └── visualization.py            # Data visualization tools
+│   │
+│   ├── __init__.py                     # Package initialization
+│   └── train.py                        # Main training entry point
+│
+├── docs/                               # Documentation
+│   ├── agent.md                        # Agent documentation
+│   ├── architecture.md                 # System architecture overview
+│   ├── environment.md                  # Environment documentation
+│   ├── improvements.md                 # Future improvements
+│   ├── model.md                        # Model documentation
+│   ├── README.md                       # Documentation overview
+│   └── training.md                     # Training process documentation
+│
+├── scripts/                            # Utility scripts
+│   ├── benchmark.py                    # Performance benchmarking
+│   ├── dashboard.py                    # Real-time monitoring dashboard
+│   ├── hyperparameter_tuning.py        # Hyperparameter optimization
+│   ├── run_environment.py              # Run the environment standalone
+│   ├── run_mock_training.py            # Training with mock environment
+│   └── visualize_training.py           # Training visualization tools
+│
+├── .github/                            # GitHub configuration
+├── .gitignore                          # Git ignore rules
+├── CONTRIBUTING.md                     # Contribution guidelines
+├── LICENSE                             # Project license
+├── README.md                           # Main README (this file)
+└── requirements.txt                    # Python dependencies
 ```
 
 **Note**: The following directories are created at runtime:
@@ -100,7 +173,7 @@ These directories are automatically created in the project root when needed by t
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/cities-skylines-2-agent.git
+git clone https://github.com/sfatkhutdinov/cities-skylines-2.git
 cd cities-skylines-2-agent
 ```
 

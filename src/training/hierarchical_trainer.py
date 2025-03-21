@@ -17,24 +17,48 @@ logger = logging.getLogger(__name__)
 class HierarchicalTrainer(MemoryTrainer):
     """Trainer class extended for hierarchical agents with specialized networks."""
     
-    def __init__(self, agent, env, config_file=None, **kwargs):
+    def __init__(self, agent, env, config, **kwargs):
         """Initialize the hierarchical trainer.
         
         Args:
             agent: The hierarchical agent
             env: The environment
-            config_file: Path to configuration file
+            config: Configuration object or dictionary
             **kwargs: Additional arguments for MemoryTrainer
         """
         # Initialize base trainer
-        super().__init__(agent, env, config_file, **kwargs)
+        super().__init__(agent, env, config, **kwargs)
         
         # Verify agent type
         if not isinstance(agent, HierarchicalAgent):
             logger.warning("Agent is not a HierarchicalAgent, some hierarchical features may not work")
         
         # Hierarchical-specific training parameters
-        self.hierarchical_config = self.config.get("hierarchical", {})
+        # Check if config is a dict-like object or a HardwareConfig
+        if hasattr(self.config, "get"):
+            # Config is a dict-like object
+            self.hierarchical_config = self.config.get("hierarchical", {})
+        else:
+            # Config is likely a HardwareConfig object
+            # Create a default hierarchical config since HardwareConfig doesn't have hierarchical settings
+            self.hierarchical_config = {
+                "training_schedules": {
+                    "visual_network": 10,
+                    "world_model": 5,
+                    "error_detection": 20
+                },
+                "batch_sizes": {
+                    "visual_network": 32,
+                    "world_model": 64,
+                    "error_detection": 32
+                },
+                "progressive_training": True,
+                "progressive_phases": {
+                    "visual_network": 50,
+                    "world_model": 100,
+                    "error_detection": 150
+                }
+            }
         
         # Component training schedules (how often to train each component)
         self.training_schedules = self.hierarchical_config.get("training_schedules", {

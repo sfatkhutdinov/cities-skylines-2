@@ -808,31 +808,29 @@ class Environment:
         return stats 
 
     def _get_stacked_observation(self):
-        """Get stacked observation from frame buffer.
-        
-        Returns:
-            Stacked observation tensor
-        """
-        # Stack frames along channel dimension for visual observations
-        # or concatenate for vector observations
-        
+        """Get stacked observations for frame stacking."""
         if len(self.frame_buffer) == 0:
-            logger.critical("Frame buffer is empty, this should not happen")
-            # Return a zero observation as fallback
-            return np.zeros(self.observation_space.shape, dtype=np.float32)
+            return None
             
-        # Check observation type
+        # Check if using image or vector observations
         sample_obs = self.frame_buffer[0]
         
-        if isinstance(sample_obs, np.ndarray) and len(sample_obs.shape) >= 3:
-            # Visual observation (image)
-            # Stack along channel dimension
+        # Convert all tensors to CPU if they're on GPU
+        cpu_frames = []
+        for frame in self.frame_buffer:
+            if isinstance(frame, torch.Tensor) and frame.is_cuda:
+                cpu_frames.append(frame.cpu())
+            else:
+                cpu_frames.append(frame)
+        
+        # Handle image observations (stacked frames)
+        if len(sample_obs.shape) == 3:  # Images: (C, H, W) or (H, W, C)
             if sample_obs.shape[0] == 3:  # If channels-first format
-                return np.concatenate([f for f in self.frame_buffer], axis=0)
+                return np.concatenate([f for f in cpu_frames], axis=0)
             else:  # If channels-last format
-                stacked = np.concatenate([f for f in self.frame_buffer], axis=-1)
+                stacked = np.concatenate([f for f in cpu_frames], axis=-1)
                 # Convert to channels-first for PyTorch
                 return np.transpose(stacked, (2, 0, 1))
         else:
             # Vector observation - concatenate
-            return np.concatenate([f.flatten() for f in self.frame_buffer]) 
+            return np.concatenate([f.flatten() for f in cpu_frames]) 

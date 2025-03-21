@@ -36,6 +36,8 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                  feature_dim: int = 512,
                  latent_dim: int = 256,
                  prediction_horizon: int = 5,
+                 adaptive_memory_use: bool = True,
+                 adaptive_memory_threshold: float = 0.7,
                  **kwargs):
         """Initialize the hierarchical agent.
         
@@ -52,9 +54,12 @@ class HierarchicalAgent(MemoryAugmentedAgent):
             feature_dim: Dimension of visual features
             latent_dim: Dimension of latent space in world model
             prediction_horizon: Number of timesteps to predict in world model
+            adaptive_memory_use: Whether to adapt memory usage based on errors
+            adaptive_memory_threshold: Threshold for adaptive memory usage
             **kwargs: Additional arguments for MemoryAugmentedAgent
         """
         # Initialize the base memory-augmented agent
+        # Pass only the parameters that the base class expects
         super().__init__(
             policy_network, 
             observation_space, 
@@ -69,6 +74,10 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         self.use_visual_network = use_visual_network
         self.use_world_model = use_world_model
         self.use_error_detection = use_error_detection
+        
+        # Store adaptive memory parameters as instance variables
+        self.adaptive_memory_use = adaptive_memory_use
+        self.adaptive_memory_threshold = adaptive_memory_threshold
         
         # Get device
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -138,13 +147,17 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         self.last_uncertainty = None
         self.prediction_errors = deque(maxlen=100)
         
-        # Adaptation parameters
-        self.adaptive_memory_use = kwargs.get('adaptive_memory_use', True)
-        self.adaptive_memory_threshold = kwargs.get('adaptive_memory_threshold', 0.7)
-        
         # Performance tracking
         self.error_history = deque(maxlen=100)
         self.correction_history = deque(maxlen=100)
+        
+        # Initialize new instance variables for storing action info
+        self.last_action_probs = None
+        self.last_state_embedding = None
+        self.last_used_memory = False
+        self.last_error_detected = False
+        self.last_error_info = None
+        self.last_predicted_next_state = None
         
         logger.critical(f"Initialized hierarchical agent with components: "
                        f"Visual={use_visual_network}, World={use_world_model}, "
@@ -163,8 +176,17 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         if not isinstance(observation, torch.Tensor):
             observation = torch.tensor(observation, dtype=torch.float32, device=self.device)
         
+        # Handle frame stacking - if we have 12 channels (4 stacked frames of 3 channels each)
+        # Use only the most recent frame for visual processing
+        if self.use_visual_network and len(observation.shape) > 1 and observation.shape[0] == 12:
+            # Extract the last frame (last 3 channels) from the stacked frames
+            last_frame = observation[9:12]  # Get channels 9, 10, 11 (last frame in stack)
+            
+            with torch.no_grad():
+                visual_features, _ = self.visual_network(last_frame)
+                return visual_features
         # Apply Visual Understanding Network if enabled
-        if self.use_visual_network:
+        elif self.use_visual_network:
             with torch.no_grad():
                 visual_features, _ = self.visual_network(observation)
                 return visual_features
@@ -182,7 +204,7 @@ class HierarchicalAgent(MemoryAugmentedAgent):
             deterministic: Whether to select the action deterministically
             
         Returns:
-            dict: Containing action, log_prob, value, and other info
+            tuple: (action, log_prob, value) for compatibility with the trainer
         """
         logger.debug(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
         
@@ -288,46 +310,27 @@ class HierarchicalAgent(MemoryAugmentedAgent):
             self.last_state = processed_state
             self.last_action = action
             
-            # Create info dictionary
-            info = {
-                'action_probs': action_probs,
-                'log_prob': log_prob,
-                'value': value,
-                'used_memory': use_memory,
-                'state_embedding': state_embedding,
-                'error_detected': error_detected,
-                'error_info': error_info,
-                'predicted_next_state': predicted_next_state,
-                'uncertainty': uncertainty
-            }
+            # Store additional info as instance variables for process_experience
+            self.last_action_probs = action_probs
+            self.last_state_embedding = state_embedding
+            self.last_used_memory = use_memory
+            self.last_error_detected = error_detected
+            self.last_error_info = error_info
+            self.last_predicted_next_state = predicted_next_state
+            self.last_uncertainty = uncertainty
             
             logger.debug(f"Returning action: {action.cpu().numpy().item()}")
-            return {
-                'action': action,
-                'log_prob': log_prob,
-                'value': value,
-                'action_probs': action_probs,
-                'state_embedding': state_embedding,
-                'used_memory': use_memory,
-                'additional_info': info
-            }
+            # Return the triple expected by the trainer
+            return action.cpu().item(), log_prob.cpu().item(), value.cpu().item()
                 
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
             import traceback
             logger.error(traceback.format_exc())
             
-            # Return a random action as fallback
-            random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
-            return {
-                'action': random_action,
-                'log_prob': torch.tensor(0.0, device=self.device),
-                'value': torch.tensor(0.0, device=self.device),
-                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim,
-                'state_embedding': None,
-                'used_memory': False,
-                'additional_info': {'error_detected': True, 'error_info': {'explanations': ['Agent failure error']}}
-            }
+            # Return a random action as fallback - using the format expected by the trainer
+            random_action = torch.randint(0, self.action_dim, (1,), device=self.device).item()
+            return random_action, 0.0, 0.0
     
     def process_experience(self, state, action, reward, next_state, done, info=None):
         """Process experience to potentially store in episodic memory.
@@ -358,10 +361,9 @@ class HierarchicalAgent(MemoryAugmentedAgent):
             # Store this experience's reward
             self.last_reward = reward
             
-            # Get state embedding if not already available
-            if info is not None and 'state_embedding' in info and info['state_embedding'] is not None:
-                state_embedding = info['state_embedding']
-            else:
+            # Get state embedding if not already available - use stored embedding if we have it
+            state_embedding = self.last_state_embedding
+            if state_embedding is None:
                 if isinstance(processed_state, torch.Tensor):
                     state_tensor = processed_state
                 else:
@@ -382,11 +384,10 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                     importance += min(0.3, current_error / (avg_error + 1e-5) * 0.2)
             
             # 2. Error detection results
-            if self.use_error_detection and info is not None and 'additional_info' in info:
-                additional_info = info['additional_info']
-                if additional_info.get('error_detected', False):
-                    # Higher importance for states with errors
-                    severity = additional_info.get('error_info', {}).get('severity', 0.0)
+            if self.use_error_detection and self.last_error_detected:
+                # Higher importance for states with errors
+                if self.last_error_info and 'severity' in self.last_error_info:
+                    severity = self.last_error_info['severity']
                     importance += min(0.3, severity)
             
             # 3. Reward signal
@@ -412,7 +413,7 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                     'done': done,
                     'info': info,
                     'prediction_error': self.prediction_errors[-1] if self.prediction_errors else None,
-                    'error_detected': info.get('additional_info', {}).get('error_detected', False) if info else False
+                    'error_detected': self.last_error_detected
                 }
                 
                 # Store in memory

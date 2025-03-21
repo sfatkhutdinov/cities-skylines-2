@@ -207,11 +207,6 @@ def setup_agent(args, hardware_config, observation_space, action_space):
             feature_dim=hardware_config.hierarchical.get('feature_dim', 512),
             latent_dim=hardware_config.hierarchical.get('latent_dim', 256),
             prediction_horizon=hardware_config.hierarchical.get('prediction_horizon', 5),
-            lr=hardware_config.learning_rate,
-            gamma=0.99,
-            epsilon=hardware_config.clip_param,
-            value_coef=hardware_config.value_loss_coef,
-            entropy_coef=hardware_config.entropy_coef,
             adaptive_memory_use=hardware_config.hierarchical.get('adaptive_memory_use', True),
             adaptive_memory_threshold=hardware_config.hierarchical.get('adaptive_memory_threshold', 0.7)
         )
@@ -242,36 +237,18 @@ def setup_agent(args, hardware_config, observation_space, action_space):
             action_space=action_space,
             device=device,
             memory_size=memory_size,
-            memory_use_prob=hardware_config.memory.get('memory_use_probability', 0.8),
-            lr=hardware_config.learning_rate,
-            gamma=0.99,
-            epsilon=hardware_config.clip_param,
-            value_coef=hardware_config.value_loss_coef,
-            entropy_coef=hardware_config.entropy_coef
+            memory_use_prob=hardware_config.memory.get('memory_use_probability', 0.8)
         )
     else:
         logger.info("Creating standard PPO agent (memory disabled via flag)")
         
-        # Create standard network
-        policy_network = OptimizedNetwork(
-            input_shape=observation_space.shape,
-            num_actions=action_space.n,
-            device=device,
-            use_lstm=True,  # Enable LSTM by default
-            lstm_hidden_size=256  # Standard hidden size
-        )
-        
-        # Create standard PPO agent
+        # Create the PPO agent with the state_dim, action_dim pattern since we're
+        # not using a memory-augmented network
         agent = PPOAgent(
-            policy_network=policy_network,
-            observation_space=observation_space,
-            action_space=action_space,
-            device=device,
-            lr=hardware_config.learning_rate,
-            gamma=0.99,
-            epsilon=hardware_config.clip_param,
-            value_coef=hardware_config.value_loss_coef,
-            entropy_coef=hardware_config.entropy_coef
+            state_dim=observation_space.shape,
+            action_dim=action_space.n,
+            config=hardware_config,
+            use_amp=hardware_config.use_fp16
         )
     
     agent.to(device)
@@ -297,10 +274,16 @@ def extend_parser_args(parser):
                        help='Disable world model in hierarchical agent')
     parser.add_argument('--no_error', action='store_true',
                        help='Disable error detection network in hierarchical agent')
-    parser.add_argument('--memory_size', type=int, default=2000,
-                       help='Size of episodic memory (default: 2000)')
-    parser.add_argument('--mixed_precision', action='store_true', default=True,
-                       help='Enable mixed precision training (default: enabled)')
+    
+    # Only add --memory_size if not already there
+    if not any(action.dest == 'memory_size' for action in parser._actions):
+        parser.add_argument('--memory_size', type=int, default=2000,
+                          help='Size of episodic memory (default: 2000)')
+    
+    # Only add --mixed_precision if not already there
+    if not any(action.dest == 'mixed_precision' for action in parser._actions):
+        parser.add_argument('--mixed_precision', action='store_true', default=True,
+                          help='Enable mixed precision training (default: enabled)')
     
     return parser
 
@@ -319,9 +302,11 @@ def main():
         # Setup file logging
         log_file = setup_file_logging()
         
-        # Parse command line arguments
+        # Parse command line arguments - use a single unified approach
         parser = argparse.ArgumentParser()
+        # Add our custom arguments
         parser = extend_parser_args(parser)
+        # Allow parse_args to add the standard arguments
         args = parse_args(parser)
         
         # Add memory-specific arguments if not present

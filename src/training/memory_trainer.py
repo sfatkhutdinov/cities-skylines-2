@@ -16,24 +16,41 @@ logger = logging.getLogger(__name__)
 class MemoryTrainer(Trainer):
     """Trainer class extended for memory-augmented agents."""
     
-    def __init__(self, agent, env, config_file=None, **kwargs):
+    def __init__(self, agent, env, config, **kwargs):
         """Initialize the memory trainer.
         
         Args:
             agent: The memory-augmented agent
             env: The environment
-            config_file: Path to configuration file
+            config: Configuration object or dictionary
             **kwargs: Additional arguments for Trainer
         """
         # Initialize base trainer
-        super().__init__(agent, env, config_file, **kwargs)
+        super().__init__(agent, env, config, **kwargs)
         
         # Verify agent type
         if not isinstance(agent, MemoryAugmentedAgent):
             logger.warning("Agent is not a MemoryAugmentedAgent, some memory features may not work")
         
         # Memory-specific training parameters
-        self.memory_config = self.config.get("memory", {})
+        # Check if config is a dict-like object or a HardwareConfig
+        if hasattr(self.config, "get"):
+            # Config is a dict-like object
+            self.memory_config = self.config.get("memory", {})
+        else:
+            # Config is likely a HardwareConfig object
+            # Create a default memory config since HardwareConfig doesn't have memory settings
+            self.memory_config = {
+                "warmup_episodes": 10,
+                "use_curriculum": True,
+                "curriculum_phases": {
+                    "observation": 10,
+                    "retrieval": 30,
+                    "integration": 50,
+                    "refinement": 100
+                }
+            }
+            
         self.memory_warmup_episodes = self.memory_config.get("warmup_episodes", 10)
         self.memory_curriculum = self.memory_config.get("use_curriculum", True)
         self.curriculum_phases = self.memory_config.get("curriculum_phases", {
