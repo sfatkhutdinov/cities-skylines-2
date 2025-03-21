@@ -14,6 +14,9 @@ import os
 import json
 from typing import Dict, List, Tuple, Optional, Any, Union
 from pathlib import Path
+import contextlib
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from .checkpointing import CheckpointManager
 from .signal_handlers import is_exit_requested, request_exit
@@ -23,129 +26,161 @@ from ..environment.core import Environment
 from ..utils.visualization import TrainingVisualizer
 from ..utils.hardware_monitor import HardwareMonitor
 from ..utils.performance_safeguards import PerformanceSafeguards
+from ..agent.core.memory import Memory
 
 logger = logging.getLogger(__name__)
 
 class Trainer:
-    """Manages the training process for reinforcement learning."""
+    """Handles the training process for the PPO agent."""
     
     def __init__(
         self,
-        agent: PPOAgent,
-        env: Environment,
-        config: HardwareConfig,
-        config_dict: Dict[str, Any],
-        hardware_monitor: Optional[HardwareMonitor] = None,
-        performance_safeguards: Optional[PerformanceSafeguards] = None
+        agent,
+        env,
+        config,
+        device: torch.device = None,
+        checkpoint_dir: str = "checkpoints",
+        tensorboard_dir: str = "logs"
     ):
         """Initialize the trainer.
         
         Args:
-            agent: The PPO agent
-            env: The environment to interact with
-            config: Hardware configuration
-            config_dict: Training configuration dictionary
-            hardware_monitor: Optional hardware monitor instance
-            performance_safeguards: Optional performance safeguards instance
+            agent: The agent to train
+            env: The environment to train in
+            config: Training configuration
+            device: The device to use for training
+            checkpoint_dir: Directory to save checkpoints
+            tensorboard_dir: Directory to save tensorboard logs
         """
         self.agent = agent
         self.env = env
         self.config = config
-        self.args = config_dict
-        self.hardware_monitor = hardware_monitor
-        self.performance_safeguards = performance_safeguards
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Extract training parameters
-        self.num_episodes = config_dict.get('num_episodes', 1000)
-        self.max_steps = config_dict.get('max_steps', 1000)
-        self.checkpoint_dir = config_dict.get('checkpoint_dir', 'checkpoints')
-        self.use_wandb = config_dict.get('use_wandb', False)
+        # Set up memory
+        self.memory = Memory(self.device)
         
-        # Initialize checkpointing
+        # Set up optimizer
+        self.optimizer = self._create_optimizer()
+        
+        # Set up learning rate scheduler
+        self.lr_scheduler = self._create_lr_scheduler()
+        
+        # PPO hyperparameters
+        self.gamma = config.gamma
+        self.gae_lambda = config.gae_lambda
+        self.clip_param = config.clip_param
+        self.ppo_epochs = config.ppo_epochs
+        self.batch_size = config.batch_size
+        self.value_loss_coef = config.value_loss_coef
+        self.entropy_coef = config.entropy_coef
+        self.max_grad_norm = config.max_grad_norm
+        
+        # Mixed precision training
+        self.use_mixed_precision = config.use_mixed_precision and torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
+        
+        # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=self.checkpoint_dir,
-            checkpoint_freq=config_dict.get('checkpoint_freq', 100),
-            autosave_interval=config_dict.get('autosave_interval', 15),
-            backup_checkpoints=config_dict.get('backup_checkpoints', 5),
-            max_checkpoints=config_dict.get('max_checkpoints', 10),
-            max_disk_usage_gb=config_dict.get('max_disk_usage_gb', 5.0),
-            use_best=config_dict.get('use_best', False),
-            fresh_start=config_dict.get('fresh_start', False)
+            checkpoint_dir=checkpoint_dir,
+            max_checkpoints=config.max_checkpoints
         )
         
-        # Initialize optimizer
-        self.optimizer = torch.optim.Adam(
-            self.agent.parameters(),
-            lr=config_dict.get('learning_rate', 1e-4)
-        )
-        
-        # Optional learning rate scheduler
-        self.scheduler = None
-        if config_dict.get('use_lr_scheduler', False):
-            self.scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=config_dict.get('lr_step_size', 100),
-                gamma=config_dict.get('lr_gamma', 0.9)
-            )
-        
-        # Training stats
-        self.start_episode = 0
-        self.best_reward = float('-inf')
-        self.total_steps = 0
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.recent_rewards = []
-        self.train_start_time = None
+        # Initialize tensorboard writer
+        self.writer = SummaryWriter(log_dir=tensorboard_dir)
         
         # Initialize visualizer
-        log_dir = config_dict.get('log_dir', os.path.join(self.checkpoint_dir, 'logs'))
-        self.visualizer = TrainingVisualizer(log_dir=log_dir)
+        self.visualizer = TrainingVisualizer(
+            log_dir=tensorboard_dir
+        )
         
-        # Load checkpoint if available
-        self._load_checkpoint()
+        # Hardware monitor
+        self.hardware_monitor = HardwareMonitor() if config.monitor_hardware else None
         
-        # Initialize Weights & Biases logging
-        if self.use_wandb:
-            self._init_wandb(config_dict)
+        # Performance safeguards
+        self.performance_safeguards = PerformanceSafeguards(
+            config=config
+        )
+        
+        # Training metrics
+        self.episodes_completed = 0
+        self.steps_completed = 0
+        self.best_reward = float('-inf')
+        
+        # Training parameters
+        self.start_episode = 0  # Start from episode 0
+        self.num_episodes = config.num_episodes if hasattr(config, 'num_episodes') else 100
+        self.max_steps = config.max_steps if hasattr(config, 'max_steps') else 1000
+        self.total_steps = 0  # Initialize total steps counter
+        
+        # Timing
+        self.start_time = time.time()
+        self.last_checkpoint_time = self.start_time
+        
+        logger.critical(f"Trainer initialized on {self.device}")
+        logger.critical(f"Using mixed precision: {self.use_mixed_precision}")
     
-    def _init_wandb(self, args: Dict[str, Any]):
-        """Initialize Weights & Biases logging.
+    def _create_optimizer(self):
+        """Create the optimizer for the agent's policy.
         
-        Args:
-            args: Training arguments
+        Returns:
+            Optimizer instance
         """
-        try:
-            # Configure wandb
-            wandb_project = args.get('wandb_project', 'cities-skylines-rl')
-            wandb_name = args.get('wandb_name', f"train_{time.strftime('%Y%m%d_%H%M%S')}")
+        logger.critical("Creating optimizer")
+        
+        # Get optimizer parameters from config
+        optimizer_type = self.config.optimizer
+        learning_rate = self.config.learning_rate
+        weight_decay = self.config.weight_decay
+        
+        # Get trainable parameters
+        parameters = self.agent.parameters()
+        
+        # Create optimizer
+        if optimizer_type.lower() == 'adam':
+            logger.critical(f"Using Adam optimizer with lr={learning_rate}, weight_decay={weight_decay}")
+            return torch.optim.Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'adamw':
+            logger.critical(f"Using AdamW optimizer with lr={learning_rate}, weight_decay={weight_decay}")
+            return torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'sgd':
+            momentum = self.config.momentum if hasattr(self.config, 'momentum') else 0.9
+            logger.critical(f"Using SGD optimizer with lr={learning_rate}, momentum={momentum}, weight_decay={weight_decay}")
+            return torch.optim.SGD(parameters, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+        else:
+            logger.warning(f"Unknown optimizer type: {optimizer_type}, using Adam")
+            return torch.optim.Adam(parameters, lr=learning_rate, weight_decay=weight_decay)
             
-            # Get some device information for logging
-            device_info = {
-                "device": str(self.agent.device),
-                "cuda_available": torch.cuda.is_available(),
-                "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
-            }
+    def _create_lr_scheduler(self):
+        """Create learning rate scheduler.
+        
+        Returns:
+            Learning rate scheduler or None
+        """
+        if not hasattr(self.config, 'use_lr_scheduler') or not self.config.use_lr_scheduler:
+            logger.critical("Not using learning rate scheduler")
+            return None
             
-            # Initialize wandb
-            wandb.init(
-                project=wandb_project,
-                name=wandb_name,
-                config={
-                    **vars(args),
-                    **device_info,
-                    "agent_type": type(self.agent).__name__,
-                    "environment_type": type(self.env).__name__,
-                    "resume": self.start_episode > 0
-                }
-            )
-            
-            logger.info(f"Initialized Weights & Biases logging with project '{wandb_project}', run '{wandb_name}'")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Weights & Biases: {e}")
-            logger.warning("Continuing without Weights & Biases logging")
-            self.use_wandb = False
+        # Get scheduler parameters from config
+        scheduler_type = self.config.scheduler_type if hasattr(self.config, 'scheduler_type') else 'step'
+        
+        # Create scheduler based on type
+        if scheduler_type.lower() == 'step':
+            step_size = self.config.lr_step_size
+            gamma = self.config.lr_gamma
+            logger.critical(f"Using StepLR scheduler: step_size={step_size}, gamma={gamma}")
+            return torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+        elif scheduler_type.lower() == 'exponential':
+            gamma = self.config.lr_gamma
+            logger.critical(f"Using ExponentialLR scheduler: gamma={gamma}")
+            return torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=gamma)
+        elif scheduler_type.lower() == 'cosine':
+            t_max = self.config.cosine_t_max if hasattr(self.config, 'cosine_t_max') else 100
+            logger.critical(f"Using CosineAnnealingLR scheduler: T_max={t_max}")
+            return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max)
+        else:
+            logger.warning(f"Unknown scheduler type: {scheduler_type}, not using scheduler")
+            return None
     
     def _load_checkpoint(self):
         """Load checkpoint if available."""
@@ -221,156 +256,146 @@ class Trainer:
         except Exception as e:
             logger.error(f"Error saving checkpoint: {e}")
     
-    def collect_trajectory(
-        self, 
-        render: bool = False
-    ) -> Tuple[List[Tuple], float, int]:
-        """Collect a trajectory from the environment.
+    def collect_trajectory(self, max_steps: int = 1000, render: bool = False) -> List:
+        """Collect a trajectory of experiences.
         
         Args:
+            max_steps: Maximum number of steps to collect
             render: Whether to render the environment
             
         Returns:
-            Tuple of (experiences, total_reward, steps)
+            List of experiences
         """
-        logger.critical("===== STARTING TRAJECTORY COLLECTION =====")
-        state = self.env.reset()
-        logger.critical(f"Environment reset complete. Observation shape: {state.shape}")
-        
         experiences = []
-        done = False
         total_reward = 0
-        steps = 0
         
-        # For tracking menu transitions
+        # Reset environment and start new episode
+        logger.critical("Resetting environment to start trajectory collection")
+        observation = self.env.reset()
+        
+        if observation is None:
+            logger.critical("Environment reset failed - returned None observation")
+            return experiences
+            
+        logger.critical(f"Initial observation shape: {observation.shape if hasattr(observation, 'shape') else 'unknown'}")
+        
+        # Flag to track menu transitions
         in_menu = False
-        menu_transition_count = 0
-        consecutive_menu_steps = 0
         
-        # For tracking game crashes
-        game_crash_wait_count = 0
-        max_crash_wait_steps = 60  # Maximum steps to wait for game restart
-        
-        for step in range(self.max_steps):
-            logger.critical(f"--- Trajectory Step {step} ---")
-            # Check if exit requested
-            if is_exit_requested():
-                logger.info("Exit requested during trajectory collection, stopping early")
+        # Collect steps until we reach max_steps or episode is done
+        for step in range(max_steps):
+            # Check for valid observation
+            if observation is None:
+                logger.critical(f"Invalid observation at step {step}, terminating trajectory")
                 break
                 
-            # Select action
-            logger.critical("Selecting action from policy...")
-            action, log_prob, value = self.agent.select_action(state)
-            logger.critical(f"Selected action: {action}")
-            
-            # Record action for visualization
-            self.visualizer.record_action_count(action)
-            
-            # Check if we're in a menu before taking action
-            if hasattr(self.env, 'check_menu_state'):
-                logger.critical("Checking menu state before action...")
-                pre_action_in_menu = self.env.check_menu_state()
-                logger.critical(f"Menu state before action: {pre_action_in_menu}")
+            # Convert observation to tensor
+            if not isinstance(observation, torch.Tensor):
+                observation = torch.tensor(observation, device=self.agent.device)
                 
-                if pre_action_in_menu:
-                    consecutive_menu_steps += 1
-                    logger.critical(f"In menu for {consecutive_menu_steps} consecutive steps")
-                    
-                    # If stuck in menu for too long, try recovery
-                    if consecutive_menu_steps >= 3:
-                        logger.critical(f"Stuck in menu for {consecutive_menu_steps} steps, attempting recovery")
-                        try:
-                            self.env.input_simulator.handle_menu_recovery(retries=2)
-                        except Exception as e:
-                            logger.error(f"Menu recovery failed: {e}")
-                        
-                        # Re-check menu state after recovery attempt
-                        in_menu = self.env.check_menu_state()
-                        if not in_menu:
-                            logger.critical("Successfully recovered from menu state")
-                            consecutive_menu_steps = 0
-                else:
-                    consecutive_menu_steps = 0
+            # Log observation statistics
+            if isinstance(observation, torch.Tensor) and observation.numel() > 0:
+                logger.critical(f"Step {step}: Observation stats - shape={observation.shape}, mean={observation.float().mean().item():.4f}, max={observation.float().max().item():.4f}")
+                
+                # Check for NaN or infinite values
+                if torch.isnan(observation).any() or torch.isinf(observation).any():
+                    logger.critical(f"NaN or Inf in observation at step {step}")
+                    break
             
-            # Take action in environment
-            logger.critical(f"Executing action {action} in environment...")
-            # Try to ensure the window has focus
-            if hasattr(self.env, 'error_recovery') and hasattr(self.env.error_recovery, 'focus_game_window'):
-                logger.critical("Attempting to focus game window before taking action...")
-                focus_success = self.env.error_recovery.focus_game_window()
-                logger.critical(f"Window focus attempt {'succeeded' if focus_success else 'failed'}")
+            # Select action from policy
+            action_result = self.agent.select_action(observation)
             
+            # Ensure action_result contains required fields
+            if isinstance(action_result, dict):
+                action = action_result.get('action')
+                log_prob = action_result.get('log_prob')
+                value = action_result.get('value', torch.tensor(0.0, device=self.agent.device))
+                action_probs = action_result.get('action_probs')
+            else:
+                logger.critical(f"Unexpected action result type: {type(action_result)}")
+                action = action_result
+                log_prob = None
+                value = None
+                action_probs = None
+                
+            # Basic validation
+            if action is None:
+                logger.critical("Agent returned None action, using random action")
+                action = torch.randint(0, self.agent.num_actions, (1,), device=self.agent.device)
+                
+            logger.critical(f"Step {step}: Selected action {action}, log_prob {log_prob}")
+            
+            # Take step in environment
             try:
-                next_state, reward, done, info = self.env.step(action)
-                logger.critical(f"Step complete with reward: {reward}, done: {done}")
-                if info:
-                    logger.critical(f"Step info: {info}")
-            except Exception as e:
-                logger.critical(f"ERROR during environment step: {e}")
-                import traceback
-                logger.critical(f"Traceback: {traceback.format_exc()}")
-                # Continue with a failed state
-                done = True
-                reward = -10.0
-                next_state = state
-                info = {"error": str(e)}
-                logger.critical("Using fallback state due to error")
-            
-            # Store in experience buffer
-            experience = (state, action, reward, next_state, done, log_prob, value)
-            experiences.append(experience)
-            
-            # Update state and counters
-            state = next_state
-            total_reward += reward
-            steps += 1
-            
-            # Check for menu transitions if supported
-            if hasattr(self.env, 'check_menu_state'):
-                logger.critical("Checking menu state after action...")
-                post_action_in_menu = self.env.check_menu_state()
-                logger.critical(f"Menu state after action: {post_action_in_menu}")
+                next_observation, reward, done, info = self.env.step(action)
+                logger.critical(f"Step {step}: Action executed, reward={reward}, done={done}")
                 
-                # Detect menu transitions
-                if post_action_in_menu != in_menu:
-                    menu_transition_count += 1
-                    logger.critical(f"Menu transition detected: {in_menu} -> {post_action_in_menu}")
-                
-                in_menu = post_action_in_menu
-            
-            # Check for game crashes if supported
-            if hasattr(self.env, 'check_game_running') and hasattr(self.env, 'restart_game'):
-                logger.critical("Checking if game is running...")
-                game_running = self.env.check_game_running()
-                logger.critical(f"Game running status: {game_running}")
-                
-                if not game_running:
-                    game_crash_wait_count += 1
-                    logger.critical(f"Game appears to have crashed or is not responding. Waiting ({game_crash_wait_count}/{max_crash_wait_steps})")
+                # Check for game crashes
+                if info.get('crashed', False):
+                    logger.critical("Game crash detected, terminating trajectory")
+                    break
                     
-                    # After waiting a bit, try to restart
-                    if game_crash_wait_count >= max_crash_wait_steps:
-                        logger.critical("Attempting to restart the game")
-                        try:
-                            self.env.restart_game()
-                            # Reset counters and state
-                            game_crash_wait_count = 0
-                            state = self.env.reset()
-                        except Exception as e:
-                            logger.error(f"Failed to restart game: {e}")
-                else:
-                    game_crash_wait_count = 0
-            
-            if render:
-                self.env.render()
+                # Check for menu transitions
+                if info.get('in_menu', False) and not in_menu:
+                    logger.warning("Detected transition to menu state")
+                    in_menu = True
+                elif not info.get('in_menu', False) and in_menu:
+                    logger.info("Detected return from menu state")
+                    in_menu = False
+                    
+                # Store experience
+                if self.memory:
+                    self.memory.add(
+                        state=observation,
+                        action=action,
+                        reward=reward,
+                        next_state=next_observation,
+                        done=done,
+                        log_prob=log_prob,
+                        value=value,
+                        action_probs=action_probs
+                    )
+                    logger.critical(f"Added experience to memory: reward={reward}, done={done}")
                 
-            if done:
-                logger.critical(f"Episode done after {steps} steps with total reward {total_reward}")
+                # Add to experiences list
+                experiences.append({
+                    'state': observation,
+                    'action': action,
+                    'reward': reward,
+                    'next_state': next_observation,
+                    'done': done,
+                    'log_prob': log_prob,
+                    'value': value,
+                    'action_probs': action_probs,
+                    'info': info
+                })
+                
+                total_reward += reward
+                observation = next_observation
+                
+                # Display debugging info
+                if step % 10 == 0:
+                    logger.info(f"Step {step}/{max_steps}: reward={reward:.2f}, total={total_reward:.2f}")
+                
+                # Render if requested
+                if render:
+                    self.env.render()
+                
+                # Check if episode is done
+                if done:
+                    logger.info(f"Episode done after {step+1} steps with total reward {total_reward:.2f}")
+                    break
+                    
+            except Exception as e:
+                logger.critical(f"Error in environment step: {e}")
+                import traceback
+                logger.critical(traceback.format_exc())
                 break
-                
-        logger.critical(f"===== TRAJECTORY COLLECTION COMPLETE =====")
-        logger.critical(f"Total steps: {steps}, Total reward: {total_reward}")
-        return experiences, total_reward, steps
+        
+        # Log trajectory statistics
+        logger.info(f"Collected trajectory: {len(experiences)} steps, reward={total_reward:.2f}")
+        
+        return experiences
     
     def train_episode(
         self, 
@@ -821,205 +846,168 @@ class Trainer:
         
         return eval_summary
     
-    def _update_policy(self, experiences, scaler=None):
+    def _update_policy(self, experiences: List[Dict]) -> Dict[str, float]:
         """Update policy based on collected experiences.
         
         Args:
-            experiences: List of experience tuples
-            scaler: Optional grad scaler for mixed precision training
+            experiences: List of collected experiences
+            
+        Returns:
+            Dictionary of statistics from the update
         """
-        # Extract states, actions, rewards, etc. from experiences
-        states = []
-        actions = []
-        rewards = []
-        next_states = []
-        dones = []
-        log_probs = []
-        values = []
-        
-        for exp in experiences:
-            state, action, reward, next_state, done, log_prob, value = exp
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            next_states.append(next_state)
-            dones.append(done)
-            log_probs.append(log_prob)
-            values.append(value)
-        
-        # Convert to tensors
-        states = torch.stack(states)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.agent.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.agent.device)
-        next_states = torch.stack(next_states)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.agent.device)
-        log_probs = torch.stack(log_probs)
-        values = torch.stack(values)
-        
-        # Calculate returns and advantages
-        returns = self._compute_returns(rewards, dones, values)
-        advantages = self._compute_advantages(returns, values)
-        
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # With mixed precision if available
-        using_mixed_precision = scaler is not None
-        
-        # Create mini-batches for update
-        batch_size = min(self.config.batch_size, len(states))
-        indices = torch.randperm(len(states))
-        
-        # Zero gradients
-        self.optimizer.zero_grad()
-        
-        # Track losses for logging
-        policy_losses = []
-        value_losses = []
-        entropy_losses = []
-        
-        # Number of batches
-        n_batches = (len(states) + batch_size - 1) // batch_size
-        
-        for i in range(n_batches):
-            # Get batch indices
-            batch_indices = indices[i * batch_size:(i + 1) * batch_size]
+        if not experiences:
+            logger.critical("No experiences provided for policy update")
+            return {
+                'policy_loss': 0,
+                'value_loss': 0,
+                'entropy': 0,
+                'total_loss': 0,
+                'clip_fraction': 0,
+                'approx_kl': 0
+            }
             
-            # Extract batch data
-            batch_states = states[batch_indices]
-            batch_actions = actions[batch_indices]
-            batch_log_probs = log_probs[batch_indices]
-            batch_returns = returns[batch_indices]
-            batch_advantages = advantages[batch_indices]
-            
-            # Forward pass - with or without mixed precision
-            if using_mixed_precision:
-                with torch.cuda.amp.autocast():
-                    # Get new action distributions and values
-                    new_action_probs, new_values = self.agent.network(batch_states)
-                    
-                    # Calculate new log probs - properly gathering the probabilities for each action
-                    # and then taking the log
-                    gathered_probs = torch.gather(new_action_probs, 1, batch_actions.unsqueeze(1))
-                    new_log_probs = torch.log(gathered_probs.squeeze(1).clamp(min=1e-10))
-                    
-                    # Calculate policy loss (PPO objective)
-                    ratio = torch.exp(new_log_probs - batch_log_probs)
-                    surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - self.agent.updater.clip_param, 1.0 + self.agent.updater.clip_param) * batch_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # Calculate value loss
-                    value_loss = ((new_values - batch_returns) ** 2).mean()
-                    
-                    # Calculate entropy bonus - using the formula -sum(p_i * log(p_i))
-                    entropy_loss = -torch.sum(new_action_probs * torch.log(new_action_probs.clamp(min=1e-10)), dim=1).mean()
-                    
-                    # Calculate total loss
-                    loss = policy_loss + self.agent.updater.value_coef * value_loss + self.agent.updater.entropy_coef * entropy_loss
-                
-                # Backpropagate with scaler
-                scaler.scale(loss).backward()
-            else:
-                # Standard forward pass
-                new_action_probs, new_values = self.agent.network(batch_states)
-                
-                # Calculate new log probs - properly gathering the probabilities for each action
-                # and then taking the log
-                gathered_probs = torch.gather(new_action_probs, 1, batch_actions.unsqueeze(1))
-                new_log_probs = torch.log(gathered_probs.squeeze(1).clamp(min=1e-10))
-                
-                # Calculate policy loss (PPO objective)
-                ratio = torch.exp(new_log_probs - batch_log_probs)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.agent.updater.clip_param, 1.0 + self.agent.updater.clip_param) * batch_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # Calculate value loss
-                value_loss = ((new_values - batch_returns) ** 2).mean()
-                
-                # Calculate entropy bonus - using the formula -sum(p_i * log(p_i))
-                entropy_loss = -torch.sum(new_action_probs * torch.log(new_action_probs.clamp(min=1e-10)), dim=1).mean()
-                
-                # Calculate total loss
-                loss = policy_loss + self.agent.updater.value_coef * value_loss + self.agent.updater.entropy_coef * entropy_loss
-                
-                # Standard backprop
-                loss.backward()
-            
-            # Track losses for logging
-            policy_losses.append(policy_loss.item())
-            value_losses.append(value_loss.item())
-            entropy_losses.append(entropy_loss.item())
+        logger.critical(f"Updating policy with {len(experiences)} experiences")
         
-        # Apply gradients with or without scaler
-        if using_mixed_precision:
-            # Unscale to enable gradient clipping
-            scaler.unscale_(self.optimizer)
+        # Check that memory has been initialized
+        if self.memory is None:
+            logger.critical("Memory not initialized, creating temporary memory")
+            self.memory = Memory(self.device)
             
-            # Clip gradients using L2 norm
-            torch.nn.utils.clip_grad_norm_(self.agent.network.parameters(), self.agent.updater.max_grad_norm)
-            
-            # Step with scaler
-            scaler.step(self.optimizer)
-            scaler.update()
-        else:
-            # Standard gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.agent.network.parameters(), self.agent.updater.max_grad_norm)
-            
-            # Standard optimizer step
-            self.optimizer.step()
+        # Add experiences to memory if needed
+        if self.memory.size() == 0:
+            logger.critical("Memory is empty, adding experiences")
+            for exp in experiences:
+                self.memory.add(
+                    state=exp['state'],
+                    action=exp['action'],
+                    reward=exp['reward'],
+                    next_state=exp['next_state'],
+                    done=exp['done'],
+                    log_prob=exp.get('log_prob'),
+                    value=exp.get('value'),
+                    action_probs=exp.get('action_probs')
+                )
+                
+        # Compute returns and advantages
+        logger.critical("Computing returns and advantages")
+        self.memory.compute_returns(self.gamma, self.gae_lambda)
         
-        # Step learning rate scheduler if available
-        if self.scheduler is not None:
-            self.scheduler.step()
+        # Update policy for multiple epochs
+        logger.critical(f"Starting policy update for {self.ppo_epochs} epochs")
         
-        # Update visualizer metrics
-        self.visualizer.record_training_metrics(
-            actor_loss=sum(policy_losses) / len(policy_losses) if policy_losses else 0.0,
-            critic_loss=sum(value_losses) / len(value_losses) if value_losses else 0.0,
-            entropy=sum(entropy_losses) / len(entropy_losses) if entropy_losses else 0.0
-        )
-        
-        # Return update statistics
-        return {
-            'actor_loss': sum(policy_losses) / len(policy_losses) if policy_losses else 0.0,
-            'critic_loss': sum(value_losses) / len(value_losses) if value_losses else 0.0,
-            'entropy': sum(entropy_losses) / len(entropy_losses) if entropy_losses else 0.0,
-            'learning_rate': self.optimizer.param_groups[0]['lr']
+        # Initialize metrics for tracking
+        metrics = {
+            'policy_loss': 0,
+            'value_loss': 0,
+            'entropy': 0,
+            'total_loss': 0,
+            'clip_fraction': 0,
+            'approx_kl': 0
         }
         
-    def _compute_returns(self, rewards, dones, values):
-        """Compute discounted returns for a trajectory.
-        
-        Args:
-            rewards: Tensor of rewards
-            dones: Tensor of done flags
-            values: Tensor of value predictions
+        # Update for multiple epochs
+        for epoch in range(self.ppo_epochs):
+            logger.critical(f"Policy update epoch {epoch+1}/{self.ppo_epochs}")
             
-        Returns:
-            Tensor of discounted returns
-        """
-        returns = torch.zeros_like(rewards)
-        next_value = 0
-        
-        # Compute returns in reverse order
-        for t in reversed(range(len(rewards))):
-            next_value = rewards[t] + self.agent.gamma * next_value * (1 - dones[t])
-            returns[t] = next_value
+            # Reset epoch metrics
+            epoch_policy_loss = 0
+            epoch_value_loss = 0
+            epoch_entropy = 0
+            epoch_total_loss = 0
+            epoch_clip_fraction = 0
+            epoch_approx_kl = 0
+            num_batches = 0
             
-        return returns
-    
-    def _compute_advantages(self, returns, values):
-        """Compute advantages for a trajectory.
-        
-        Args:
-            returns: Tensor of discounted returns
-            values: Tensor of value predictions
+            # Get batch iterator
+            batch_iterator = self.memory.get_batch_iterator(self.batch_size, shuffle=True)
             
-        Returns:
-            Tensor of advantages
-        """
-        # Simple advantage computation: returns - values
-        advantages = returns - values
-        return advantages 
+            # Process each batch
+            for batch in batch_iterator:
+                # Ensure all tensors are on the correct device
+                for key, tensor in batch.items():
+                    if tensor.device != self.device:
+                        batch[key] = tensor.to(self.device)
+                        
+                try:
+                    # Use mixed precision if enabled
+                    with torch.cuda.amp.autocast(enabled=self.use_mixed_precision) if torch.cuda.is_available() and self.use_mixed_precision else contextlib.nullcontext():
+                        # Forward pass through the model
+                        states = batch['states']
+                        actions = batch['actions']
+                        old_log_probs = batch['old_log_probs']
+                        returns = batch['returns']
+                        advantages = batch['advantages']
+                        
+                        # Get current policy outputs
+                        action_probs, state_values = self.agent.policy.evaluate_actions(states, actions)
+                        
+                        # Calculate log probabilities and entropy
+                        dist = torch.distributions.Categorical(action_probs)
+                        new_log_probs = dist.log_prob(actions)
+                        entropy = dist.entropy().mean()
+                        
+                        # Calculate policy loss with clipping
+                        ratio = torch.exp(new_log_probs - old_log_probs)
+                        surr1 = ratio * advantages
+                        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages
+                        policy_loss = -torch.min(surr1, surr2).mean()
+                        
+                        # Calculate value loss
+                        value_loss = F.mse_loss(state_values, returns)
+                        
+                        # Combined loss
+                        loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+                        
+                        # Calculate metrics
+                        clip_fraction = ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
+                        approx_kl = 0.5 * ((new_log_probs - old_log_probs) ** 2).mean().item()
+                        
+                    # Compute gradients
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    
+                    # Clip gradients
+                    if self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), self.max_grad_norm)
+                    
+                    # Update parameters
+                    self.optimizer.step()
+                    
+                    # Update metrics
+                    epoch_policy_loss += policy_loss.item()
+                    epoch_value_loss += value_loss.item()
+                    epoch_entropy += entropy.item()
+                    epoch_total_loss += loss.item()
+                    epoch_clip_fraction += clip_fraction
+                    epoch_approx_kl += approx_kl
+                    num_batches += 1
+                    
+                except Exception as e:
+                    logger.critical(f"Error during policy update: {e}")
+                    import traceback
+                    logger.critical(traceback.format_exc())
+                    continue
+                    
+            # Average over batches
+            if num_batches > 0:
+                metrics['policy_loss'] += epoch_policy_loss / num_batches
+                metrics['value_loss'] += epoch_value_loss / num_batches
+                metrics['entropy'] += epoch_entropy / num_batches
+                metrics['total_loss'] += epoch_total_loss / num_batches
+                metrics['clip_fraction'] += epoch_clip_fraction / num_batches
+                metrics['approx_kl'] += epoch_approx_kl / num_batches
+                
+        # Average over epochs
+        for key in metrics:
+            metrics[key] /= max(1, self.ppo_epochs)
+            
+        # Update learning rate if scheduler is available
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+            metrics['learning_rate'] = self.lr_scheduler.get_last_lr()[0]
+            
+        # Clear memory after update
+        self.memory.clear()
+        
+        logger.critical(f"Policy update complete: policy_loss={metrics['policy_loss']:.4f}, value_loss={metrics['value_loss']:.4f}")
+        return metrics 

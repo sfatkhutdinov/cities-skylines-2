@@ -84,18 +84,54 @@ class ObservationManager:
             time.sleep(self.min_capture_interval - elapsed)
         
         # Capture raw frame
-        logger.critical("Capturing raw frame")
+        logger.critical("===== OBSERVATION CAPTURE ATTEMPT =====")
         try:
+            logger.critical("Calling screen_capture.capture_frame()")
+            capture_start = time.time()
             raw_frame = self.screen_capture.capture_frame()
+            capture_duration = time.time() - capture_start
+            logger.critical(f"Screen capture completed in {capture_duration:.4f}s")
+            
             if raw_frame is None:
                 logger.critical("Failed to capture frame: raw_frame is None")
+                # If in mock mode, generate a random frame for testing
+                if self.mock_mode:
+                    logger.critical("In mock mode, generating random frame")
+                    raw_frame = np.random.randint(0, 255, (84, 84, 3), dtype=np.uint8)
+                else:
+                    # Try again with a short delay
+                    logger.critical("Waiting 0.5s and trying capture again")
+                    time.sleep(0.5)
+                    raw_frame = self.screen_capture.capture_frame()
+                    if raw_frame is None:
+                        logger.critical("Second capture attempt also failed")
+                        raise ValueError("Failed to capture frame after retry")
             else:
+                # Log basic frame info
                 logger.critical(f"Raw frame captured: shape={raw_frame.shape}, type={type(raw_frame)}")
+                logger.critical(f"Frame values - min: {np.min(raw_frame)}, max: {np.max(raw_frame)}, mean: {np.mean(raw_frame):.2f}")
+                
+                # Check for all-black or all-white frames which might indicate issues
+                if np.mean(raw_frame) < 10:
+                    logger.critical("WARNING: Frame appears to be mostly black!")
+                elif np.mean(raw_frame) > 245:
+                    logger.critical("WARNING: Frame appears to be mostly white!")
+                    
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
             logger.critical(f"Error capturing frame: {e}")
             logger.critical(f"Error traceback: {error_trace}")
+            
+            # Try to diagnose screen capture issues
+            logger.critical("Diagnosing screen capture issues:")
+            try:
+                if hasattr(self.screen_capture, 'check_window_handle'):
+                    handle_ok = self.screen_capture.check_window_handle()
+                    logger.critical(f"Window handle check: {'OK' if handle_ok else 'FAILED'}")
+            except Exception as diag_error:
+                logger.critical(f"Diagnostics error: {diag_error}")
+                
             raise  # Re-raise to be handled by the Environment class
         
         # Process frame
@@ -103,6 +139,13 @@ class ObservationManager:
         try:
             processed_frame = self._process_frame(raw_frame)
             logger.critical(f"Frame processed: shape={processed_frame.shape}, device={processed_frame.device}, dtype={processed_frame.dtype}")
+            
+            # Check for NaN or Inf values
+            if torch.isnan(processed_frame).any():
+                logger.critical("WARNING: Processed frame contains NaN values!")
+            if torch.isinf(processed_frame).any():
+                logger.critical("WARNING: Processed frame contains Inf values!")
+                
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
@@ -116,6 +159,7 @@ class ObservationManager:
         
         # Update timing
         self.last_capture_time = time.time()
+        logger.critical("===== OBSERVATION CAPTURE COMPLETE =====")
         
         return processed_frame
     

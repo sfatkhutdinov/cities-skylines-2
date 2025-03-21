@@ -12,4 +12,8 @@ __all__ = [
     "ImageUtils",
     "HardwareMonitor", 
     "PerformanceSafeguards"
-] 
+]
+
+"""
+Utility modules for the project.
+""" 

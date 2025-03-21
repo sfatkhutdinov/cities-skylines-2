@@ -34,6 +34,9 @@ _trainer = None
 _environment = None
 _exit_requested = False
 
+# Default game path for Steam installation
+DEFAULT_GAME_PATH = r"C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2.exe"
+
 def setup_file_logging(log_dir="logs"):
     """Configure logging to write to a timestamped file in the specified directory."""
     if not os.path.exists(log_dir):
@@ -149,7 +152,24 @@ def main():
         env_type = "mock" if args.mock_env else "real game"
         logger.info(f"Setting up {env_type} environment")
         
+        # Handle game path - check command line args, then use default path if it exists
+        game_path = args.game_path if hasattr(args, 'game_path') and args.game_path else None
+        
+        # If no path provided via args, try the default Steam path
+        if not game_path and not args.mock_env:
+            if os.path.exists(DEFAULT_GAME_PATH):
+                game_path = DEFAULT_GAME_PATH
+                logger.info(f"Using default Steam installation path: {game_path}")
+            else:
+                logger.warning("Default game path not found. Game auto-restart will be disabled.")
+                logger.warning("Use --game_path to specify the path to the Cities: Skylines 2 executable")
+        
         _environment = setup_environment(args, hardware_config)
+        
+        # If game path is available, set it on the error recovery system
+        if game_path and not args.mock_env and hasattr(_environment, 'error_recovery'):
+            logger.info(f"Setting game path: {game_path}")
+            _environment.error_recovery.game_path = game_path
         
         # Ensure window focus before proceeding
         if not args.mock_env:
@@ -175,12 +195,35 @@ def main():
             'mixed_precision': args.mixed_precision if hasattr(args, 'mixed_precision') else False,
         }
         
+        # Update hardware config with trainer config values
+        hardware_config.num_episodes = trainer_config['num_episodes']
+        hardware_config.max_steps = trainer_config['max_steps']
+        hardware_config.learning_rate = trainer_config['learning_rate']
+        hardware_config.early_stop_reward = trainer_config['early_stop_reward']
+        hardware_config.mixed_precision = trainer_config['mixed_precision']
+        
+        # Add optimizer related attributes 
+        hardware_config.optimizer = 'adam'  # Default optimizer
+        hardware_config.weight_decay = 0.0  # Default weight decay
+        hardware_config.clip_param = 0.2    # PPO clip parameter
+        
+        # Add additional required attributes
+        hardware_config.max_checkpoints = 5  # Maximum number of checkpoints to keep
+        hardware_config.value_loss_coef = 0.5  # Value loss coefficient
+        hardware_config.entropy_coef = 0.01  # Entropy coefficient
+        hardware_config.max_grad_norm = 0.5  # Max gradient norm
+        hardware_config.visualizer_update_interval = 10  # Visualizer update interval
+        hardware_config.monitor_hardware = False  # Hardware monitoring
+        hardware_config.min_fps = 10  # Minimum FPS
+        hardware_config.max_memory_usage = 0.9  # Maximum memory usage (90%)
+        hardware_config.safeguard_cooldown = 60  # Safeguard cooldown
+        
         # Create trainer
         _trainer = Trainer(
             agent=agent,
             env=_environment,
             config=hardware_config,
-            config_dict=trainer_config
+            checkpoint_dir=trainer_config['checkpoint_dir']
         )
         
         # Train the agent

@@ -99,34 +99,63 @@ class PPOAgent:
         Returns:
             Tuple containing (action, log_prob, value)
         """
-        # Convert state to tensor if needed
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=self.dtype, device=self.device)
-        
-        # Ensure state has correct shape
-        if len(state.shape) == 3:  # Add batch dimension if needed
-            state = state.unsqueeze(0)
-        
-        # Store last state for continued episodes
-        self.last_state = state
-        
-        # Use automatic mixed precision for forward pass if enabled
-        if self.use_amp and self.training and torch.is_grad_enabled():
-            with torch.cuda.amp.autocast():
+        # Enhanced error logging
+        logger.critical(f"select_action called with state of type {type(state)}")
+        if isinstance(state, torch.Tensor):
+            logger.critical(f"State tensor shape: {state.shape}, device: {state.device}, dtype: {state.dtype}")
+            if torch.isnan(state).any():
+                logger.critical("WARNING: State contains NaN values!")
+            if torch.isinf(state).any():
+                logger.critical("WARNING: State contains Inf values!")
+        elif isinstance(state, np.ndarray):
+            logger.critical(f"State numpy array shape: {state.shape}, dtype: {state.dtype}")
+        else:
+            logger.critical(f"State is of unexpected type: {type(state)}")
+            
+        try:
+            # Convert state to tensor if needed
+            if not isinstance(state, torch.Tensor):
+                logger.critical("Converting state to tensor")
+                state = torch.tensor(state, dtype=self.dtype, device=self.device)
+            
+            # Ensure state has correct shape
+            if len(state.shape) == 3:  # Add batch dimension if needed
+                logger.critical("Adding batch dimension to state")
+                state = state.unsqueeze(0)
+            
+            # Store last state for continued episodes
+            self.last_state = state
+            
+            # Use automatic mixed precision for forward pass if enabled
+            logger.critical("About to call policy.select_action")
+            if self.use_amp and self.training and torch.is_grad_enabled():
+                with torch.cuda.amp.autocast():
+                    # Select action using policy
+                    action, log_prob, info = self.policy.select_action(state, deterministic)
+            else:
                 # Select action using policy
                 action, log_prob, info = self.policy.select_action(state, deterministic)
-        else:
-            # Select action using policy
-            action, log_prob, info = self.policy.select_action(state, deterministic)
-        
-        # Extract value from info
-        value = info['value']
-        
-        # Track steps
-        self.steps_taken += 1
-        
-        # Return action, log_prob, and value
-        return action.cpu().numpy().item(), log_prob, value
+            
+            logger.critical(f"Policy returned action: {action}, log_prob: {log_prob}")
+            
+            # Extract value from info
+            value = info['value']
+            
+            # Track steps
+            self.steps_taken += 1
+            
+            # Return action, log_prob, and value
+            logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
+            return action.cpu().numpy().item(), log_prob, value
+            
+        except Exception as e:
+            import traceback
+            logger.critical(f"ERROR in select_action: {e}")
+            logger.critical(f"Traceback: {traceback.format_exc()}")
+            # Provide a fallback random action in case of error
+            action = np.random.randint(0, self.action_dim)
+            logger.critical(f"Falling back to random action: {action}")
+            return action, torch.tensor(0.0), torch.tensor(0.0)
     
     def store_experience(self, state: torch.Tensor, 
                         action: torch.Tensor, 

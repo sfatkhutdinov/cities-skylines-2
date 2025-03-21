@@ -1,35 +1,30 @@
 """
 Memory module for PPO agent in Cities: Skylines 2.
 
-This module implements the experience memory component of the PPO agent,
-storing experiences and providing data for training updates.
+This module implements the memory system for the PPO agent,
+handling experience storage, retrieval, and processing.
 """
 
 import torch
 import logging
 import numpy as np
-from typing import Dict, Tuple, List, Any, Optional, Iterator, Union
-from collections import deque, namedtuple
+from typing import Dict, List, Tuple, Any, Optional, Iterator
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
-# Define experience tuple structure
-Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done', 'log_prob', 'value'])
-
 class Memory:
-    """Implements the experience memory component for the PPO agent."""
+    """Manages experience memory for the PPO agent."""
     
-    def __init__(self, device: torch.device, capacity: int = 10000):
+    def __init__(self, device: torch.device):
         """Initialize memory component.
         
         Args:
             device: Device to store tensors on
-            capacity: Maximum number of experiences to store
         """
         self.device = device
-        self.capacity = capacity
         
-        # Core memory storage
+        # Store experiences
         self.states = []
         self.actions = []
         self.rewards = []
@@ -37,27 +32,30 @@ class Memory:
         self.dones = []
         self.log_probs = []
         self.values = []
+        self.action_probs = []
         
-        # Computed data
+        # Store computed data
         self.returns = []
         self.advantages = []
-        self.action_probs = []  # Full action probability distributions
         
-        # Episode tracking
-        self.current_episode = []
+        # Statistics
         self.episode_rewards = deque(maxlen=100)
         self.episode_lengths = deque(maxlen=100)
         
-        logger.info(f"Initialized memory with capacity {capacity}")
+        # Initialize empty
+        self.clear()
+        
+        logger.info(f"Initialized memory on device: {device}")
     
-    def add(self, state: torch.Tensor, 
-           action: torch.Tensor, 
-           reward: float, 
-           next_state: Optional[torch.Tensor], 
-           done: bool, 
-           log_prob: torch.Tensor, 
-           value: torch.Tensor,
-           action_probs: Optional[torch.Tensor] = None) -> None:
+    def add(self, 
+            state: torch.Tensor, 
+            action: Any, 
+            reward: float, 
+            next_state: Optional[torch.Tensor], 
+            done: bool, 
+            log_prob: Optional[torch.Tensor] = None, 
+            value: Optional[torch.Tensor] = None,
+            action_probs: Optional[torch.Tensor] = None) -> None:
         """Add an experience to memory.
         
         Args:
@@ -67,276 +65,174 @@ class Memory:
             next_state: Next state
             done: Whether episode ended
             log_prob: Log probability of action
-            value: Value of state
-            action_probs: Full action probability distribution
+            value: Value estimate
+            action_probs: Action probability distribution
         """
-        # Check if memory is full
-        if len(self.states) >= self.capacity:
-            # Remove oldest entries
-            self._remove_oldest(1)
+        # Log critical information about what's being added to memory
+        logger.critical(f"Adding experience: action={action}, reward={reward}, done={done}")
         
-        # Convert to torch tensors if needed
+        # Ensure state is a tensor on the correct device
         if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, device=self.device)
-        if not isinstance(action, torch.Tensor):
-            action = torch.tensor(action, device=self.device)
-        if not isinstance(reward, torch.Tensor):
-            reward = torch.tensor(reward, device=self.device, dtype=torch.float32)
-        if next_state is not None and not isinstance(next_state, torch.Tensor):
-            next_state = torch.tensor(next_state, device=self.device)
-        if not isinstance(done, torch.Tensor):
-            done = torch.tensor(done, device=self.device, dtype=torch.float32)
-        if not isinstance(log_prob, torch.Tensor):
-            log_prob = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
-        if not isinstance(value, torch.Tensor):
-            value = torch.tensor(value, device=self.device, dtype=torch.float32)
-            
-        # Store experience
+            state = torch.as_tensor(state, device=self.device).float()
+        elif state.device != self.device:
+            state = state.to(self.device)
+        
+        # Ensure next_state is a tensor on the correct device
+        if next_state is not None:
+            if not isinstance(next_state, torch.Tensor):
+                next_state = torch.as_tensor(next_state, device=self.device).float()
+            elif next_state.device != self.device:
+                next_state = next_state.to(self.device)
+        
+        # Store the experience
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
-        if next_state is not None:
-            self.next_states.append(next_state)
+        self.next_states.append(next_state if next_state is not None else state.clone())  # Use current state as fallback
         self.dones.append(done)
-        self.log_probs.append(log_prob)
-        self.values.append(value)
         
-        # Store action probabilities if provided
+        # Store optional data if provided
+        if log_prob is not None:
+            if not isinstance(log_prob, torch.Tensor):
+                log_prob = torch.tensor(log_prob, device=self.device).float()
+            elif log_prob.device != self.device:
+                log_prob = log_prob.to(self.device)
+            self.log_probs.append(log_prob)
+        else:
+            # Use a default value for log probability
+            self.log_probs.append(torch.tensor(0.0, device=self.device))
+        
+        if value is not None:
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, device=self.device).float()
+            elif value.device != self.device:
+                value = value.to(self.device)
+            self.values.append(value)
+        else:
+            # Use a default value for value estimate
+            self.values.append(torch.tensor(0.0, device=self.device))
+        
         if action_probs is not None:
+            if not isinstance(action_probs, torch.Tensor):
+                action_probs = torch.tensor(action_probs, device=self.device).float()
+            elif action_probs.device != self.device:
+                action_probs = action_probs.to(self.device)
             self.action_probs.append(action_probs)
         
-        # Add to current episode
-        experience = Experience(state, action, reward, next_state, done, log_prob, value)
-        self.current_episode.append(experience)
-        
-        # Check if episode ended
+        # Track episode statistics
         if done:
-            self._finish_episode()
+            current_episode_reward = sum(self.rewards[-1:])
+            current_episode_length = 1
+            self.episode_rewards.append(current_episode_reward)
+            self.episode_lengths.append(current_episode_length)
+            logger.info(f"Episode complete: reward={current_episode_reward:.2f}, length={current_episode_length}")
     
-    def add_batch(self, states: torch.Tensor, 
-                 actions: torch.Tensor, 
-                 rewards: torch.Tensor, 
-                 next_states: torch.Tensor, 
-                 dones: torch.Tensor, 
-                 log_probs: torch.Tensor, 
-                 values: torch.Tensor) -> None:
-        """Add a batch of experiences to memory.
-        
-        Args:
-            states: Batch of states
-            actions: Batch of actions
-            rewards: Batch of rewards
-            next_states: Batch of next states
-            dones: Batch of done flags
-            log_probs: Batch of log probabilities
-            values: Batch of state values
-        """
-        batch_size = len(states)
-        
-        # Check capacity
-        if len(self.states) + batch_size > self.capacity:
-            # Remove oldest entries to make room
-            overflow = len(self.states) + batch_size - self.capacity
-            self._remove_oldest(overflow)
-            
-        # Ensure all tensors are on the correct device
-        if states.device != self.device:
-            states = states.to(self.device)
-        if actions.device != self.device:
-            actions = actions.to(self.device)
-        if rewards.device != self.device:
-            rewards = rewards.to(self.device)
-        if next_states.device != self.device:
-            next_states = next_states.to(self.device)
-        if dones.device != self.device:
-            dones = dones.to(self.device)
-        if log_probs.device != self.device:
-            log_probs = log_probs.to(self.device)
-        if values.device != self.device:
-            values = values.to(self.device)
-        
-        # Add batch to memory
-        for i in range(batch_size):
-            self.states.append(states[i])
-            self.actions.append(actions[i])
-            self.rewards.append(rewards[i])
-            if next_states is not None:
-                self.next_states.append(next_states[i])
-            self.dones.append(dones[i])
-            self.log_probs.append(log_probs[i])
-            self.values.append(values[i])
-            
-            # Update episode tracking
-            if dones[i]:
-                self._finish_episode()
-    
-    def compute_returns_and_advantages(self, gamma: float, gae_lambda: float, next_value: Optional[torch.Tensor] = None) -> None:
-        """Compute returns and advantages for the stored experiences.
+    def compute_returns(self, gamma: float, gae_lambda: float) -> None:
+        """Compute returns and advantages using GAE.
         
         Args:
             gamma: Discount factor
-            gae_lambda: GAE lambda parameter
-            next_value: Value of the state after the last experience
+            gae_lambda: GAE factor
         """
-        # Ensure we have experiences to process
-        if not self.states:
-            logger.warning("No experiences to compute returns and advantages for")
+        if len(self.states) == 0:
+            logger.warning("No experiences in memory to compute returns")
             return
-        
-        # If next_value not provided, use zero
-        if next_value is None:
-            next_value = torch.zeros(1, device=self.device)
             
-        # Convert rewards and dones to tensors
-        rewards = torch.stack(self.rewards).to(self.device)
-        dones = torch.stack(self.dones).to(self.device)
-        values = torch.stack(self.values).to(self.device)
+        # Log critical information about the computation
+        logger.critical(f"Computing returns and advantages: gamma={gamma}, gae_lambda={gae_lambda}, experiences={len(self.states)}")
         
-        # Compute GAE advantages and returns
-        batch_size = len(rewards)
-        advantages = torch.zeros_like(rewards)
+        # Convert lists to tensors for faster computation
+        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
+        values = torch.cat(self.values).to(self.device) if all(isinstance(v, torch.Tensor) for v in self.values) else torch.tensor(self.values, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+        
+        # Initialize returns and advantages
         returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
         
-        # Initialize with next value
-        next_value = next_value
+        # Initialize values for GAE computation
+        next_value = 0.0  # Assume zero value after end of trajectory
         next_advantage = 0.0
         
-        # Compute advantages and returns backwards
-        for t in reversed(range(batch_size)):
-            # For last timestep, use provided next_value
-            if t == batch_size - 1:
-                next_state_value = next_value
-            else:
-                # For other timesteps, use value of next state in batch
-                next_state_value = values[t + 1]
-                
-            # Compute delta (TD error)
-            delta = rewards[t] + gamma * next_state_value * (1 - dones[t]) - values[t]
+        # Compute returns and advantages in reverse order
+        for t in reversed(range(len(rewards))):
+            # If at the end of an episode, next values are zero
+            next_non_terminal = 1.0 - dones[t]
             
-            # Compute advantage (GAE)
-            advantages[t] = delta + gamma * gae_lambda * next_advantage * (1 - dones[t])
+            # Compute TD target for return
+            delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
+            
+            # Compute return using GAE
+            returns[t] = rewards[t] + gamma * next_non_terminal * next_value
+            
+            # Compute advantage using GAE
+            advantages[t] = delta + gamma * gae_lambda * next_non_terminal * next_advantage
+            
+            # Update next values
+            next_value = values[t]
             next_advantage = advantages[t]
-            
-            # Compute returns
-            returns[t] = advantages[t] + values[t]
-            
-        # Store computed returns and advantages
-        self.returns = list(returns)
-        self.advantages = list(advantages)
         
         # Normalize advantages
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            self.advantages = list(advantages)
+        
+        # Store computed values
+        self.returns = returns.tolist()
+        self.advantages = advantages.tolist()
+        
+        logger.critical(f"Returns computed: min={min(self.returns):.2f}, max={max(self.returns):.2f}, mean={sum(self.returns)/len(self.returns):.2f}")
+        logger.critical(f"Advantages computed: min={min(self.advantages):.2f}, max={max(self.advantages):.2f}, mean={sum(self.advantages)/len(self.advantages):.2f}")
     
     def get_batch_iterator(self, batch_size: int, shuffle: bool = True) -> Iterator[Dict[str, torch.Tensor]]:
-        """Get iterator over batches of experiences.
+        """Get iterator for batches of experiences.
         
         Args:
-            batch_size: Size of each batch
-            shuffle: Whether to shuffle experiences
+            batch_size: Size of batches
+            shuffle: Whether to shuffle the data
             
         Returns:
-            Iterator over batches
+            Iterator of batches
         """
-        # Check if we have data to return
-        if not self.states or len(self.states) == 0:
-            logger.warning("No experiences in memory")
+        if len(self.states) == 0:
+            logger.warning("No experiences in memory to iterate over")
             return iter([])
             
-        # Get indices of all experiences
-        indices = list(range(len(self.states)))
+        logger.critical(f"Creating batch iterator: batch_size={batch_size}, experiences={len(self.states)}, shuffle={shuffle}")
         
-        # Shuffle if requested
-        if shuffle:
-            np.random.shuffle(indices)
-            
-        # Ensure returns and advantages are computed
-        if not self.returns or len(self.returns) != len(self.states):
-            logger.warning("Returns not computed, computing with default parameters")
-            self.compute_returns_and_advantages(0.99, 0.95)
-            
+        # Convert lists to tensors
+        states = torch.stack(self.states)
+        actions = torch.tensor(self.actions, dtype=torch.long, device=self.device)
+        returns = torch.tensor(self.returns, dtype=torch.float32, device=self.device)
+        advantages = torch.tensor(self.advantages, dtype=torch.float32, device=self.device)
+        log_probs = torch.stack(self.log_probs) if all(isinstance(lp, torch.Tensor) for lp in self.log_probs) else torch.tensor(self.log_probs, dtype=torch.float32, device=self.device)
+        values = torch.stack(self.values) if all(isinstance(v, torch.Tensor) for v in self.values) else torch.tensor(self.values, dtype=torch.float32, device=self.device)
+        
+        # Create dataset size
+        dataset_size = len(self.states)
+        
+        # Create indices
+        indices = torch.randperm(dataset_size) if shuffle else torch.arange(dataset_size)
+        
         # Create batches
-        for start_idx in range(0, len(indices), batch_size):
-            end_idx = min(start_idx + batch_size, len(indices))
+        for start_idx in range(0, dataset_size, batch_size):
+            end_idx = min(start_idx + batch_size, dataset_size)
             batch_indices = indices[start_idx:end_idx]
             
-            # Collect batch data
-            states_batch = torch.stack([self.states[i] for i in batch_indices])
-            actions_batch = torch.stack([self.actions[i] for i in batch_indices])
-            old_log_probs_batch = torch.stack([self.log_probs[i] for i in batch_indices])
-            returns_batch = torch.stack([self.returns[i] for i in batch_indices])
-            advantages_batch = torch.stack([self.advantages[i] for i in batch_indices])
-            values_batch = torch.stack([self.values[i] for i in batch_indices])
-            
-            # Build batch dict
+            # Extract batch data
             batch = {
-                'states': states_batch,
-                'actions': actions_batch,
-                'old_log_probs': old_log_probs_batch,
-                'returns': returns_batch,
-                'advantages': advantages_batch,
-                'values': values_batch
+                'states': states[batch_indices],
+                'actions': actions[batch_indices],
+                'old_log_probs': log_probs[batch_indices],
+                'returns': returns[batch_indices],
+                'advantages': advantages[batch_indices],
+                'old_values': values[batch_indices]
             }
             
-            # Add action_probs if available
-            if self.action_probs and len(self.action_probs) == len(self.states):
-                batch['old_action_probs'] = torch.stack([self.action_probs[i] for i in batch_indices])
-                
+            logger.critical(f"Yielding batch: size={len(batch_indices)}, indices={batch_indices[:5].tolist()}...")
             yield batch
     
-    def _remove_oldest(self, count: int) -> None:
-        """Remove oldest experiences from memory.
-        
-        Args:
-            count: Number of experiences to remove
-        """
-        if count <= 0:
-            return
-            
-        # Ensure we don't remove more than we have
-        count = min(count, len(self.states))
-        
-        # Remove oldest experiences
-        self.states = self.states[count:]
-        self.actions = self.actions[count:]
-        self.rewards = self.rewards[count:]
-        if self.next_states:
-            self.next_states = self.next_states[count:]
-        self.dones = self.dones[count:]
-        self.log_probs = self.log_probs[count:]
-        self.values = self.values[count:]
-        
-        # Remove from computed data too
-        if self.returns:
-            self.returns = self.returns[count:]
-        if self.advantages:
-            self.advantages = self.advantages[count:]
-        if self.action_probs:
-            self.action_probs = self.action_probs[count:]
-    
-    def _finish_episode(self) -> None:
-        """Process the end of an episode and update statistics."""
-        if not self.current_episode:
-            return
-            
-        # Calculate episode total reward and length
-        total_reward = sum(exp.reward.item() if isinstance(exp.reward, torch.Tensor) else exp.reward 
-                          for exp in self.current_episode)
-        episode_length = len(self.current_episode)
-        
-        # Update statistics
-        self.episode_rewards.append(total_reward)
-        self.episode_lengths.append(episode_length)
-        
-        # Log episode statistics
-        logger.debug(f"Episode finished: length={episode_length}, reward={total_reward:.2f}")
-        
-        # Clear current episode
-        self.current_episode = []
-    
     def clear(self) -> None:
-        """Clear all stored experiences."""
+        """Clear memory."""
         self.states = []
         self.actions = []
         self.rewards = []
@@ -344,29 +240,37 @@ class Memory:
         self.dones = []
         self.log_probs = []
         self.values = []
+        self.action_probs = []
         self.returns = []
         self.advantages = []
-        self.action_probs = []
-        self.current_episode = []
         
+        logger.critical("Memory cleared")
+    
     def size(self) -> int:
-        """Get number of experiences in memory.
+        """Get the number of experiences in memory.
         
         Returns:
-            Number of experiences
+            int: Number of experiences
         """
         return len(self.states)
     
-    def get_episode_stats(self) -> Dict[str, float]:
-        """Get episode statistics.
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get memory statistics.
         
         Returns:
-            Dictionary with episode statistics
+            Dict with statistics
         """
         return {
-            'mean_episode_reward': np.mean(self.episode_rewards) if self.episode_rewards else 0.0,
-            'mean_episode_length': np.mean(self.episode_lengths) if self.episode_lengths else 0,
-            'last_episode_reward': self.episode_rewards[-1] if self.episode_rewards else 0.0,
-            'last_episode_length': self.episode_lengths[-1] if self.episode_lengths else 0,
-            'num_episodes': len(self.episode_rewards)
-        } 
+            'experiences': len(self.states),
+            'avg_episode_reward': sum(self.episode_rewards) / len(self.episode_rewards) if self.episode_rewards else 0.0,
+            'avg_episode_length': sum(self.episode_lengths) / len(self.episode_lengths) if self.episode_lengths else 0.0,
+            'total_episodes': len(self.episode_rewards)
+        }
+    
+    def __len__(self) -> int:
+        """Get the number of experiences in memory.
+        
+        Returns:
+            int: Number of experiences
+        """
+        return len(self.states) 

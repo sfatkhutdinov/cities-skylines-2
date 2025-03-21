@@ -52,10 +52,10 @@ def parse_args():
     
     # Environment settings
     parser.add_argument("--mock_env", action="store_true", help="Use mock environment instead of real game")
-    parser.add_argument("--skip_game_check", action="store_true", help="Skip checking if game is running")
+    parser.add_argument("--skip_game_check", action="store_false", dest="skip_game_check", default=True, help="Check if game is running (default: disabled)")
     parser.add_argument("--disable_menu_detection", action="store_true", help="Disable menu detection")
     parser.add_argument("--window_title", type=str, help="Game window title to connect to")
-    parser.add_argument("--game_path", type=str, help="Path to game executable")
+    parser.add_argument("--game_path", type=str, help="Path to game executable (default: Steam installation path will be checked automatically)")
     
     # Hardware settings
     parser.add_argument("--device", type=str, choices=["cpu", "cuda"], help="Device to use (cpu or cuda)")
@@ -97,7 +97,7 @@ def setup_config(args):
         "environment": {
             "mock_env": False,
             "disable_menu_detection": False,
-            "skip_game_check": False,
+            "skip_game_check": True,
             "window_title": "Cities: Skylines II",
         },
         "hardware": {
@@ -125,8 +125,7 @@ def setup_config(args):
         config["environment"]["mock_env"] = True
     if args.disable_menu_detection:
         config["environment"]["disable_menu_detection"] = True
-    if args.skip_game_check:
-        config["environment"]["skip_game_check"] = True
+    config["environment"]["skip_game_check"] = args.skip_game_check
     if args.window_title:
         config["environment"]["window_title"] = args.window_title
     if args.game_path:
