@@ -44,7 +44,23 @@
         "eval_episodes": 5,
         "eval_interval": 100,
         "save_video": false,
-        "video_fps": 30
+        "video_fps": 30,
+        "learning_rate": 5e-5,
+        "learning_rate_decay": 0.9999,
+        "min_learning_rate": 1e-6,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_ratio": 0.2,
+        "max_grad_norm": 0.5,
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "target_kl": 0.01,
+        "update_epochs": 8,
+        "batch_size": 64,
+        "sequence_length": 16,
+        "use_gae": true,
+        "normalize_advantage": true,
+        "normalize_value": true
     },
     "environment": {
         "game_path": "",
@@ -61,7 +77,21 @@
         "grayscale": false,
         "normalize_input": true,
         "use_curriculum": false,
-        "curriculum_stages": 5
+        "curriculum_stages": 5,
+        "observation_shape": [3, 224, 224],
+        "action_space_size": 20,
+        "max_episode_steps": 2000,
+        "frame_stack_size": 4,
+        "menu_penalty": -1.0,
+        "screen_capture_method": "winapi",
+        "screen_capture_fps": 10,
+        "capture_frame_skip": 2,
+        "random_seed": 42,
+        "game_window_size": [1280, 720],
+        "use_delta_observations": false,
+        "time_limit": 3600,
+        "throttle_fps": 10,
+        "render": true
     },
     "model": {
         "backbone": "optimized",
@@ -72,7 +102,9 @@
         "use_lstm": true,
         "lstm_hidden_size": 256,
         "use_attention": true,
-        "attention_heads": 4
+        "attention_heads": 4,
+        "dropout": 0.1,
+        "sequence_batch_size": 8
     },
     "logging": {
         "level": "INFO",

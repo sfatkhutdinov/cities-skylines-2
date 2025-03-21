@@ -11,6 +11,7 @@ import numpy as np
 import logging
 import os
 from typing import Dict, List, Tuple, Optional, Any
+from collections import deque
 
 from src.config.hardware_config import HardwareConfig
 from src.environment.core.game_state import GameState
@@ -167,6 +168,11 @@ class Environment:
         self.action_stats = {}
         self.action_success_rates = {}
         
+        # Frame stacking for better temporal context
+        self.frame_stack_size = self.config.get("environment", {}).get("frame_stack_size", 4)
+        logger.critical(f"Initializing with frame stack size: {self.frame_stack_size}")
+        self.frame_buffer = deque(maxlen=self.frame_stack_size)
+        
         logger.info("Environment initialized successfully.")
     
     @property
@@ -218,20 +224,19 @@ class Environment:
         logger.critical("Setting game speed")
         self._set_game_speed(1)
         
-        # Capture initial observation
-        logger.critical("Capturing initial observation")
-        try:
-            self.current_frame = self.get_observation()
-            logger.critical(f"Observation captured successfully with shape {self.current_frame.shape if hasattr(self.current_frame, 'shape') else 'unknown'}")
-        except Exception as e:
-            logger.critical(f"Error capturing initial observation: {e}")
-            import traceback
-            logger.critical(f"Traceback: {traceback.format_exc()}")
-            # Create an empty observation as fallback
-            logger.critical("Creating fallback observation")
-            self.current_frame = torch.zeros(self.observation_space.shape)
+        # Reset frame buffer for stacking
+        logger.critical("Resetting frame buffer")
+        self.frame_buffer = deque(maxlen=self.frame_stack_size)
         
-        return self.current_frame
+        # Get first observation and fill frame buffer
+        observation = self.get_observation()
+        for _ in range(self.frame_stack_size):
+            self.frame_buffer.append(observation)
+        
+        # Return stacked observation
+        stacked_observation = self._get_stacked_observation()
+        
+        return stacked_observation
     
     def step(self, action_idx: int) -> Tuple[torch.Tensor, float, bool, Dict[str, Any]]:
         """Execute an action in the environment.
@@ -460,6 +465,12 @@ class Environment:
         # Update state with new observation
         self.current_frame = next_observation
         
+        # Add new observation to frame buffer
+        self.frame_buffer.append(next_observation)
+        
+        # Use stacked observation as state
+        state = self._get_stacked_observation()
+        
         # Compute reward
         reward = self._compute_reward(action_info, action_idx, success, menu_detected)
         logger.critical(f"REWARD DEBUG: Computed reward: {reward}")
@@ -485,7 +496,7 @@ class Environment:
         }
         
         logger.critical(f"STEP DEBUG: Step completed - success={success}, reward={reward}, done={done}")
-        return next_observation, reward, done, info
+        return state, reward, done, info
     
     def get_observation(self) -> torch.Tensor:
         """Get the current observation from the environment.
@@ -795,3 +806,33 @@ class Environment:
         
         stats['problematic_actions'] = problematic
         return stats 
+
+    def _get_stacked_observation(self):
+        """Get stacked observation from frame buffer.
+        
+        Returns:
+            Stacked observation tensor
+        """
+        # Stack frames along channel dimension for visual observations
+        # or concatenate for vector observations
+        
+        if len(self.frame_buffer) == 0:
+            logger.critical("Frame buffer is empty, this should not happen")
+            # Return a zero observation as fallback
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
+            
+        # Check observation type
+        sample_obs = self.frame_buffer[0]
+        
+        if isinstance(sample_obs, np.ndarray) and len(sample_obs.shape) >= 3:
+            # Visual observation (image)
+            # Stack along channel dimension
+            if sample_obs.shape[0] == 3:  # If channels-first format
+                return np.concatenate([f for f in self.frame_buffer], axis=0)
+            else:  # If channels-last format
+                stacked = np.concatenate([f for f in self.frame_buffer], axis=-1)
+                # Convert to channels-first for PyTorch
+                return np.transpose(stacked, (2, 0, 1))
+        else:
+            # Vector observation - concatenate
+            return np.concatenate([f.flatten() for f in self.frame_buffer]) 

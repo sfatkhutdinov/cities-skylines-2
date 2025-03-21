@@ -98,6 +98,15 @@ class PPOAgent:
         if self.use_lstm:
             logger.info("LSTM is enabled in the policy network")
         
+        # Action smoothing parameters
+        self.action_history = []
+        self.action_memory_size = 5  # Remember last 5 actions for smoothing
+        self.smooth_factor = 0.7  # Weight for current action vs. historical actions
+        self.continuous_actions = set([0, 1, 2, 3, 4, 5, 6, 7])  # Indices of movement/camera actions
+        self.last_continuous_action = None
+        self.action_momentum = 0.8  # Momentum factor for continuous actions
+        logger.info(f"Action smoothing enabled with smooth_factor={self.smooth_factor}")
+        
         logger.info(f"Initialized PPO agent with state_dim={state_dim}, action_dim={action_dim}, device={self.device}")
     
     def select_action(self, state, deterministic=False):
@@ -131,11 +140,24 @@ class PPOAgent:
                 # Create categorical distribution
                 action_distribution = torch.distributions.Categorical(action_probs)
                 
+                # Apply action smoothing
+                raw_action_probs = action_probs.clone()
+                
+                # Apply smoothing for continuous actions
+                if len(self.action_history) > 0 and not deterministic:
+                    action_probs = self._apply_action_smoothing(action_probs)
+                    # Recalculate distribution with smoothed probabilities
+                    action_distribution = torch.distributions.Categorical(action_probs)
+                
                 # Choose action
                 if deterministic:
                     action = torch.argmax(action_probs, dim=1)
                 else:
                     action = action_distribution.sample()
+                
+                # Store action in history for future smoothing
+                action_item = action.cpu().item()
+                self._update_action_history(action_item)
                 
                 # Get log probability
                 log_prob = action_distribution.log_prob(action)
@@ -667,16 +689,130 @@ class PPOAgent:
     def reset(self):
         """Reset agent state between episodes."""
         logger.critical("Resetting agent state")
-        # Reset LSTM hidden state between episodes
-        if self.use_lstm:
-            logger.critical("Resetting LSTM hidden state")
+        
+        # Don't fully reset LSTM hidden state between episodes
+        # instead, detach it from the computation graph to maintain
+        # long-term memory while preventing backprop across episodes
+        if self.use_lstm and self.hidden_state is not None:
+            h, c = self.hidden_state
+            self.hidden_state = (h.detach(), c.detach())
+            logger.critical("Detached LSTM hidden state but preserved memory")
+        elif self.use_lstm:
+            # If there's no hidden state yet, initialize it to zeros
+            logger.critical("Initializing LSTM hidden state to zeros")
             self.hidden_state = None
+            
+        # Partially reset action history to maintain some movement continuity
+        if len(self.action_history) > 2:
+            # Keep the last 2 actions
+            self.action_history = self.action_history[-2:]
         
         # Other resets if needed
         self.episodes_completed += 1
         
-        # Reset menu action tracking
-        self.menu_actions = {}
-        self.menu_actions = deque(maxlen=self.menu_action_memory)
+        logger.info("Agent state partially reset for new episode")
+    
+    def _apply_action_smoothing(self, action_probs):
+        """Apply smoothing to action probabilities to reduce jerky movements.
         
-        logger.info("Agent state reset successfully") 
+        Args:
+            action_probs: Current raw action probabilities
+            
+        Returns:
+            Smoothed action probabilities
+        """
+        smoothed_probs = action_probs.clone()
+        
+        # Apply momentum for continuous actions if we have a history
+        if self.last_continuous_action is not None:
+            # Increase probability of the last continuous action
+            for action_idx in self.continuous_actions:
+                if action_idx == self.last_continuous_action:
+                    # Boost probability of continuing the same continuous action
+                    # but only for movement/camera actions
+                    current_prob = smoothed_probs[0, action_idx].item()
+                    boosted_prob = current_prob + (1 - current_prob) * self.action_momentum
+                    smoothed_probs[0, action_idx] = boosted_prob
+            
+            # Renormalize
+            smoothed_probs = smoothed_probs / smoothed_probs.sum(dim=1, keepdim=True)
+        
+        # For non-deterministic selection, we apply historical smoothing
+        if len(self.action_history) > 0:
+            # Create historical distribution
+            action_counter = {}
+            for act in self.action_history:
+                if act in action_counter:
+                    action_counter[act] += 1
+                else:
+                    action_counter[act] = 1
+            
+            # Calculate historical probabilities
+            hist_probs = torch.zeros_like(smoothed_probs)
+            for act, count in action_counter.items():
+                hist_probs[0, act] = count / len(self.action_history)
+            
+            # Blend current and historical probabilities
+            smoothed_probs = self.smooth_factor * smoothed_probs + (1 - self.smooth_factor) * hist_probs
+            
+            # Renormalize
+            smoothed_probs = smoothed_probs / smoothed_probs.sum(dim=1, keepdim=True)
+        
+        return smoothed_probs
+    
+    def _update_action_history(self, action):
+        """Update the action history with a new action.
+        
+        Args:
+            action: New action to add to history
+        """
+        self.action_history.append(action)
+        if len(self.action_history) > self.action_memory_size:
+            self.action_history.pop(0)
+        
+        # Track continuous actions separately
+        if action in self.continuous_actions:
+            self.last_continuous_action = action
+        
+    def update_menu_action_tracking(self, action):
+        """Track which actions tend to cause menu transitions.
+        
+        Args:
+            action: The action that led to a menu
+        """
+        if isinstance(action, torch.Tensor):
+            action = action.item()
+            
+        # Initialize counter if this is the first time seeing this action
+        if action not in self.menu_actions:
+            self.menu_actions[action] = deque(maxlen=self.menu_action_memory)
+            
+        # Add timestamp to track recency
+        self.menu_actions[action].append(time.time())
+        
+        logger.info(f"Updated menu action tracking for action {action}: {len(self.menu_actions[action])} occurrences")
+    
+    def get_menu_action_penalty(self, action):
+        """Get penalty for actions that frequently cause menus.
+        
+        Args:
+            action: The action to check
+            
+        Returns:
+            float: Penalty factor (0 to menu_penalty_factor)
+        """
+        if isinstance(action, torch.Tensor):
+            action = action.item()
+            
+        if action not in self.menu_actions or len(self.menu_actions[action]) == 0:
+            return 0.0
+            
+        # Calculate decay based on time since last occurrence
+        now = time.time()
+        recent_count = sum(1 for t in self.menu_actions[action] if now - t < 300)  # Count occurrences in last 5 minutes
+        
+        # Normalize by memory size
+        recent_ratio = recent_count / self.menu_action_memory
+        
+        # Return penalty scaled by factor
+        return recent_ratio * self.menu_penalty_factor 

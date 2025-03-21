@@ -18,6 +18,8 @@ import contextlib
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
+import random
+from collections import deque
 
 from .checkpointing import CheckpointManager
 from .signal_handlers import is_exit_requested, request_exit
@@ -933,173 +935,324 @@ class Trainer:
         
         return eval_summary
     
-    def _update_policy(self, experiences: List[Dict], scaler=None) -> Dict[str, float]:
-        """Update policy based on collected experiences.
+    def _prepare_batches(self, states, actions, log_probs, returns, advantages, values=None):
+        """Prepare batches for training, with support for sequence-based processing for LSTM.
         
         Args:
-            experiences: List of collected experiences (state, action, reward, next_state, done, log_prob, value)
-            scaler: Optional gradient scaler for mixed precision training
+            states: States from experience buffer
+            actions: Actions from experience buffer
+            log_probs: Log probabilities from experience buffer
+            returns: Returns from experience buffer
+            advantages: Advantages from experience buffer
+            values: Values from experience buffer (optional)
             
         Returns:
-            Dictionary of statistics from the update
+            List of batches for training
         """
-        if not experiences:
-            logger.critical("No experiences provided for policy update")
-            return {
-                'policy_loss': 0,
-                'value_loss': 0,
-                'entropy': 0,
-                'total_loss': 0,
-                'clip_fraction': 0,
-                'approx_kl': 0
-            }
+        # Get sequence length from config if using LSTM
+        use_lstm = self.config.get("model", {}).get("use_lstm", False)
+        sequence_length = self.config.get("training", {}).get("sequence_length", 16) if use_lstm else 1
+        batch_size = self.config.get("training", {}).get("batch_size", 64)
+        
+        # Convert to tensors if they aren't already
+        if not isinstance(states, torch.Tensor):
+            states = torch.tensor(states, device=self.device)
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.tensor(actions, device=self.device)
+        if not isinstance(log_probs, torch.Tensor):
+            log_probs = torch.tensor(log_probs, device=self.device)
+        if not isinstance(returns, torch.Tensor):
+            returns = torch.tensor(returns, device=self.device)
+        if not isinstance(advantages, torch.Tensor):
+            advantages = torch.tensor(advantages, device=self.device)
+        if values is not None and not isinstance(values, torch.Tensor):
+            values = torch.tensor(values, device=self.device)
             
-        logger.critical(f"Updating policy with {len(experiences)} experiences")
+        # Create batches based on whether we're using LSTM or not
+        if use_lstm:
+            logger.info(f"Preparing sequence-based batches with sequence length {sequence_length}")
+            return self._prepare_sequence_batches(
+                states, actions, log_probs, returns, advantages, values,
+                sequence_length, batch_size
+            )
+        else:
+            logger.info("Preparing regular mini-batches")
+            # Regular mini-batches without sequence consideration
+            dataset = torch.utils.data.TensorDataset(
+                states, actions, log_probs, returns, advantages,
+                values if values is not None else torch.zeros_like(returns)
+            )
+            dataloader = torch.utils.data.DataLoader(
+                dataset, batch_size=batch_size, shuffle=True
+            )
+            return list(dataloader)
+    
+    def _prepare_sequence_batches(self, states, actions, log_probs, returns, advantages, values, 
+                                  sequence_length, batch_size):
+        """Prepare batches that respect sequence boundaries for LSTM training.
         
-        # Check that memory has been initialized
-        if self.memory is None:
-            logger.critical("Memory not initialized, creating temporary memory")
-            self.memory = Memory(self.device)
+        Args:
+            states: State tensor
+            actions: Action tensor
+            log_probs: Log probability tensor
+            returns: Returns tensor
+            advantages: Advantages tensor
+            values: Values tensor
+            sequence_length: Length of sequences for LSTM
+            batch_size: Number of sequences per batch
             
-        # Add experiences to memory if needed
-        if self.memory.size() == 0:
-            logger.critical("Memory is empty, adding experiences")
-            for exp in experiences:
-                # Unpack the experience tuple
-                state, action, reward, next_state, done, log_prob, value = exp
-                action_probs = None  # This might not be available in the tuple
-                
-                self.memory.add(
-                    state=state,
-                    action=action,
-                    reward=reward,
-                    next_state=next_state,
-                    done=done,
-                    log_prob=log_prob,
-                    value=value,
-                    action_probs=action_probs
-                )
-                
-        # Compute returns and advantages
-        logger.critical("Computing returns and advantages")
-        self.memory.compute_returns(self.gamma, self.gae_lambda)
+        Returns:
+            List of sequence batches
+        """
+        total_steps = states.size(0)
+        logger.info(f"Preparing sequence batches from {total_steps} steps")
         
-        # Update policy for multiple epochs
-        logger.critical(f"Starting policy update for {self.ppo_epochs} epochs")
+        # Determine starting indices for sequences
+        num_sequences = total_steps // sequence_length
+        if num_sequences == 0:
+            # Not enough data for even one sequence
+            logger.warning(f"Not enough data for sequence batching, falling back to standard batching")
+            dataset = torch.utils.data.TensorDataset(
+                states, actions, log_probs, returns, advantages,
+                values if values is not None else torch.zeros_like(returns)
+            )
+            dataloader = torch.utils.data.DataLoader(
+                dataset, batch_size=batch_size, shuffle=True
+            )
+            return list(dataloader)
+            
+        # Create sequence indices that respect episode boundaries
+        sequence_starts = []
+        for seq_idx in range(num_sequences):
+            start_idx = seq_idx * sequence_length
+            sequence_starts.append(start_idx)
+            
+        # Shuffle the sequence starts
+        random.shuffle(sequence_starts)
         
-        # Initialize metrics for tracking
+        # Create batches of sequences
+        batches = []
+        num_batches = (len(sequence_starts) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            # Get the sequence starts for this batch
+            batch_starts = sequence_starts[batch_idx * batch_size:
+                                          min((batch_idx + 1) * batch_size, len(sequence_starts))]
+            
+            batch_states = []
+            batch_actions = []
+            batch_log_probs = []
+            batch_returns = []
+            batch_advantages = []
+            batch_values = []
+            
+            # Collect sequences for this batch
+            for start_idx in batch_starts:
+                end_idx = min(start_idx + sequence_length, total_steps)
+                batch_states.append(states[start_idx:end_idx])
+                batch_actions.append(actions[start_idx:end_idx])
+                batch_log_probs.append(log_probs[start_idx:end_idx])
+                batch_returns.append(returns[start_idx:end_idx])
+                batch_advantages.append(advantages[start_idx:end_idx])
+                if values is not None:
+                    batch_values.append(values[start_idx:end_idx])
+                    
+            # Pad sequences if necessary
+            for i in range(len(batch_states)):
+                if batch_states[i].size(0) < sequence_length:
+                    padding_size = sequence_length - batch_states[i].size(0)
+                    if len(batch_states[i].shape) > 1:
+                        # For multidimensional states
+                        padding = torch.zeros(padding_size, *batch_states[i].shape[1:], 
+                                             device=self.device)
+                    else:
+                        # For 1D states
+                        padding = torch.zeros(padding_size, device=self.device)
+                    
+                    batch_states[i] = torch.cat([batch_states[i], padding])
+                    batch_actions[i] = torch.cat([batch_actions[i], torch.zeros(padding_size, device=self.device)])
+                    batch_log_probs[i] = torch.cat([batch_log_probs[i], torch.zeros(padding_size, device=self.device)])
+                    batch_returns[i] = torch.cat([batch_returns[i], torch.zeros(padding_size, device=self.device)])
+                    batch_advantages[i] = torch.cat([batch_advantages[i], torch.zeros(padding_size, device=self.device)])
+                    if values is not None:
+                        batch_values[i] = torch.cat([batch_values[i], torch.zeros(padding_size, device=self.device)])
+            
+            # Stack sequences into batch tensors
+            batch_states = torch.stack(batch_states)  # [batch_size, sequence_length, ...]
+            batch_actions = torch.stack(batch_actions)
+            batch_log_probs = torch.stack(batch_log_probs)
+            batch_returns = torch.stack(batch_returns)
+            batch_advantages = torch.stack(batch_advantages)
+            if values is not None:
+                batch_values = torch.stack(batch_values)
+            else:
+                batch_values = torch.zeros_like(batch_returns)
+                
+            # Add to batches
+            batches.append((batch_states, batch_actions, batch_log_probs, 
+                           batch_returns, batch_advantages, batch_values))
+                
+        logger.info(f"Created {len(batches)} sequence batches with size {batch_size}")
+        return batches
+    
+    def update_policy(self, states, actions, log_probs, returns, advantages, values=None):
+        """Update policy with PPO using properly batched sequences for LSTM.
+        
+        Args:
+            states: States from experience buffer
+            actions: Actions from experience buffer
+            log_probs: Log probabilities from experience buffer
+            returns: Returns from experience buffer
+            advantages: Advantages from experience buffer
+            values: Values from experience buffer (optional)
+            
+        Returns:
+            Dict with training metrics
+        """
+        # Prepare batches with sequence handling for LSTM
+        batches = self._prepare_batches(states, actions, log_probs, returns, advantages, values)
+        
+        # Track metrics
         metrics = {
             'policy_loss': 0,
             'value_loss': 0,
             'entropy': 0,
-            'total_loss': 0,
+            'approx_kl': 0,
             'clip_fraction': 0,
-            'approx_kl': 0
+            'explained_variance': 0,
+            'update_time': 0,
         }
         
-        # Update for multiple epochs
-        for epoch in range(self.ppo_epochs):
-            logger.critical(f"Policy update epoch {epoch+1}/{self.ppo_epochs}")
-            
-            # Reset epoch metrics
-            epoch_policy_loss = 0
-            epoch_value_loss = 0
-            epoch_entropy = 0
-            epoch_total_loss = 0
-            epoch_clip_fraction = 0
-            epoch_approx_kl = 0
-            num_batches = 0
-            
-            # Get batch iterator
-            batch_iterator = self.memory.get_batch_iterator(self.batch_size, shuffle=True)
-            
+        # Begin timing update
+        update_start = time.time()
+        
+        # Run multiple epochs of training
+        num_epochs = self.config.get("training", {}).get("update_epochs", 10)
+        use_lstm = self.config.get("model", {}).get("use_lstm", False)
+        
+        for epoch in range(num_epochs):
             # Process each batch
-            for batch in batch_iterator:
-                # Ensure all tensors are on the correct device
-                for key, tensor in batch.items():
-                    if tensor.device != self.device:
-                        batch[key] = tensor.to(self.device)
+            for batch in batches:
+                batch_states, batch_actions, batch_old_log_probs, batch_returns, batch_advantages, batch_values = batch
+                
+                # Initialize LSTM hidden state for sequence processing
+                hidden_state = None
+                
+                # Handle batch shape depending on whether we're using sequences
+                if use_lstm:
+                    # For sequence batches, we have [batch_size, sequence_length, ...] shape
+                    batch_size, sequence_length = batch_states.shape[0], batch_states.shape[1]
+                    
+                    # Process entire sequences
+                    self.agent.optimizer.zero_grad()
+                    
+                    # Reshape tensors to process in batch
+                    batch_loss = 0
+                    batch_policy_loss = 0
+                    batch_value_loss = 0
+                    batch_entropy = 0
+                    
+                    # Get initial hidden state
+                    h0 = torch.zeros(1, batch_size, self.agent.policy.lstm_hidden_size, device=self.device)
+                    c0 = torch.zeros(1, batch_size, self.agent.policy.lstm_hidden_size, device=self.device)
+                    hidden_state = (h0, c0)
+                    
+                    # Process each step in the sequence
+                    for step_idx in range(sequence_length):
+                        step_states = batch_states[:, step_idx]
+                        step_actions = batch_actions[:, step_idx]
+                        step_old_log_probs = batch_old_log_probs[:, step_idx]
+                        step_returns = batch_returns[:, step_idx]
+                        step_advantages = batch_advantages[:, step_idx]
                         
-                try:
-                    # Use mixed precision if enabled
-                    with torch.cuda.amp.autocast(enabled=self.use_mixed_precision) if torch.cuda.is_available() and self.use_mixed_precision else contextlib.nullcontext():
-                        # Forward pass through the model
-                        states = batch['states']
-                        actions = batch['actions']
-                        old_log_probs = batch['old_log_probs']
-                        returns = batch['returns']
-                        advantages = batch['advantages']
+                        # Forward pass with LSTM state
+                        action_probs, values, hidden_state = self.agent.policy(step_states, hidden_state)
                         
-                        # Get current policy outputs
-                        action_probs, state_values = self.agent.policy.evaluate_actions(states, actions)
-                        
-                        # Calculate log probabilities and entropy
+                        # Calculate new log probs and entropy
                         dist = torch.distributions.Categorical(action_probs)
-                        new_log_probs = dist.log_prob(actions)
+                        new_log_probs = dist.log_prob(step_actions)
                         entropy = dist.entropy().mean()
                         
-                        # Calculate policy loss with clipping
-                        ratio = torch.exp(new_log_probs - old_log_probs)
-                        surr1 = ratio * advantages
-                        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages
+                        # PPO loss calculation
+                        ratio = torch.exp(new_log_probs - step_old_log_probs)
+                        surr1 = ratio * step_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - self.agent.epsilon, 1.0 + self.agent.epsilon) * step_advantages
                         policy_loss = -torch.min(surr1, surr2).mean()
                         
-                        # Calculate value loss
-                        value_loss = F.mse_loss(state_values, returns)
+                        # Value loss
+                        value_loss = F.mse_loss(values, step_returns)
                         
-                        # Combined loss
-                        loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
+                        # Total loss
+                        loss = policy_loss + self.agent.value_coef * value_loss - self.agent.entropy_coef * entropy
                         
-                        # Calculate metrics
-                        clip_fraction = ((ratio - 1.0).abs() > self.clip_param).float().mean().item()
-                        approx_kl = 0.5 * ((new_log_probs - old_log_probs) ** 2).mean().item()
-                        
-                    # Compute gradients
-                    self.optimizer.zero_grad()
-                    loss.backward()
+                        # Accumulate batch loss
+                        batch_loss += loss
+                        batch_policy_loss += policy_loss.item()
+                        batch_value_loss += value_loss.item()
+                        batch_entropy += entropy.item()
                     
-                    # Clip gradients
-                    if self.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.agent.policy.network.parameters(), self.max_grad_norm)
+                    # Average losses over sequence steps
+                    batch_loss /= sequence_length
+                    batch_policy_loss /= sequence_length
+                    batch_value_loss /= sequence_length
+                    batch_entropy /= sequence_length
                     
-                    # Update parameters
-                    self.optimizer.step()
+                    # Backward pass and update
+                    batch_loss.backward()
+                    if self.agent.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), self.agent.max_grad_norm)
+                    self.agent.optimizer.step()
                     
                     # Update metrics
-                    epoch_policy_loss += policy_loss.item()
-                    epoch_value_loss += value_loss.item()
-                    epoch_entropy += entropy.item()
-                    epoch_total_loss += loss.item()
-                    epoch_clip_fraction += clip_fraction
-                    epoch_approx_kl += approx_kl
-                    num_batches += 1
+                    metrics['policy_loss'] += batch_policy_loss / num_epochs
+                    metrics['value_loss'] += batch_value_loss / num_epochs
+                    metrics['entropy'] += batch_entropy / num_epochs
                     
-                except Exception as e:
-                    logger.critical(f"Error during policy update: {e}")
-                    import traceback
-                    logger.critical(traceback.format_exc())
-                    continue
+                else:
+                    # Standard non-sequence processing (original method)
+                    self.agent.optimizer.zero_grad()
                     
-            # Average over batches
-            if num_batches > 0:
-                metrics['policy_loss'] += epoch_policy_loss / num_batches
-                metrics['value_loss'] += epoch_value_loss / num_batches
-                metrics['entropy'] += epoch_entropy / num_batches
-                metrics['total_loss'] += epoch_total_loss / num_batches
-                metrics['clip_fraction'] += epoch_clip_fraction / num_batches
-                metrics['approx_kl'] += epoch_approx_kl / num_batches
-                
-        # Average over epochs
-        for key in metrics:
-            metrics[key] /= max(1, self.ppo_epochs)
-            
-        # Update learning rate if scheduler is available
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
-            metrics['learning_rate'] = self.lr_scheduler.get_last_lr()[0]
-            
-        # Clear memory after update
-        self.memory.clear()
+                    # Forward pass
+                    action_probs, values, _ = self.agent.policy(batch_states)
+                    dist = torch.distributions.Categorical(action_probs)
+                    new_log_probs = dist.log_prob(batch_actions)
+                    entropy = dist.entropy().mean()
+                    
+                    # Ratio for PPO
+                    ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                    
+                    # Clipped surrogate objective
+                    surr1 = ratio * batch_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.agent.epsilon, 1.0 + self.agent.epsilon) * batch_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Value loss
+                    value_loss = F.mse_loss(values, batch_returns)
+                    
+                    # Total loss
+                    loss = policy_loss + self.agent.value_coef * value_loss - self.agent.entropy_coef * entropy
+                    
+                    # Backward pass and optimize
+                    loss.backward()
+                    if self.agent.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), self.agent.max_grad_norm)
+                    self.agent.optimizer.step()
+                    
+                    # Update metrics
+                    metrics['policy_loss'] += policy_loss.item() / num_epochs
+                    metrics['value_loss'] += value_loss.item() / num_epochs
+                    metrics['entropy'] += entropy.item() / num_epochs
+                    approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
+                    metrics['approx_kl'] += approx_kl / num_epochs
+                    metrics['clip_fraction'] += ((ratio - 1.0).abs() > self.agent.epsilon).float().mean().item() / num_epochs
         
-        logger.critical(f"Policy update complete: policy_loss={metrics['policy_loss']:.4f}, value_loss={metrics['value_loss']:.4f}")
+        # Calculate explained variance
+        if values is not None:
+            var_y = torch.var(returns)
+            explained_var = 1 - torch.var(returns - values) / var_y if var_y > 0 else 0
+            metrics['explained_variance'] = explained_var.item()
+            
+        # Record update time
+        metrics['update_time'] = time.time() - update_start
+        
         return metrics 
