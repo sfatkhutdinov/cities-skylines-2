@@ -255,6 +255,15 @@ class AutonomousRewardSystem:
         self.last_error = 0.0
         self.steps_since_reset = 0
         
+        # Add visited states tracking
+        self.visited_states = set()
+        self.action_history = deque(maxlen=100)
+        self.reward_counter = 0
+        self.num_actions = action_dim
+        self.action_history_size = 100
+        self.max_reward = 1.0
+        self.min_reward = -1.0
+        
         # State variables
         self.is_stable = False
         self.stability_threshold = self.config.get("stability_threshold", 100)
@@ -934,6 +943,11 @@ class AutonomousRewardSystem:
         
         # Reset reward shaper
         self.reward_shaper.reset()
+        
+        # Reset visited states tracking
+        self.visited_states.clear()
+        self.action_history.clear()
+        self.reward_counter = 0
         
         logger.info("Reset reward system for new episode")
         

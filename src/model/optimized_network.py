@@ -291,16 +291,43 @@ class OptimizedNetwork(nn.Module):
     def _build_shared_layers(self, input_size, output_size):
         """
         Build the shared layers of the network.
+        
+        Args:
+            input_size: Input dimension
+            output_size: Output dimension
+            
+        Returns:
+            nn.Sequential: Shared layers
         """
         logger.critical(f"Building shared layers with input_size={input_size}, output_size={output_size}")
-        return nn.Sequential(
-            nn.Linear(input_size, self.hidden_size),
-            nn.BatchNorm1d(self.hidden_size, track_running_stats=False),  # Add batch norm with track_running_stats=False
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, output_size),
-            nn.BatchNorm1d(output_size, track_running_stats=False),  # Add batch norm with track_running_stats=False
-            nn.ReLU()
-        )
+        
+        # Validate input size
+        if input_size <= 0:
+            logger.warning(f"Invalid input_size {input_size}, using fallback size 3136")
+            input_size = 3136
+            
+        # Ensure output size is reasonable
+        if output_size <= 0:
+            logger.warning(f"Invalid output_size {output_size}, using fallback size 512")
+            output_size = 512
+            
+        # Build layers with safety checks
+        try:
+            return nn.Sequential(
+                nn.Linear(input_size, self.hidden_size),
+                nn.BatchNorm1d(self.hidden_size, track_running_stats=False),
+                nn.ReLU(),
+                nn.Linear(self.hidden_size, output_size),
+                nn.BatchNorm1d(output_size, track_running_stats=False),
+                nn.ReLU()
+            )
+        except Exception as e:
+            logger.error(f"Error building shared layers: {e}, using simplified architecture")
+            # Simplified fallback with fewer layers and safer dimensions
+            return nn.Sequential(
+                nn.Linear(input_size, output_size),
+                nn.ReLU()
+            )
     
     def _init_weights(self, module):
         """
@@ -746,21 +773,37 @@ class OptimizedNetwork(nn.Module):
 
     def _calculate_conv_output_size(self):
         """Calculate the expected flattened output size of the convolutional layers."""
-        # Use the conv_channels defined in __init__
-        # Assuming stride=2 and padding=1 for each conv layer as per _build_conv_layers
-        
-        # Start with minimum input size that won't cause errors
-        h, w = 8, 8
-        
-        # Default conv channels from initialization
-        channels = getattr(self, 'conv_channels', (32, 64, 64))
-        
-        # Calculate output size after each conv layer
-        for c in channels:
-            # Formula: output_size = (input_size - kernel_size + 2*padding) / stride + 1
-            # With kernel_size=3, padding=1, stride=2
-            h = (h - 3 + 2*1) // 2 + 1
-            w = (w - 3 + 2*1) // 2 + 1
-        
-        # Final output size
-        return channels[-1] * h * w 
+        try:
+            # Use the conv_channels from instance
+            channels = getattr(self, 'conv_channels', (32, 64, 64))
+            
+            # Start with frame_size from initialization
+            h, w = self.frame_size
+            
+            # Apply convolution formulas with actual parameters from our architecture
+            # 1st layer: kernel=8, stride=4, padding=0
+            h = (h - 8) // 4 + 1
+            w = (w - 8) // 4 + 1
+            
+            # 2nd layer: kernel=4, stride=2, padding=0
+            h = (h - 4) // 2 + 1
+            w = (w - 4) // 2 + 1
+            
+            # 3rd layer: kernel=3, stride=1, padding=0
+            h = (h - 3) // 1 + 1
+            w = (w - 3) // 1 + 1
+            
+            # Calculate final size
+            output_size = channels[-1] * h * w
+            
+            logger.debug(f"Calculated conv output size: {output_size} (h={h}, w={w}, c={channels[-1]})")
+            
+            return output_size
+            
+        except Exception as e:
+            logger.error(f"Error calculating conv output size: {e}")
+            # Return a fallback value that matches our network architecture for 84x84 input
+            # For 84x84 input with our architecture, should be close to 3136 (= 64 * 7 * 7)
+            fallback_size = 3136
+            logger.warning(f"Using fallback conv output size: {fallback_size}")
+            return fallback_size 
