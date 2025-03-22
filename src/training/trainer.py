@@ -939,34 +939,26 @@ class Trainer:
         return eval_summary
     
     def _prepare_batches(self, states, actions, log_probs, returns, advantages, values=None):
-        """Prepare batches for training with proper sequence handling for LSTM.
+        """Prepare minibatches for policy update.
         
         Args:
-            states: States from experience buffer
-            actions: Actions from experience buffer
-            log_probs: Log probabilities from experience buffer
-            returns: Returns from experience buffer
-            advantages: Advantages from experience buffer
-            values: Values from experience buffer (optional)
+            states: State batch
+            actions: Action batch
+            log_probs: Log probability batch
+            returns: Returns batch
+            advantages: Advantages batch
+            values: Old value predictions batch
             
         Returns:
-            List of batches for training
+            List of batches
         """
-        # Get sequence length from config if using LSTM
-        use_lstm = False  # Default value
-        sequence_length = 1  # Default value
-        batch_size = 64  # Default value
+        # Get agent properties
+        use_lstm = False
+        sequence_length = 0
+        batch_size = 64  # Default batch size
         
-        # Try to get values from config based on its type
-        if hasattr(self.config, "get"):
-            # Config is a dict-like object
-            use_lstm = self.config.get("model", {}).get("use_lstm", False)
-            sequence_length = self.config.get("training", {}).get("sequence_length", 16) if use_lstm else 1
-            batch_size = self.config.get("training", {}).get("batch_size", 64)
-        else:
-            # Config is likely a HardwareConfig object
-            # Try to access attributes directly
-            if hasattr(self.agent, "use_lstm"):
+        if hasattr(self, 'agent'):
+            if hasattr(self.agent, 'use_lstm'):
                 use_lstm = self.agent.use_lstm
             if hasattr(self, "sequence_length"):
                 sequence_length = self.sequence_length
@@ -975,19 +967,75 @@ class Trainer:
             if hasattr(self, "batch_size"):
                 batch_size = self.batch_size
         
-        # Convert to tensors if they aren't already
+        # Convert to tensors if they aren't already (safely)
         if not isinstance(states, torch.Tensor):
-            states = torch.tensor(states, device=self.device)
+            try:
+                # If it's a list of tensors, stack them
+                if isinstance(states[0], torch.Tensor):
+                    states = torch.stack(states)
+                else:
+                    states = torch.tensor(states, device=self.device)
+            except (ValueError, TypeError):
+                # Handle potential errors when converting complex structures
+                logger.critical(f"Error converting states to tensor, shape: {np.shape(states)}")
+                # Convert states to a flat batch if needed
+                if hasattr(states, '__len__') and hasattr(states[0], 'shape'):
+                    states = torch.cat([s.reshape(1, -1) for s in states], dim=0).to(self.device)
+        
         if not isinstance(actions, torch.Tensor):
-            actions = torch.tensor(actions, device=self.device)
+            try:
+                # If it's a list of tensors, stack them
+                if isinstance(actions[0], torch.Tensor):
+                    actions = torch.stack(actions)
+                else:
+                    actions = torch.tensor(actions, device=self.device)
+            except (ValueError, TypeError):
+                logger.critical(f"Error converting actions to tensor, shape: {np.shape(actions)}")
+                actions = torch.tensor([a.item() if hasattr(a, 'item') else a for a in actions], device=self.device)
+        
         if not isinstance(log_probs, torch.Tensor):
-            log_probs = torch.tensor(log_probs, device=self.device)
+            try:
+                # If it's a list of tensors, stack them
+                if isinstance(log_probs[0], torch.Tensor):
+                    log_probs = torch.stack(log_probs)
+                else:
+                    log_probs = torch.tensor(log_probs, device=self.device)
+            except (ValueError, TypeError):
+                logger.critical(f"Error converting log_probs to tensor, shape: {np.shape(log_probs)}")
+                log_probs = torch.tensor([lp.item() if hasattr(lp, 'item') else float(lp) for lp in log_probs], device=self.device)
+        
         if not isinstance(returns, torch.Tensor):
-            returns = torch.tensor(returns, device=self.device)
+            try:
+                # If it's a list of tensors, stack them
+                if isinstance(returns[0], torch.Tensor):
+                    returns = torch.stack(returns)
+                else:
+                    returns = torch.tensor(returns, device=self.device)
+            except (ValueError, TypeError):
+                logger.critical(f"Error converting returns to tensor, shape: {np.shape(returns)}")
+                returns = torch.tensor([r.item() if hasattr(r, 'item') else float(r) for r in returns], device=self.device)
+        
         if not isinstance(advantages, torch.Tensor):
-            advantages = torch.tensor(advantages, device=self.device)
+            try:
+                # If it's a list of tensors, stack them
+                if isinstance(advantages[0], torch.Tensor):
+                    advantages = torch.stack(advantages)
+                else:
+                    advantages = torch.tensor(advantages, device=self.device)
+            except (ValueError, TypeError):
+                logger.critical(f"Error converting advantages to tensor, shape: {np.shape(advantages)}")
+                advantages = torch.tensor([a.item() if hasattr(a, 'item') else float(a) for a in advantages], device=self.device)
+        
         if values is not None and not isinstance(values, torch.Tensor):
-            values = torch.tensor(values, device=self.device)
+            try:
+                # If it's a list of tensors, stack them
+                if isinstance(values[0], torch.Tensor):
+                    values = torch.stack(values)
+                else:
+                    values = torch.tensor(values, device=self.device)
+            except (ValueError, TypeError):
+                logger.critical(f"Error converting values to tensor, shape: {np.shape(values)}")
+                values = torch.tensor([v.item() if hasattr(v, 'item') else float(v) for v in values], device=self.device)
             
         # Create batches based on whether we're using LSTM or not
         if use_lstm:

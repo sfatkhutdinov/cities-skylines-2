@@ -284,6 +284,7 @@ class MANNController(nn.Module):
         ).to(self.device)
         
         # Memory projection when no memories are retrieved
+        # Ensure the input dimension matches the embedding_size
         self.fallback_projection = nn.Sequential(
             nn.Linear(embedding_size, 512),
             nn.ReLU(),

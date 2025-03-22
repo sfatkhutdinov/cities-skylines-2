@@ -282,14 +282,18 @@ class Environment:
             logger.warning(f"Exceeded max consecutive errors ({self.max_consecutive_errors}). Resetting environment.")
             self.reset()
             observation = self.get_observation()
-            return observation, -1.0, True, {"action_success": False, "reset": True}
+            self.frame_buffer.append(observation)
+            stacked_observation = self._get_stacked_observation()
+            return stacked_observation, -1.0, True, {"action_success": False, "reset": True}
         
         # Ensure the game is running and the window is focused
         if not self._ensure_game_running():
             # Failed to ensure the game is running
             self.consecutive_errors += 1
             observation = self.get_observation()
-            return observation, -1.0, False, {"action_success": False, "game_running": False}
+            self.frame_buffer.append(observation)
+            stacked_observation = self._get_stacked_observation()
+            return stacked_observation, -1.0, False, {"action_success": False, "game_running": False}
         
         # Ensure window is focused
         self._ensure_window_focused()
@@ -350,6 +354,10 @@ class Environment:
         # Get observation after action
         observation = self.get_observation()
         
+        # Update frame buffer with new observation and create stacked observation
+        self.frame_buffer.append(observation)
+        stacked_observation = self._get_stacked_observation()
+        
         # Compute reward
         reward = self._compute_reward(action_info, action_idx, success, in_menu_after_action)
         
@@ -376,7 +384,7 @@ class Environment:
         if action_results:
             info["action_results"] = action_results
             
-        return observation, reward, done, info
+        return stacked_observation, reward, done, info
     
     def get_observation(self) -> torch.Tensor:
         """Get the current observation from the environment.
@@ -815,22 +823,23 @@ class Environment:
         # Check if using image or vector observations
         sample_obs = self.frame_buffer[0]
         
-        # Convert all tensors to CPU if they're on GPU
-        cpu_frames = []
-        for frame in self.frame_buffer:
-            if isinstance(frame, torch.Tensor) and frame.is_cuda:
-                cpu_frames.append(frame.cpu())
-            else:
-                cpu_frames.append(frame)
-        
         # Handle image observations (stacked frames)
-        if len(sample_obs.shape) == 3:  # Images: (C, H, W) or (H, W, C)
-            if sample_obs.shape[0] == 3:  # If channels-first format
-                return np.concatenate([f for f in cpu_frames], axis=0)
-            else:  # If channels-last format
-                stacked = np.concatenate([f for f in cpu_frames], axis=-1)
-                # Convert to channels-first for PyTorch
-                return np.transpose(stacked, (2, 0, 1))
+        if isinstance(sample_obs, torch.Tensor):
+            if len(sample_obs.shape) == 3:  # Images: (C, H, W)
+                # Stack frames along channel dimension (dim 0) using torch.cat
+                return torch.cat([f for f in self.frame_buffer], dim=0)
+            else:
+                # Vector observation - concatenate
+                return torch.cat([f.flatten() for f in self.frame_buffer])
         else:
-            # Vector observation - concatenate
-            return np.concatenate([f.flatten() for f in cpu_frames]) 
+            # Handle numpy arrays
+            if len(sample_obs.shape) == 3:  # Images: (C, H, W) or (H, W, C)
+                if sample_obs.shape[0] == 3:  # If channels-first format
+                    return np.concatenate([f for f in self.frame_buffer], axis=0)
+                else:  # If channels-last format
+                    stacked = np.concatenate([f for f in self.frame_buffer], axis=-1)
+                    # Convert to channels-first for PyTorch
+                    return np.transpose(stacked, (2, 0, 1))
+            else:
+                # Vector observation - concatenate
+                return np.concatenate([f.flatten() for f in self.frame_buffer]) 

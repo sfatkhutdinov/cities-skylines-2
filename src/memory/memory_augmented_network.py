@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import logging
+import traceback
 from typing import Dict, List, Tuple, Optional, Any, Union
 
 from src.model.optimized_network import OptimizedNetwork
@@ -115,7 +116,7 @@ class MemoryAugmentedNetwork(nn.Module):
     def forward(self, x: torch.Tensor, 
                hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
                use_memory: bool = True) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward pass through the network.
+        """Forward pass through the MANN.
         
         Args:
             x: Input state tensor
@@ -142,20 +143,43 @@ class MemoryAugmentedNetwork(nn.Module):
                 logger.debug(f"Memory state embedding shape before controller: {state_embedding.shape}")
                 
                 # Handle batch dimension mismatch - ensure embedding_size is correct
-                # The error shows dimension mismatch: 32x256 vs 384x512
-                # We need to ensure the embedding size is consistent with controller's expectation
                 batch_size = state_embedding.shape[0]
+                
+                # Ensure the embedding size matches what the controller expects
+                expected_embedding_size = self.embedding_size
+                actual_embedding_size = state_embedding.shape[1]
+                
+                # Resize embedding if dimensions don't match
+                if actual_embedding_size != expected_embedding_size:
+                    logger.warning(f"Embedding size mismatch: expected {expected_embedding_size}, got {actual_embedding_size}. Adapting...")
+                    # Use linear projection to adjust size if needed
+                    if not hasattr(self, 'embedding_adapter'):
+                        self.embedding_adapter = nn.Linear(actual_embedding_size, expected_embedding_size).to(self.device)
+                    state_embedding = self.embedding_adapter(state_embedding)
+                
                 if batch_size > 1:
                     # Process each embedding in batch separately to avoid dimension issues
                     memory_outputs = []
                     for i in range(batch_size):
                         single_embedding = state_embedding[i:i+1]  # Keep batch dimension (1, embedding_size)
-                        memory_output = self.memory_controller(single_embedding)
-                        memory_outputs.append(memory_output)
+                        try:
+                            memory_output = self.memory_controller(single_embedding)
+                            memory_outputs.append(memory_output)
+                        except Exception as e:
+                            logger.error(f"Error in memory augmentation: {str(e)}")
+                            logger.error(f"Traceback: {traceback.format_exc()}")
+                            # Use fallback: just use the original embedding
+                            memory_outputs.append(single_embedding)
                     memory_output = torch.cat(memory_outputs, dim=0)
                 else:
                     # Only one embedding, can process directly
-                    memory_output = self.memory_controller(state_embedding)
+                    try:
+                        memory_output = self.memory_controller(state_embedding)
+                    except Exception as e:
+                        logger.error(f"Error in memory augmentation: {str(e)}")
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        # Use fallback: just use the original embedding
+                        memory_output = state_embedding
                 
                 # Log the memory output shape
                 logger.debug(f"Memory output shape after controller: {memory_output.shape}")
@@ -181,7 +205,6 @@ class MemoryAugmentedNetwork(nn.Module):
                 
             except Exception as e:
                 logger.error(f"Error in memory augmentation: {e}")
-                import traceback
                 logger.error(traceback.format_exc())
                 # In case of error, just use the base network's outputs
         
@@ -278,7 +301,6 @@ class MemoryAugmentedNetwork(nn.Module):
             return state_embedding
         except Exception as e:
             logger.error(f"Error in extract_state_embedding: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             
             # Return a zero tensor as fallback

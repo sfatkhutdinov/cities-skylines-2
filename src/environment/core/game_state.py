@@ -17,17 +17,23 @@ logger = logging.getLogger(__name__)
 class GameState:
     """Tracks and manages the state of the Cities: Skylines 2 game."""
     
-    def __init__(self, history_length: int = 10):
+    def __init__(self, history_length: int = 10, enabled: bool = True, mock_mode: bool = False):
         """Initialize game state tracking.
         
         Args:
             history_length: Length of history to maintain for observations and rewards
+            enabled: Whether game state tracking is enabled
+            mock_mode: Whether the environment is in mock mode
         """
         # Game state flags
         self.in_menu = False
         self.paused = False
         self.game_speed = 1  # 1=normal, 2=fast, 3=fastest
         self.game_crashed = False
+        
+        # Feature flags
+        self.enabled = enabled
+        self.mock_mode = mock_mode
         
         # History tracking
         self.history_length = history_length
