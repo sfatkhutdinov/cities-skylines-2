@@ -309,6 +309,33 @@ class MANNController(nn.Module):
         # Ensure input is on correct device
         state_embedding = state_embedding.to(self.device)
         
+        # Get input shape for debugging
+        original_shape = state_embedding.shape
+        logger.debug(f"MANNController input shape: {original_shape}")
+        
+        # Reshape if needed to match expected dimensions
+        # For batched input, we need to process each embedding separately
+        if len(original_shape) > 1 and original_shape[0] > 1:
+            batch_size = original_shape[0]
+            # Process each embedding in the batch separately and then stack results
+            outputs = []
+            for i in range(batch_size):
+                single_embedding = state_embedding[i].unsqueeze(0)  # Add batch dim back
+                outputs.append(self._process_single_embedding(single_embedding))
+            return torch.stack(outputs)
+        else:
+            # Handle single embedding case
+            return self._process_single_embedding(state_embedding)
+    
+    def _process_single_embedding(self, state_embedding: torch.Tensor) -> torch.Tensor:
+        """Process a single state embedding through memory system.
+        
+        Args:
+            state_embedding: Single state embedding (with batch dim)
+            
+        Returns:
+            torch.Tensor: Processed output
+        """
         # Retrieve relevant memories
         memories, scores = self.memory.read(state_embedding, top_k=5)
         
@@ -317,7 +344,7 @@ class MANNController(nn.Module):
             self.memory_usage_count += 1
             
             # Prepare for attention calculation
-            repeated_state = state_embedding.unsqueeze(0).repeat(len(memories), 1)
+            repeated_state = state_embedding.repeat(len(memories), 1)
             mem_tensor = torch.stack(memories)
             
             # Concatenate state with each memory
@@ -334,10 +361,10 @@ class MANNController(nn.Module):
             combined_memory = torch.sum(weighted_memories, dim=0)
             
             # Combine with current state
-            combined = torch.cat([state_embedding, combined_memory], dim=0)
+            combined = torch.cat([state_embedding.squeeze(0), combined_memory], dim=0)
             
             # Final integration
-            output = self.integration(combined)
+            output = self.integration(combined.unsqueeze(0))
             
         else:
             # No memories retrieved, use fallback

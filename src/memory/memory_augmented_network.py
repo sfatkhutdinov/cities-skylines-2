@@ -138,8 +138,27 @@ class MemoryAugmentedNetwork(nn.Module):
                 if len(state_embedding.shape) == 1:
                     state_embedding = state_embedding.unsqueeze(0)  # Add batch dimension if needed
                 
-                # Get memory-augmented features
-                memory_output = self.memory_controller(state_embedding)
+                # Log the embedding shape for debugging
+                logger.debug(f"Memory state embedding shape before controller: {state_embedding.shape}")
+                
+                # Handle batch dimension mismatch - ensure embedding_size is correct
+                # The error shows dimension mismatch: 32x256 vs 384x512
+                # We need to ensure the embedding size is consistent with controller's expectation
+                batch_size = state_embedding.shape[0]
+                if batch_size > 1:
+                    # Process each embedding in batch separately to avoid dimension issues
+                    memory_outputs = []
+                    for i in range(batch_size):
+                        single_embedding = state_embedding[i:i+1]  # Keep batch dimension (1, embedding_size)
+                        memory_output = self.memory_controller(single_embedding)
+                        memory_outputs.append(memory_output)
+                    memory_output = torch.cat(memory_outputs, dim=0)
+                else:
+                    # Only one embedding, can process directly
+                    memory_output = self.memory_controller(state_embedding)
+                
+                # Log the memory output shape
+                logger.debug(f"Memory output shape after controller: {memory_output.shape}")
                 
                 # Ensure consistent dimensions for concatenation
                 if len(memory_output.shape) != len(state_embedding.shape):
