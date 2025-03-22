@@ -70,98 +70,60 @@ class ObservationManager:
         # Reset capture timing
         self.last_capture_time = time.time()
         
-    def get_observation(self) -> torch.Tensor:
-        """Get current observation as processed frame.
+    def get_observation(self):
+        """Get the current observation (frame and metadata).
         
         Returns:
-            torch.Tensor: Processed observation
+            dict: Observation dictionary with frame and metadata
         """
-        # Rate limit capturing
-        current_time = time.time()
-        elapsed = current_time - self.last_capture_time
-        if elapsed < self.min_capture_interval:
-            logger.critical(f"Rate limiting: elapsed={elapsed:.4f}s, sleeping for {self.min_capture_interval - elapsed:.4f}s")
-            time.sleep(self.min_capture_interval - elapsed)
-        
-        # Capture raw frame
-        logger.critical("===== OBSERVATION CAPTURE ATTEMPT =====")
-        try:
-            logger.critical("Calling screen_capture.capture_frame()")
-            capture_start = time.time()
-            raw_frame = self.screen_capture.capture_frame()
-            capture_duration = time.time() - capture_start
-            logger.critical(f"Screen capture completed in {capture_duration:.4f}s")
+        frame = self.capture_frame()
+        if frame is None:
+            return None
             
-            if raw_frame is None:
-                logger.critical("Failed to capture frame: raw_frame is None")
-                # If in mock mode, generate a random frame for testing
-                if self.mock_mode:
-                    logger.critical("In mock mode, generating random frame")
-                    raw_frame = np.random.randint(0, 255, (84, 84, 3), dtype=np.uint8)
-                else:
-                    # Try again with a short delay
-                    logger.critical("Waiting 0.5s and trying capture again")
-                    time.sleep(0.5)
-                    raw_frame = self.screen_capture.capture_frame()
-                    if raw_frame is None:
-                        logger.critical("Second capture attempt also failed")
-                        raise ValueError("Failed to capture frame after retry")
-            else:
-                # Log basic frame info
-                logger.critical(f"Raw frame captured: shape={raw_frame.shape}, type={type(raw_frame)}")
-                logger.critical(f"Frame values - min: {np.min(raw_frame)}, max: {np.max(raw_frame)}, mean: {np.mean(raw_frame):.2f}")
-                
-                # Check for all-black or all-white frames which might indicate issues
-                if np.mean(raw_frame) < 10:
-                    logger.critical("WARNING: Frame appears to be mostly black!")
-                elif np.mean(raw_frame) > 245:
-                    logger.critical("WARNING: Frame appears to be mostly white!")
-                    
-        except Exception as e:
-            import traceback
-            error_trace = traceback.format_exc()
-            logger.critical(f"Error capturing frame: {e}")
-            logger.critical(f"Error traceback: {error_trace}")
+        # Extract metadata from the frame if needed
+        metadata = self._extract_metadata(frame)
+        
+        # Get logo embedding if menu detector is available
+        logo_embedding = None
+        if hasattr(self, 'menu_detector') and self.menu_detector is not None:
+            if hasattr(self.menu_detector, 'get_logo_embedding'):
+                logo_embedding = self.menu_detector.get_logo_embedding(frame)
+        
+        observation = {
+            "frame": frame,
+            "metadata": metadata,
+            "timestamp": time.time()
+        }
+        
+        # Add logo embedding if available
+        if logo_embedding is not None:
+            observation["logo_embedding"] = logo_embedding
+        
+        return observation
+        
+    def _extract_metadata(self, frame):
+        """Extract metadata from the frame.
+        
+        Args:
+            frame: The current frame
             
-            # Try to diagnose screen capture issues
-            logger.critical("Diagnosing screen capture issues:")
-            try:
-                if hasattr(self.screen_capture, 'check_window_handle'):
-                    handle_ok = self.screen_capture.check_window_handle()
-                    logger.critical(f"Window handle check: {'OK' if handle_ok else 'FAILED'}")
-            except Exception as diag_error:
-                logger.critical(f"Diagnostics error: {diag_error}")
-                
-            raise  # Re-raise to be handled by the Environment class
+        Returns:
+            dict: Metadata extracted from the frame
+        """
+        metadata = {
+            "frame_shape": frame.shape,
+            "frame_mean": frame.mean(),
+            "frame_std": frame.std()
+        }
         
-        # Process frame
-        logger.critical("Processing captured frame")
-        try:
-            processed_frame = self._process_frame(raw_frame)
-            logger.critical(f"Frame processed: shape={processed_frame.shape}, device={processed_frame.device}, dtype={processed_frame.dtype}")
-            
-            # Check for NaN or Inf values
-            if torch.isnan(processed_frame).any():
-                logger.critical("WARNING: Processed frame contains NaN values!")
-            if torch.isinf(processed_frame).any():
-                logger.critical("WARNING: Processed frame contains Inf values!")
-                
-        except Exception as e:
-            import traceback
-            error_trace = traceback.format_exc()
-            logger.critical(f"Error processing frame: {e}")
-            logger.critical(f"Error traceback: {error_trace}")
-            raise  # Re-raise to be handled by the Environment class
+        # Add menu detection info if available
+        if hasattr(self, 'menu_detector') and self.menu_detector is not None:
+            in_menu, menu_type, confidence = self.menu_detector.detect_menu(frame)
+            metadata["in_menu"] = in_menu
+            metadata["menu_type"] = menu_type
+            metadata["menu_confidence"] = confidence
         
-        # Update history
-        self.frame_history.append(processed_frame)
-        logger.critical(f"Frame added to history, current history size: {len(self.frame_history)}")
-        
-        # Update timing
-        self.last_capture_time = time.time()
-        logger.critical("===== OBSERVATION CAPTURE COMPLETE =====")
-        
-        return processed_frame
+        return metadata
     
     def get_frame_stack(self, stack_size: int = 4) -> torch.Tensor:
         """Get a stack of frames for temporal processing.

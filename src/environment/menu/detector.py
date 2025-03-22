@@ -39,6 +39,9 @@ class MenuDetector:
         (0.9, 0.1, 1.0, 0.3),     # Side tool panel
     ]
     
+    # CS2 Logo region (normalized coordinates based on 1920x1080 resolution)
+    CS2_LOGO_REGION = (0.435, 0.059, 0.568, 0.407)  # Corresponds to (835,64) to (1090, 440)
+    
     def __init__(
         self,
         observation_manager: ObservationManager,
@@ -75,8 +78,47 @@ class MenuDetector:
         self.detection_stability_count = 0
         self.min_stability_count = 2  # Minimum number of consistent detections needed
         
+        # Load CS2 logo template for reliable menu detection
+        self.cs2_logo_template = self._load_cs2_logo_template()
+        self.cs2_logo_detection_threshold = 0.6
+        self.use_logo_detection = True  # Flag to enable/disable logo detection
+        
         logger.info("Menu detector initialized")
     
+    def _load_cs2_logo_template(self) -> Optional[np.ndarray]:
+        """Load the CS2 logo template for menu detection.
+        
+        Returns:
+            Optional[np.ndarray]: The logo template or None if not found
+        """
+        try:
+            # Try several possible paths for the logo template
+            possible_paths = [
+                "menu_templates/cs2_logo.png",                                    # From project root
+                os.path.join(os.getcwd(), "menu_templates/cs2_logo.png"),         # From current working directory
+                os.path.abspath("menu_templates/cs2_logo.png"),                   # Absolute path from relative
+                "C:/Users/stani/Desktop/cities skylines 2/menu_templates/cs2_logo.png",  # Direct absolute path
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../menu_templates/cs2_logo.png"),  # From script location
+            ]
+            
+            for path in possible_paths:
+                logger.debug(f"Trying to load CS2 logo from: {path}")
+                if os.path.exists(path):
+                    logger.info(f"Loading CS2 logo template from: {path}")
+                    logo = cv2.imread(path)
+                    
+                    if logo is not None:
+                        logger.info(f"Successfully loaded CS2 logo template, shape: {logo.shape}")
+                        return logo
+            
+            logger.warning("CS2 logo template not found in any of the possible locations")
+            logger.warning(f"Current working directory: {os.getcwd()}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error loading CS2 logo template: {e}")
+            return None
+
     def _load_menu_templates(self) -> Dict:
         """Load menu template images for detection.
         
@@ -119,89 +161,182 @@ class MenuDetector:
                 
         return signatures
     
-    def detect_menu(self, current_frame: np.ndarray) -> Tuple[bool, Optional[str], float]:
-        """Detect if the current frame shows a menu and which type.
+    def detect_cs2_logo(self, frame=None):
+        """Detect the CS2 logo in the current frame.
         
         Args:
-            current_frame: Current frame to analyze
+            frame: Optional frame to detect in, otherwise captures current frame
             
         Returns:
-            Tuple of (menu_detected, menu_type, confidence)
+            Tuple of (is_detected, confidence, location)
         """
-        # Skip detection if we recently exited a menu (prevents flapping)
-        if time.time() - self.last_menu_exit_time < self.menu_exit_cooldown:
-            return False, None, 0.0
+        # Use provided frame or capture new one
+        if frame is None:
+            frame = self.observation_manager.capture_frame()
+            if frame is None:
+                return False, 0.0, None
         
-        # Use visual metrics if available
-        if self.performance_monitor is not None and hasattr(self.performance_monitor, 'detect_menu'):
-            try:
-                menu_detected, menu_type, confidence = self.performance_monitor.detect_menu(current_frame)
-                
-                # Apply dynamic threshold adjustment based on history
-                adjusted_confidence = confidence - self.detection_threshold_adjustment
-                threshold = 0.75  # Base threshold
-                
-                if adjusted_confidence > threshold:
-                    self.consecutive_menu_detections += 1
-                    # Increase threshold slightly to prevent false positives
-                    if self.consecutive_menu_detections > 3:
-                        self.detection_threshold_adjustment = min(0.1, self.detection_threshold_adjustment + 0.02)
-                else:
-                    self.consecutive_menu_detections = 0
-                    # Decrease threshold adjustment over time to recover sensitivity
-                    self.detection_threshold_adjustment = max(0, self.detection_threshold_adjustment - 0.01)
-                
-                # Return adjusted result
-                if adjusted_confidence > threshold:
-                    return True, menu_type, adjusted_confidence
-                else:
-                    return False, None, adjusted_confidence
-                    
-            except Exception as e:
-                logger.error(f"Error in visual metrics menu detection: {e}")
-                # Fall through to the fallback implementation
+        if self.cs2_logo_template is None:
+            self.load_cs2_logo_template()
+            if self.cs2_logo_template is None:
+                return False, 0.0, None
         
-        # Fallback implementation: template matching and visual analysis
+        # Extract region of interest
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = self.CS2_LOGO_REGION
+        x1_px, y1_px = int(x1 * w), int(y1 * h)
+        x2_px, y2_px = int(x2 * w), int(y2 * h)
+        
+        if x1_px >= x2_px or y1_px >= y2_px or x2_px > w or y2_px > h:
+            return False, 0.0, None
+            
+        roi = frame[y1_px:y2_px, x1_px:x2_px]
+        if roi.size == 0:
+            return False, 0.0, None
+        
+        # Resize ROI to match template dimensions if needed
+        template_h, template_w = self.cs2_logo_template.shape[:2]
+        if roi.shape[0] != template_h or roi.shape[1] != template_w:
+            roi = cv2.resize(roi, (template_w, template_h))
+        
+        # Perform template matching
         try:
-            # Try template matching if we have templates
-            if self.menu_templates:
-                for menu_type, template in self.menu_templates.items():
-                    # Simple template matching
-                    result = cv2.matchTemplate(current_frame, template, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, _ = cv2.minMaxLoc(result)
-                    
-                    threshold = self.MENU_TYPES[menu_type]["threshold"]
-                    if max_val > threshold:
-                        return True, menu_type, max_val
-            
-            # Visual analysis approach
-            # Extract regions that are characteristic of menus
-            signatures = self._extract_menu_signatures(current_frame)
-            
-            # Check each menu type
-            for menu_type, regions in signatures.items():
-                # Analyze the signature regions
-                # This is a simplified placeholder for more complex analysis
-                # In a real implementation, this would analyze colors, patterns, etc.
-                
-                # Example: Check for uniform bright regions which might indicate a menu
-                confidence = 0
-                for region in regions:
-                    if region.mean() > 160:  # Bright region
-                        confidence += 0.5
-                    if np.std(region) < 30:  # Uniform region
-                        confidence += 0.3
-                
-                threshold = self.MENU_TYPES[menu_type]["threshold"]
-                if confidence > threshold:
-                    return True, menu_type, confidence
-            
-            # No menu detected
-            return False, None, 0.0
-            
+            result = cv2.matchTemplate(roi, self.cs2_logo_template, cv2.TM_CCOEFF_NORMED)
+            _, confidence, _, location = cv2.minMaxLoc(result)
         except Exception as e:
-            logger.error(f"Error in fallback menu detection: {e}")
-            return False, None, 0.0
+            logger.error(f"Error during logo template matching: {e}")
+            return False, 0.0, None
+        
+        is_detected = confidence >= self.cs2_logo_detection_threshold
+        return is_detected, confidence, location
+
+    def get_logo_embedding(self, frame=None, embedding_size=32):
+        """Generate a compact embedding of the CS2 logo region for RL agent.
+        
+        This method extracts the logo region, downsamples it to a small size,
+        and converts it to a flattened numeric vector for efficient processing.
+        
+        Args:
+            frame: Optional frame to use, otherwise captures current frame
+            embedding_size: Size of the square embedding (default: 32x32)
+            
+        Returns:
+            dict: Embedding dictionary with vector, detection flag, and confidence
+        """
+        # Use provided frame or capture new one
+        if frame is None:
+            frame = self.observation_manager.capture_frame()
+            if frame is None:
+                return {"detected": False, "confidence": 0.0, "vector": np.zeros(embedding_size * embedding_size)}
+        
+        # First run standard logo detection
+        is_detected, confidence, _ = self.detect_cs2_logo(frame)
+        
+        # Extract region of interest
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = self.CS2_LOGO_REGION
+        x1_px, y1_px = int(x1 * w), int(y1 * h)
+        x2_px, y2_px = int(x2 * w), int(y2 * h)
+        
+        # Handle edge cases to prevent crashes
+        if x1_px >= x2_px or y1_px >= y2_px or x2_px > w or y2_px > h:
+            return {"detected": False, "confidence": 0.0, "vector": np.zeros(embedding_size * embedding_size)}
+            
+        roi = frame[y1_px:y2_px, x1_px:x2_px]
+        if roi.size == 0:
+            return {"detected": False, "confidence": 0.0, "vector": np.zeros(embedding_size * embedding_size)}
+        
+        # Convert to grayscale to reduce dimensions
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape) == 3 else roi
+        
+        # Resize to small fixed size for efficiency
+        small_roi = cv2.resize(gray_roi, (embedding_size, embedding_size))
+        
+        # Normalize pixel values to 0-1 range
+        normalized_roi = small_roi.astype(np.float32) / 255.0
+        
+        # Flatten to 1D array
+        flat_vector = normalized_roi.flatten()
+        
+        # Return embedding dictionary with detection info
+        return {
+            "detected": is_detected,
+            "confidence": float(confidence),
+            "vector": flat_vector
+        }
+    
+    def detect_menu(self, frame=None):
+        """Detect if the current frame shows a menu.
+        
+        Args:
+            frame: Optional frame to detect in, otherwise captures current frame
+            
+        Returns:
+            Tuple of (is_in_menu, menu_type, confidence)
+        """
+        # Use provided frame or capture new one
+        if frame is None:
+            frame = self.observation_manager.capture_frame()
+            if frame is None:
+                return False, None, 0.0
+        
+        # First check for CS2 logo as a reliable indicator
+        logo_detected, logo_confidence, _ = self.detect_cs2_logo(frame)
+        if logo_detected:
+            # Store the logo location for use in navigation
+            self.last_menu_type = "logo_menu"
+            self.last_detection_time = time.time()
+            self.last_menu_confidence = logo_confidence
+            return True, "logo_menu", logo_confidence
+        
+        # Fallback to regular menu detection methods
+        # Get screen layout hash
+        layout_hash = self._compute_layout_hash(frame)
+        
+        # Check for match with known menu templates
+        best_match = None
+        best_confidence = 0.0
+        
+        # Find best template match
+        for template_name, template in self.templates.items():
+            # Get template image
+            template_img = template.get("image")
+            if template_img is None:
+                continue
+                
+            # Do template matching
+            match, confidence = self._match_template(frame, template_img)
+            
+            logger.debug(f"Template {template_name}: matched={match}, confidence={confidence:.4f}")
+            
+            if match and confidence > best_confidence:
+                best_match = template_name
+                best_confidence = confidence
+        
+        # Store list of menu scores for debugging
+        self.last_menu_scores = [(name, self._match_template(frame, template.get("image"))[1]) 
+                                 for name, template in self.templates.items() 
+                                 if template.get("image") is not None]
+        self.last_menu_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        # Check if confidence exceeds threshold
+        if best_match and best_confidence >= self.detection_threshold:
+            self.last_menu_type = best_match
+            self.last_detection_time = time.time()
+            self.last_menu_confidence = best_confidence
+            return True, best_match, best_confidence
+        
+        # Check layout hash against known menu hashes
+        if layout_hash in self.menu_hashes:
+            menu_type = self.menu_hashes[layout_hash]
+            logger.debug(f"Layout hash match for menu type: {menu_type}")
+            self.last_menu_type = menu_type
+            self.last_detection_time = time.time()
+            self.last_menu_confidence = 0.8  # Default confidence for hash match
+            return True, menu_type, 0.8
+            
+        # No menu detected
+        return False, None, 0.0
     
     def check_menu_state(self) -> bool:
         """Check if we're currently in a menu state.
