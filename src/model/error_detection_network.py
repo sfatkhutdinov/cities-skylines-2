@@ -120,14 +120,14 @@ class ErrorDetectionNetwork(nn.Module):
         """Detect errors in the agent's understanding or decisions.
         
         Args:
-            state: Current state
+            state: Current state representation
             action: Action taken
-            next_state: Actual next state (if available)
-            predicted_next_state: Predicted next state from world model (if available)
-            uncertainty: Uncertainty in prediction (if available)
+            next_state: Actual next state (optional)
+            predicted_next_state: Predicted next state (optional)
+            uncertainty: Uncertainty in prediction (optional)
             
         Returns:
-            Dict containing error types, severity, and anomaly scores
+            Dictionary with error detection results
         """
         try:
             # Log input shapes for debugging
@@ -139,6 +139,27 @@ class ErrorDetectionNetwork(nn.Module):
                 logger.debug(f"predicted_next_state shape: {predicted_next_state.shape}")
             if uncertainty is not None:
                 logger.debug(f"uncertainty shape: {uncertainty.shape}")
+            
+            # Check for NaN values in all input tensors and replace them
+            if torch.is_tensor(state) and (torch.isnan(state).any() or torch.isinf(state).any()):
+                logger.warning("NaN/Inf values detected in state tensor, replacing with zeros")
+                state = torch.where(torch.isnan(state) | torch.isinf(state), torch.zeros_like(state), state)
+                
+            if torch.is_tensor(action) and (torch.isnan(action).any() or torch.isinf(action).any()):
+                logger.warning("NaN/Inf values detected in action tensor, replacing with zeros")
+                action = torch.where(torch.isnan(action) | torch.isinf(action), torch.zeros_like(action), action)
+                
+            if next_state is not None and torch.is_tensor(next_state) and (torch.isnan(next_state).any() or torch.isinf(next_state).any()):
+                logger.warning("NaN/Inf values detected in next_state tensor, replacing with zeros")
+                next_state = torch.where(torch.isnan(next_state) | torch.isinf(next_state), torch.zeros_like(next_state), next_state)
+                
+            if predicted_next_state is not None and torch.is_tensor(predicted_next_state) and (torch.isnan(predicted_next_state).any() or torch.isinf(predicted_next_state).any()):
+                logger.warning("NaN/Inf values detected in predicted_next_state tensor, replacing with zeros")
+                predicted_next_state = torch.where(torch.isnan(predicted_next_state) | torch.isinf(predicted_next_state), torch.zeros_like(predicted_next_state), predicted_next_state)
+                
+            if uncertainty is not None and torch.is_tensor(uncertainty) and (torch.isnan(uncertainty).any() or torch.isinf(uncertainty).any()):
+                logger.warning("NaN/Inf values detected in uncertainty tensor, replacing with zeros")
+                uncertainty = torch.where(torch.isnan(uncertainty) | torch.isinf(uncertainty), torch.zeros_like(uncertainty), uncertainty)
                 
             # Ensure inputs are on the correct device
             state = state.to(self.device)

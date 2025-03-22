@@ -680,7 +680,13 @@ class Environment:
                 
             # Compute reward using reward system
             if current_frame is not None and next_frame is not None:
-                reward = self.reward_system.compute_reward(current_frame, action_idx, next_frame)
+                reward = self.reward_system.compute_reward(
+                    current_frame=current_frame, 
+                    next_frame=next_frame, 
+                    action=action_idx, 
+                    done=self.steps_taken >= self.max_steps, 
+                    info=action_info
+                )
             else:
                 logger.warning("Missing frames for reward computation, using default reward")
                 reward = 0.0

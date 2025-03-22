@@ -16,6 +16,7 @@ import pickle
 from typing import Dict, List, Tuple, Optional, Any, Union
 from collections import deque
 import threading
+import math
 
 from src.environment.rewards.metrics import DensityEstimator, TemporalAssociationMemory
 from src.environment.rewards.analyzers import VisualChangeAnalyzer, VisualFeatureExtractor
@@ -484,142 +485,141 @@ class AutonomousRewardSystem:
         except Exception as e:
             logger.error(f"Error loading reward system state: {e}")
             
-    def compute_reward(self, 
-                      current_frame: torch.Tensor,
-                      action_idx: int,
-                      next_frame: torch.Tensor) -> float:
-        """Compute reward based on visual changes between frames.
+    def compute_reward(self, current_frame: torch.Tensor, next_frame: torch.Tensor,
+                       action: int, done: bool = False, info: dict = None) -> float:
+        """
+        Compute a reward based on frame transitions.
         
         Args:
-            current_frame: Current frame observation (PyTorch tensor)
-            action_idx: Index of action taken
-            next_frame: Next frame observation (PyTorch tensor)
+            current_frame: Current state frame
+            next_frame: Next state frame
+            action: Action taken
+            done: Whether the episode is done (default: False)
+            info: Additional information (default: None)
             
         Returns:
             float: Computed reward
         """
+        # Validate input frames
+        if current_frame is None or next_frame is None:
+            logger.warning("Missing input frames for reward computation")
+            return 0.0
+            
+        # Handle case where info is None
+        if info is None:
+            info = {}
+            
+        # Check for NaN/Inf values in input frames
+        if torch.is_tensor(current_frame) and (torch.isnan(current_frame).any() or torch.isinf(current_frame).any()):
+            logger.warning("NaN/Inf values detected in current_frame, replacing with zeros")
+            current_frame = torch.zeros_like(current_frame)
+            
+        if torch.is_tensor(next_frame) and (torch.isnan(next_frame).any() or torch.isinf(next_frame).any()):
+            logger.warning("NaN/Inf values detected in next_frame, replacing with zeros")
+            next_frame = torch.zeros_like(next_frame)
+        
+        # For autonomous rewards, multiple components can be used
+        components = {}
+        
         try:
-            # Convert PyTorch tensors to numpy arrays for OpenCV operations
-            if isinstance(current_frame, torch.Tensor):
-                current_frame_np = current_frame.detach().cpu().numpy()
-                # If tensor is in CHW format, convert to HWC for OpenCV
-                if current_frame_np.shape[0] == 3:  # CHW format
-                    current_frame_np = np.transpose(current_frame_np, (1, 2, 0))
-            else:
-                current_frame_np = current_frame
-                
-            if isinstance(next_frame, torch.Tensor):
-                next_frame_np = next_frame.detach().cpu().numpy()
-                # If tensor is in CHW format, convert to HWC for OpenCV
-                if next_frame_np.shape[0] == 3:  # CHW format
-                    next_frame_np = np.transpose(next_frame_np, (1, 2, 0))
-            else:
-                next_frame_np = next_frame
+            # Component 1: Temporal difference (visual change reward)
+            if self.reward_weights['visual_change'] > 0:
+                # Check if frames are usable for difference calculation
+                if torch.is_tensor(current_frame) and torch.is_tensor(next_frame) and current_frame.shape == next_frame.shape:
+                    frame_diff = torch.abs(next_frame - current_frame).mean().item()
+                    # Normalize and scale with smoothing constant
+                    visual_change = min(frame_diff * 10.0, 1.0)
+                    components['visual_change'] = visual_change
+                else:
+                    logger.warning("Frames not compatible for difference calculation")
+                    components['visual_change'] = 0.0
             
-            # Create tensor versions for PyTorch operations
-            current_frame_tensor = torch.tensor(current_frame_np, dtype=torch.float32).unsqueeze(0)
+            # Component 2: Prediction error (if model is available)
+            if self.reward_weights['prediction_error'] > 0 and hasattr(self, 'prediction_model') and self.prediction_model is not None:
+                try:
+                    # Predict next frame from current frame and action
+                    predicted_next_frame = self.prediction_model(current_frame, action)
+                    
+                    # Compute prediction error
+                    prediction_error = torch.abs(predicted_next_frame - next_frame).mean().item()
+                    
+                    # Normalize prediction error
+                    prediction_error = min(prediction_error * 5.0, 1.0)
+                    components['prediction_error'] = prediction_error
+                except Exception as e:
+                    logger.error(f"Error computing prediction error: {e}")
+                    components['prediction_error'] = 0.0
             
-            # Make sure action_idx is within valid range
-            if action_idx >= self.action_dim:
-                logger.warning(f"Action index {action_idx} is out of bounds for action_dim {self.action_dim}, clipping to valid range")
-                action_idx = min(action_idx, self.action_dim - 1)
-                
-            # Convert action_idx to a tensor with correct shape
-            action_tensor = torch.zeros(self.action_dim, dtype=torch.float32)
-            action_tensor[action_idx] = 1.0  # One-hot encoding
-            action_tensor = action_tensor.unsqueeze(0)  # Add batch dimension
-            next_frame_tensor = torch.tensor(next_frame_np, dtype=torch.float32).unsqueeze(0)
+            # Component 3: Exploration bonus (visit novel states)
+            if self.reward_weights['density'] > 0:
+                # Check if we can compute state hash
+                if torch.is_tensor(next_frame):
+                    # Compute state fingerprint (low-dimensional hash)
+                    state_hash = self._compute_state_hash(next_frame)
+                    
+                    # Check if state is novel
+                    if state_hash not in self.visited_states:
+                        # High reward for novel states
+                        self.visited_states.add(state_hash)
+                        exploration_bonus = 1.0
+                    else:
+                        # No reward for revisited states
+                        exploration_bonus = 0.0
+                    
+                    components['density'] = exploration_bonus
+                else:
+                    logger.warning("Next frame not suitable for state hash calculation")
+                    components['density'] = 0.0
             
-            # Ensure frames are in correct format (B, C, H, W)
-            if current_frame_tensor.dim() == 4 and current_frame_tensor.shape[1] != 3:
-                # Move channel dimension to correct position if needed
-                current_frame_tensor = current_frame_tensor.permute(0, 3, 1, 2)
-            if next_frame_tensor.dim() == 4 and next_frame_tensor.shape[1] != 3:
-                next_frame_tensor = next_frame_tensor.permute(0, 3, 1, 2)
+            # Component 4: Action variety reward
+            if self.reward_weights['association'] > 0:
+                # Update action history
+                self.action_history.append(action)
+                if len(self.action_history) > self.action_history_size:
+                    self.action_history.pop(0)
+                
+                # Compute variety in recent actions
+                unique_actions = len(set(self.action_history))
+                variety_ratio = unique_actions / min(len(self.action_history), self.num_actions)
+                
+                # Scale variety ratio
+                action_variety = variety_ratio
+                components['association'] = action_variety
             
-            # Get state embedding
-            with torch.no_grad():
-                current_state_embedding = self.world_model.encode(current_frame_tensor)
-                
-            # Extract visual features - use numpy arrays for OpenCV compatibility
-            current_features = self.feature_extractor.extract_features(current_frame_np)
-            next_features = self.feature_extractor.extract_features(next_frame_np)
+            # Combine components with their weights
+            reward = 0.0
+            for component, value in components.items():
+                # Check for NaN/Inf in component values
+                if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                    logger.warning(f"NaN/Inf detected in reward component '{component}', using zero")
+                    value = 0.0
+                    
+                reward += self.reward_weights[component] * value
             
-            # Compute feature differences
-            feature_diff = self.feature_extractor.compute_feature_difference(
-                current_features, next_features)
+            # Check if final reward is NaN/Inf
+            if math.isnan(reward) or math.isinf(reward):
+                logger.warning("NaN/Inf in final computed reward, using zero")
+                reward = 0.0
                 
-            # Compute visual change score
-            visual_change_score, change_metrics = self.visual_change_analyzer.get_visual_change_score(
-                current_frame_np, next_frame_np)
-                
-            # Add to experience buffer for world model training
-            self.experience_buffer.add(
-                current_frame_np, action_idx, next_frame_np, 0.0)  # Reward will be updated later
-                
-            # Compute prediction error component
-            prediction_error = self._compute_prediction_error_reward(
-                current_state_embedding, action_tensor, next_frame_tensor)
-                
-            # Compute visual change component
-            visual_change_reward = self._compute_visual_change_reward(
-                visual_change_score, change_metrics)
-                
-            # Compute density component
-            density_reward = self._compute_density_reward(current_state_embedding)
-                
-            # Compute association component
-            association_reward = self._compute_association_reward(
-                current_state_embedding, change_metrics)
-                
-            # Combine reward components
-            reward_components = {
-                'prediction_error': prediction_error,
-                'visual_change': visual_change_reward,
-                'density': density_reward,
-                'association': association_reward
-            }
+            # Add to reward history and update cumulative reward
+            self.reward_history.append(reward)
+            self.cumulative_reward += reward
             
-            # Weighted sum of components
-            reward = sum(self.reward_weights[k] * v for k, v in reward_components.items() 
-                        if k in self.reward_weights)
-                
-            # Apply normalization and scaling
-            normalized_reward = self.reward_normalizer.normalize(reward)
-            scaled_reward = self.reward_scaler.percentile_scale(normalized_reward)
+            # Log metrics periodically
+            self.reward_counter += 1
+            if self.reward_counter % 100 == 0:
+                avg_reward = sum(self.reward_history[-100:]) / min(100, len(self.reward_history))
+                logger.info(f"Average reward (last 100): {avg_reward:.4f}, Cumulative: {self.cumulative_reward:.4f}")
+                logger.debug(f"Reward components: {components}")
             
-            # Update tracking variables
-            self.reward_history.append(scaled_reward)
-            self.cumulative_reward += scaled_reward
-            self.steps_since_reset += 1
+            # Clip reward to reasonable range
+            reward = max(min(reward, self.max_reward), self.min_reward)
             
-            # Update action tracker - action_idx is already a scalar
-            self.action_tracker.update_action_tracking(action_idx, scaled_reward)
-            
-            # Update association memory
-            self.association_memory.store(current_state_embedding.cpu(), scaled_reward)
-            
-            # Store for next iteration
-            self.last_frame = current_frame_np
-            self.last_action = action_idx
-            self.last_state_embedding = current_state_embedding
-            self.last_visual_features = current_features
-            
-            # Check if it's time to update world model
-            if (self.steps_since_reset - self.last_world_model_update) >= self.training_interval:
-                self._update_world_model()
-                
-            # Check stability
-            self._check_stability()
-            
-            # Log details periodically
-            if self.steps_since_reset % 100 == 0:
-                self._log_reward_metrics(reward_components, scaled_reward)
-                
-            return scaled_reward
+            return reward
             
         except Exception as e:
             logger.error(f"Error computing reward: {e}")
+            logger.error("Using default reward of 0.0")
             return 0.0
             
     def _compute_prediction_error_reward(self, current_state, action_tensor, next_state):

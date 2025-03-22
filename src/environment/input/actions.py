@@ -504,6 +504,13 @@ class ActionExecutor:
                     position = (0.5, 0.5)
                     logger.info(f"[ACTION-{action_id}] No position specified for scroll action, defaulting to screen center")
                 
+                # For click actions with no position, default to center screen
+                if (mouse_action == 'click' or mouse_action == 'double_click') and not position:
+                    screen_width, screen_height = self._get_screen_dimensions()
+                    # Use center of screen as default position
+                    position = (0.5, 0.5)
+                    logger.info(f"[ACTION-{action_id}] No position specified for {mouse_action} action, defaulting to screen center")
+                
                 # Extract normalized position if provided and convert to screen coordinates
                 if position and len(position) == 2:
                     screen_width, screen_height = self._get_screen_dimensions()

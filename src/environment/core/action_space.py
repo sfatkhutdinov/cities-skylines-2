@@ -58,7 +58,7 @@ class ActionSpace:
             
             # Basic UI interactions (no semantic meaning, just mouse actions)
             15: {"type": "mouse", "action": "click", "button": "left"},
-            16: {"type": "mouse", "action": "click", "button": "right"},
+            16: {"type": "mouse", "action": "click", "button": "right", "position": (0.5, 0.5)},
             17: {"type": "mouse", "action": "double_click", "button": "left"},
             18: {"type": "mouse", "action": "drag", "button": "left"},
             19: {"type": "mouse", "action": "scroll", "direction": 1},

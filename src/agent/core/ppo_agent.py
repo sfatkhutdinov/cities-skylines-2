@@ -153,9 +153,14 @@ class PPOAgent:
         """
         logger.critical(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
         
-        # Ensure state is a tensor
+        # Validate state
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, device=self.device).float()
+        
+        # Check for NaN/Inf values in state
+        if torch.isnan(state).any() or torch.isinf(state).any():
+            logger.warning("NaN/Inf detected in state input, replacing with zeros")
+            state = torch.zeros_like(state)
         
         try:
             with torch.no_grad():
@@ -163,11 +168,31 @@ class PPOAgent:
                 # Pass and update hidden_state for LSTM memory
                 if self.use_lstm:
                     logger.critical("Using LSTM in action selection")
+                    # Check if hidden state is None or has NaN values
+                    if self.hidden_state is not None:
+                        h, c = self.hidden_state
+                        if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(c).any() or torch.isinf(c).any():
+                            logger.warning("NaN/Inf detected in LSTM hidden state, resetting to None")
+                            self.hidden_state = None
+                            
                     action_probs, value, next_hidden = self.policy(state, self.hidden_state)
-                    # Update hidden state for next time
-                    self.hidden_state = next_hidden
+                    
+                    # Validate LSTM output
+                    if next_hidden is not None:
+                        h, c = next_hidden
+                        if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(c).any() or torch.isinf(c).any():
+                            logger.warning("NaN/Inf detected in LSTM output state, not updating hidden state")
+                            # Don't update hidden state if it has NaN values
+                        else:
+                            # Update hidden state for next time (only if valid)
+                            self.hidden_state = next_hidden
                 else:
                     action_probs, value, _ = self.policy(state)
+                
+                # Check for NaN in action_probs
+                if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+                    logger.warning("NaN/Inf detected in action probabilities, using uniform distribution")
+                    action_probs = torch.ones_like(action_probs) / action_probs.size(-1)
                 
                 # Create categorical distribution
                 action_distribution = torch.distributions.Categorical(action_probs)
@@ -185,14 +210,24 @@ class PPOAgent:
                 if deterministic:
                     action = torch.argmax(action_probs, dim=1)
                 else:
-                    action = action_distribution.sample()
+                    # Use try-except to handle potential NaN values in distribution
+                    try:
+                        action = action_distribution.sample()
+                    except Exception as e:
+                        logger.error(f"Error sampling from action distribution: {e}")
+                        # Fallback to argmax
+                        action = torch.argmax(action_probs, dim=1)
                 
                 # Store action in history for future smoothing
                 action_item = action.cpu().item()
                 self._update_action_history(action_item)
                 
                 # Get log probability
-                log_prob = action_distribution.log_prob(action)
+                try:
+                    log_prob = action_distribution.log_prob(action)
+                except Exception as e:
+                    logger.error(f"Error computing log probability: {e}")
+                    log_prob = torch.tensor(-10.0, device=self.device)  # Very low log prob to signal issue
                 
                 # Create info dictionary
                 info = {
@@ -201,6 +236,11 @@ class PPOAgent:
                     'log_prob': log_prob,
                     'value': value
                 }
+                
+                # Check if value is NaN
+                if torch.isnan(value).any() or torch.isinf(value).any():
+                    logger.warning("NaN/Inf detected in value, using 0.0")
+                    info['value'] = torch.tensor(0.0, device=self.device)
                 
                 # Update steps counter
                 self.steps_taken += 1
@@ -226,13 +266,23 @@ class PPOAgent:
                     if deterministic:
                         action = torch.argmax(action_probs, dim=1)
                     else:
-                        action = penalized_distribution.sample()
+                        try:
+                            action = penalized_distribution.sample()
+                        except Exception as e:
+                            logger.error(f"Error sampling from penalized distribution: {e}")
+                            action = torch.argmax(action_probs, dim=1)
                         
                     # Get log probability from original distribution for learning
                     log_prob = info['log_prob']
                 
+                # Update last_action and last_state for continuity
+                self.last_action = action_item
+                self.last_state = state.detach()
+                self.last_value = value.item() if torch.numel(value) == 1 else value.view(-1)[0].item()
+                self.last_log_prob = log_prob.item()
+                
                 # Return action, log_prob, and value
-                logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
+                logger.critical(f"Returning action: {action.cpu().item()}, with value: {self.last_value}")
                 return {
                     'action': action,
                     'log_prob': log_prob,
@@ -719,30 +769,40 @@ class PPOAgent:
         return recent_ratio * self.menu_penalty_factor 
 
     def reset(self):
-        """Reset agent state between episodes."""
-        logger.critical("Resetting agent state")
+        """Reset agent state for a new episode."""
+        logger.critical("Resetting agent state for new episode")
         
-        # Don't fully reset LSTM hidden state between episodes
-        # instead, detach it from the computation graph to maintain
-        # long-term memory while preventing backprop across episodes
-        if self.use_lstm and self.hidden_state is not None:
-            h, c = self.hidden_state
-            self.hidden_state = (h.detach(), c.detach())
-            logger.critical("Detached LSTM hidden state but preserved memory")
-        elif self.use_lstm:
-            # If there's no hidden state yet, initialize it to zeros
-            logger.critical("Initializing LSTM hidden state to zeros")
+        # Reset memory
+        self.reset_memory()
+        
+        # Reset LSTM/RNN hidden state if present
+        if self.use_lstm:
+            logger.critical("Resetting LSTM hidden state")
             self.hidden_state = None
-            
-        # Partially reset action history to maintain some movement continuity
-        if len(self.action_history) > 2:
-            # Keep the last 2 actions
-            self.action_history = self.action_history[-2:]
         
-        # Other resets if needed
+        # Reset action history
+        self.action_history = []
+        
+        # Reset episode counter and reward
+        self.episode_reward = 0.0
+        self.steps_since_reset = 0
+        
+        # Reset last actions and states
+        self.last_action = None
+        self.last_state = None
+        self.last_value = None
+        self.last_log_prob = None
+        
+        # Increment episode counter
         self.episodes_completed += 1
         
-        logger.info("Agent state partially reset for new episode")
+        logger.info("Agent state reset for new episode")
+    
+    def reset_memory(self):
+        """Reset memory buffer."""
+        if hasattr(self, 'memory') and self.memory is not None:
+            logger.critical("Resetting experience memory")
+            self.memory.clear()
     
     def _apply_action_smoothing(self, action_probs):
         """Apply smoothing to action probabilities to reduce jerky movements.
