@@ -202,13 +202,21 @@ class ErrorDetectionNetwork(nn.Module):
             # Process action features
             if isinstance(action, torch.Tensor) and action.dim() > 0:
                 # For one-hot or continuous actions
-                if action.dim() == 1:
-                    action = action.unsqueeze(0)
+                # First flatten action if it has more than one dimension
+                if action.dim() > 1 and action.dtype == torch.long:
+                    action = action.flatten()
                 
-                # Convert to one-hot if needed
-                if action.dim() == 2 and action.size(1) == 1 and action.dtype == torch.long:
+                if action.dim() == 1 and action.dtype == torch.long:
+                    # Convert scalar action to one-hot
+                    one_hot_action = torch.zeros(1, self.action_dim, device=self.device)
+                    # Ensure action is within valid range
+                    action_idx = max(0, min(action.item(), self.action_dim - 1))
+                    one_hot_action[0, action_idx] = 1.0
+                    action_features = one_hot_action
+                elif action.dim() == 2 and action.size(1) == 1 and action.dtype == torch.long:
                     one_hot_action = torch.zeros(action.size(0), self.action_dim, device=self.device)
-                    one_hot_action.scatter_(1, action, 1)
+                    action_indices = torch.clamp(action, 0, self.action_dim - 1)
+                    one_hot_action.scatter_(1, action_indices, 1)
                     action_features = one_hot_action
                 else:
                     # Ensure proper dimensions
@@ -296,7 +304,7 @@ class ErrorDetectionNetwork(nn.Module):
                 logger.debug(f"First detection layer expects input dim: {first_layer.in_features}, " + 
                            f"detector_input has dim: {detector_input.shape[-1]}")
                 
-                # Final safety check - if dimensions still don't match, adapt the input
+                # Final safety check - if dimensions don't match, adapt the input
                 if detector_input.shape[-1] != first_layer.in_features:
                     logger.warning(f"Dimension mismatch: detector_input has {detector_input.shape[-1]} features, " + 
                                  f"but first layer expects {first_layer.in_features}")
@@ -310,40 +318,82 @@ class ErrorDetectionNetwork(nn.Module):
                         padding = torch.zeros(detector_input.size(0), 
                                              first_layer.in_features - detector_input.shape[-1], 
                                              device=self.device)
-                        padded_input = torch.cat([detector_input, padding], dim=1)
-                        detector_input = padded_input
+                        detector_input = torch.cat([detector_input, padding], dim=1)
                         logger.debug(f"Padded detector_input to match network, new shape: {detector_input.shape}")
             
             # Detect errors
-            features = self.detection_network(detector_input)
-            error_types = self.error_classifier(features)
-            error_severity = self.severity_regressor(features)
+            try:
+                features = self.detection_network(detector_input)
+                error_types = self.error_classifier(features)
+                error_severity = self.severity_regressor(features)
+            except Exception as e:
+                logger.error(f"Error in detection network forward pass: {e}")
+                # Return fallback results and exit early
+                batch_size = state.shape[0] if isinstance(state, torch.Tensor) and state.dim() > 0 else 1
+                return self._create_fallback_detection_results(batch_size)
             
             # Check action inconsistency
-            if action.dtype == torch.long:
-                action_one_hot = F.one_hot(action, num_classes=self.action_dim).float()
-            else:
-                action_one_hot = action
-                
-            # Ensure state and action_one_hot have compatible batch dimensions
-            if state.shape[0] != action_one_hot.shape[0]:
-                # Broadcast if needed
-                if state.shape[0] == 1:
-                    state = state.repeat(action_one_hot.shape[0], 1)
-                elif action_one_hot.shape[0] == 1:
-                    action_one_hot = action_one_hot.repeat(state.shape[0], 1)
+            try:
+                # Handle action for action_inconsistency_detector
+                if action.dtype == torch.long:
+                    # Flatten action if needed
+                    if action.dim() > 1:
+                        action_flat = action.flatten()
+                    else:
+                        action_flat = action
+                        
+                    # Ensure action indices are in range
+                    action_flat = torch.clamp(action_flat, 0, self.action_dim - 1)
+                    action_one_hot = F.one_hot(action_flat, num_classes=self.action_dim).float()
                 else:
-                    logger.warning(f"Cannot match batch dimensions: state {state.shape[0]} vs action {action_one_hot.shape[0]}")
-                    # Use the first batch element as a fallback
-                    state = state[:1]
-                    action_one_hot = action_one_hot[:1]
+                    action_one_hot = action
+                    
+                # Make sure the first dimension is a batch dimension
+                if action_one_hot.dim() == 1:
+                    action_one_hot = action_one_hot.unsqueeze(0)
                 
-            action_inconsistency = self.action_inconsistency_detector(
-                torch.cat([state, action_one_hot], dim=-1)
-            )
+                # Ensure state and action_one_hot have same number of dimensions
+                if state.dim() != action_one_hot.dim():
+                    if state.dim() > action_one_hot.dim():
+                        # Add dimensions to action_one_hot
+                        for _ in range(state.dim() - action_one_hot.dim()):
+                            action_one_hot = action_one_hot.unsqueeze(-1)
+                    else:
+                        # Add dimensions to state
+                        for _ in range(action_one_hot.dim() - state.dim()):
+                            state = state.unsqueeze(-1)
+                
+                # Make sure batch dimensions match
+                if state.size(0) != action_one_hot.size(0):
+                    # Try to broadcast
+                    if state.size(0) == 1:
+                        state = state.expand(action_one_hot.size(0), *state.shape[1:])
+                    elif action_one_hot.size(0) == 1:
+                        action_one_hot = action_one_hot.expand(state.size(0), *action_one_hot.shape[1:])
+                    else:
+                        logger.warning(f"Incompatible batch dimensions: state={state.size(0)}, action={action_one_hot.size(0)}")
+                        # Just take first element as fallback
+                        state = state[:1]
+                        action_one_hot = action_one_hot[:1]
+                
+                # Now try to concatenate along last dimension
+                state_action_combined = torch.cat([state, action_one_hot], dim=-1)
+                action_inconsistency = self.action_inconsistency_detector(state_action_combined)
+            
+            except Exception as e:
+                import traceback
+                logger.error(f"Error in action inconsistency detection: {e}")
+                logger.error(traceback.format_exc())
+                # Fallback to zeros
+                action_inconsistency = torch.zeros(state.shape[0] if state.dim() > 0 else 1, 1, device=self.device)
             
             # Check state anomaly
-            state_anomaly = self.state_anomaly_detector(state)
+            try:
+                state_anomaly = self.state_anomaly_detector(state)
+            except Exception as e:
+                logger.error(f"Error in state anomaly detection: {e}")
+                # Fallback to zeros
+                state_anomaly = torch.zeros(state.shape[0] if state.dim() > 0 else 1, 1, device=self.device)
             
             # Create result dictionary
             result = {
@@ -364,17 +414,35 @@ class ErrorDetectionNetwork(nn.Module):
             import traceback
             logger.error(f"Error in error detection: {e}")
             logger.error(traceback.format_exc())
-            return self._create_fallback_detection_results()
+            # Determine batch size if possible
+            batch_size = None
+            if isinstance(state, torch.Tensor) and state.dim() > 0:
+                batch_size = state.shape[0]
+            return self._create_fallback_detection_results(batch_size)
     
-    def _create_fallback_detection_results(self) -> Dict[str, torch.Tensor]:
-        """Create fallback detection results when error detection fails."""
-        batch_size = 1  # Default batch size for fallback
+    def _create_fallback_detection_results(self, batch_size=None) -> Dict[str, torch.Tensor]:
+        """Create fallback detection results when error detection fails.
         
+        Args:
+            batch_size: Optional batch size for results, defaults to 1 if not provided
+        """
+        # Use provided batch_size or default to 1
+        if batch_size is None:
+            batch_size = 1
+            
+        # Ensure batch_size is an integer
+        try:
+            batch_size = int(batch_size)
+        except (ValueError, TypeError):
+            batch_size = 1
+        
+        # Create safe fallback results
         result = {
             'error_types': torch.zeros(batch_size, self.error_types, device=self.device),
-            'error_severity': torch.tensor([[0.5]], device=self.device),  # Neutral severity
-            'action_inconsistency': torch.tensor([[0.0]], device=self.device),
-            'state_anomaly': torch.tensor([[0.0]], device=self.device)
+            'error_severity': torch.zeros(batch_size, 1, device=self.device).fill_(0.5),  # Neutral severity
+            'action_inconsistency': torch.zeros(batch_size, 1, device=self.device),
+            'state_anomaly': torch.zeros(batch_size, 1, device=self.device),
+            'prediction_error': torch.zeros(batch_size, device=self.device)
         }
         
         logger.warning("Returning fallback error detection results")
