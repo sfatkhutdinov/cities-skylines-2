@@ -967,3 +967,48 @@ class AutonomousRewardSystem:
         }
         
         return metrics 
+
+    def _compute_state_hash(self, state_tensor: torch.Tensor) -> str:
+        """Compute a hash representation of a state for tracking uniqueness.
+        
+        Args:
+            state_tensor: The state tensor to hash
+            
+        Returns:
+            str: A string hash representing the state
+        """
+        try:
+            if state_tensor is None:
+                logger.warning("Cannot compute hash for None state tensor")
+                return "none_state"
+                
+            # Ensure tensor is on CPU for hashing
+            if torch.is_tensor(state_tensor):
+                # Reduce dimensionality for efficiency
+                if state_tensor.dim() > 2:
+                    # Take mean across spatial dimensions for image-like tensors
+                    reduced_state = state_tensor.mean(dim=tuple(range(2, state_tensor.dim())))
+                else:
+                    reduced_state = state_tensor
+                    
+                # Quantize to further reduce precision differences
+                reduced_state = (reduced_state * 100).round() / 100
+                
+                # Convert to numpy for hashing
+                state_np = reduced_state.detach().cpu().numpy()
+            else:
+                # If not a tensor, convert to numpy if possible
+                state_np = np.asarray(state_tensor)
+                
+            # Compute simple hash based on sum and mean values
+            state_sum = float(np.sum(state_np))
+            state_mean = float(np.mean(state_np))
+            state_std = float(np.std(state_np))
+            
+            # Create hash string
+            hash_str = f"s{state_sum:.3f}_m{state_mean:.3f}_d{state_std:.3f}"
+            
+            return hash_str
+        except Exception as e:
+            logger.error(f"Error computing state hash: {e}")
+            return f"hash_error_{time.time()}" 

@@ -174,68 +174,101 @@ class ErrorDetectionNetwork(nn.Module):
             if uncertainty is not None:
                 uncertainty = uncertainty.to(self.device)
             
-            # Reshape inputs if needed to ensure proper dimensions
-            # Add batch dimension if missing
-            if len(state.shape) == 1:
-                state = state.unsqueeze(0)
-                logger.debug(f"Added batch dimension to state, new shape: {state.shape}")
-                
-            # Make sure action is correctly formatted
-            if isinstance(action, int) or (isinstance(action, torch.Tensor) and action.dim() == 0):
-                action = torch.tensor([action], device=self.device)
-                logger.debug(f"Converted scalar action to tensor, new shape: {action.shape}")
-                
-            if next_state is not None and len(next_state.shape) == 1:
-                next_state = next_state.unsqueeze(0)
-                logger.debug(f"Added batch dimension to next_state, new shape: {next_state.shape}")
-                
-            if predicted_next_state is not None and len(predicted_next_state.shape) == 1:
-                predicted_next_state = predicted_next_state.unsqueeze(0)
-                logger.debug(f"Added batch dimension to predicted_next_state, new shape: {predicted_next_state.shape}")
-                
-            if uncertainty is not None and len(uncertainty.shape) == 1:
-                uncertainty = uncertainty.unsqueeze(0)
-                logger.debug(f"Added batch dimension to uncertainty, new shape: {uncertainty.shape}")
-            
             # Handle feature dimensionality to match expected input size of the detection network
-            if state.shape[-1] != self.state_dim:
-                logger.warning(f"State dimension mismatch - Expected {self.state_dim}, got {state.shape[-1]}")
-                # Use a simple projection to match dimensions if needed
-                if hasattr(self, 'state_adapter') and self.state_adapter is not None:
-                    state = self.state_adapter(state)
-                else:
-                    # Create a fallback method - use the first state_dim features or pad with zeros
-                    if state.shape[-1] > self.state_dim:
-                        state = state[..., :self.state_dim]
-                        logger.debug(f"Truncated state to match expected dim, new shape: {state.shape}")
-                    else:
-                        # Pad with zeros
-                        padding = torch.zeros(state.shape[0], self.state_dim - state.shape[-1], device=self.device)
-                        state = torch.cat([state, padding], dim=-1)
-                        logger.debug(f"Padded state to match expected dim, new shape: {state.shape}")
+            # Combine all available information into a detector input
+            detector_components = []
             
-            # Apply similar dimension handling for other tensor inputs if needed
-            if next_state is not None and next_state.shape[-1] != self.state_dim:
-                if next_state.shape[-1] > self.state_dim:
-                    next_state = next_state[..., :self.state_dim]
+            # Process state features
+            if self.state_dim != state.shape[-1]:
+                logger.debug(f"State dimension mismatch: expected {self.state_dim}, got {state.shape[-1]} - adapting")
+                if state.shape[-1] > self.state_dim:
+                    # If input is larger, we can reduce it with a projection
+                    state_features = state[:, :self.state_dim]
                 else:
-                    padding = torch.zeros(next_state.shape[0], self.state_dim - next_state.shape[-1], device=self.device)
-                    next_state = torch.cat([next_state, padding], dim=-1)
-                    
-            if predicted_next_state is not None and predicted_next_state.shape[-1] != self.state_dim:
-                if predicted_next_state.shape[-1] > self.state_dim:
-                    predicted_next_state = predicted_next_state[..., :self.state_dim]
-                else:
-                    padding = torch.zeros(predicted_next_state.shape[0], self.state_dim - predicted_next_state.shape[-1], device=self.device)
-                    predicted_next_state = torch.cat([predicted_next_state, padding], dim=-1)
-            
-            if uncertainty is not None and uncertainty.shape[-1] != self.state_dim:
-                if uncertainty.shape[-1] > self.state_dim:
-                    uncertainty = uncertainty[..., :self.state_dim]
-                else:
-                    padding = torch.zeros(uncertainty.shape[0], self.state_dim - uncertainty.shape[-1], device=self.device)
-                    uncertainty = torch.cat([uncertainty, padding], dim=-1)
+                    # If input is smaller, pad with zeros
+                    padding = torch.zeros(state.size(0), self.state_dim - state.shape[-1], device=self.device)
+                    state_features = torch.cat([state, padding], dim=1)
+            else:
+                state_features = state
                 
+            detector_components.append(state_features)
+            
+            # Process action features
+            if isinstance(action, torch.Tensor) and action.dim() > 0:
+                # For one-hot or continuous actions
+                if action.dim() == 1:
+                    action = action.unsqueeze(0)
+                
+                # Convert to one-hot if needed
+                if action.dim() == 2 and action.size(1) == 1 and action.dtype == torch.long:
+                    one_hot_action = torch.zeros(action.size(0), self.action_dim, device=self.device)
+                    one_hot_action.scatter_(1, action, 1)
+                    action_features = one_hot_action
+                else:
+                    # Ensure proper dimensions
+                    if action.size(-1) != self.action_dim:
+                        if action.size(-1) > self.action_dim:
+                            action_features = action[:, :self.action_dim]
+                        else:
+                            # Pad with zeros
+                            padding = torch.zeros(action.size(0), self.action_dim - action.size(-1), device=self.device)
+                            action_features = torch.cat([action, padding], dim=1)
+                    else:
+                        action_features = action
+            else:
+                # For single scalar actions, convert to one-hot
+                action_idx = action.item() if isinstance(action, torch.Tensor) else int(action)
+                action_idx = max(0, min(action_idx, self.action_dim - 1))  # Clamp to valid range
+                action_features = torch.zeros(1, self.action_dim, device=self.device)
+                action_features[0, action_idx] = 1.0
+                
+            detector_components.append(action_features)
+            
+            # Add next state features if available
+            if next_state is not None:
+                if self.state_dim != next_state.shape[-1]:
+                    if next_state.shape[-1] > self.state_dim:
+                        next_state_features = next_state[:, :self.state_dim]
+                    else:
+                        padding = torch.zeros(next_state.size(0), self.state_dim - next_state.shape[-1], device=self.device)
+                        next_state_features = torch.cat([next_state, padding], dim=1)
+                else:
+                    next_state_features = next_state
+                    
+                detector_components.append(next_state_features)
+            else:
+                # Add zeros if not available
+                detector_components.append(torch.zeros_like(state_features))
+                
+            # Add predicted next state features if available
+            if predicted_next_state is not None:
+                if self.state_dim != predicted_next_state.shape[-1]:
+                    if predicted_next_state.shape[-1] > self.state_dim:
+                        pred_features = predicted_next_state[:, :self.state_dim]
+                    else:
+                        padding = torch.zeros(predicted_next_state.size(0), self.state_dim - predicted_next_state.shape[-1], device=self.device)
+                        pred_features = torch.cat([predicted_next_state, padding], dim=1)
+                else:
+                    pred_features = predicted_next_state
+                    
+                detector_components.append(pred_features)
+            else:
+                detector_components.append(torch.zeros_like(state_features))
+                
+            # Add uncertainty information if available
+            if uncertainty is not None:
+                # Ensure proper dimensions
+                if uncertainty.shape[-1] > self.hidden_dim:
+                    uncertainty_features = uncertainty[:, :self.hidden_dim]
+                else:
+                    # Pad with zeros
+                    padding = torch.zeros(uncertainty.size(0), self.hidden_dim - uncertainty.shape[-1], device=self.device)
+                    uncertainty_features = torch.cat([uncertainty, padding], dim=1)
+                    
+                detector_components.append(uncertainty_features)
+            else:
+                detector_components.append(torch.zeros(state.size(0), self.hidden_dim, device=self.device))
+            
             # Prepare input based on available data
             if self.use_world_model and predicted_next_state is not None and next_state is not None:
                 # Full information available for error detection
@@ -243,11 +276,11 @@ class ErrorDetectionNetwork(nn.Module):
                     # If uncertainty is not provided, create a dummy tensor
                     uncertainty = torch.zeros_like(state).to(self.device)
                     
-                detector_input = torch.cat([state, predicted_next_state, next_state, uncertainty], dim=-1)
+                detector_input = torch.cat(detector_components, dim=-1)
                 logger.debug(f"Created detector_input from all components, shape: {detector_input.shape}")
             else:
                 # Use only current state for error detection
-                detector_input = state
+                detector_input = torch.cat(detector_components[:1], dim=-1)
                 logger.debug(f"Using only state for detector_input, shape: {detector_input.shape}")
             
             # Log expected input dimensions for the detection network

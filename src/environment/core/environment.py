@@ -10,6 +10,7 @@ import time
 import numpy as np
 import logging
 import os
+import math
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque
 
@@ -678,19 +679,55 @@ class Environment:
                 current_frame = self.observation_manager.get_current_frame()
                 next_frame = self.observation_manager.get_latest_frame()
                 
-            # Compute reward using reward system
-            if current_frame is not None and next_frame is not None:
-                reward = self.reward_system.compute_reward(
-                    current_frame=current_frame, 
-                    next_frame=next_frame, 
-                    action=action_idx, 
-                    done=self.steps_taken >= self.max_steps, 
-                    info=action_info
-                )
-            else:
-                logger.warning("Missing frames for reward computation, using default reward")
+            # Compute reward based on transition
+            try:
+                # Check if frames are available for reward computation
+                if current_frame is None or next_frame is None:
+                    logger.warning("Missing frames for reward computation. Defaulting to 0.0 reward.")
+                    reward = 0.0
+                else:
+                    # Ensure we have a valid action index
+                    action_idx = action if isinstance(action, (int, np.integer)) else 0
+                    
+                    # Check if the frames are valid tensors
+                    if not torch.is_tensor(current_frame) or not torch.is_tensor(next_frame):
+                        logger.warning("Frames are not valid tensors. Converting to tensors.")
+                        if not torch.is_tensor(current_frame):
+                            current_frame = torch.zeros((3, 84, 84), device=self.device)
+                        if not torch.is_tensor(next_frame):
+                            next_frame = torch.zeros((3, 84, 84), device=self.device)
+                    
+                    # Check for NaN values in frames
+                    if torch.isnan(current_frame).any() or torch.isinf(current_frame).any():
+                        logger.warning("NaN/Inf values detected in current frame. Replacing with zeros.")
+                        current_frame = torch.zeros_like(current_frame)
+                    
+                    if torch.isnan(next_frame).any() or torch.isinf(next_frame).any():
+                        logger.warning("NaN/Inf values detected in next frame. Replacing with zeros.")
+                        next_frame = torch.zeros_like(next_frame)
+                
+                    # Pass done flag and info to reward system
+                    done = self.steps_taken >= self.max_steps
+                    info = action_info or {}
+                
+                    # Compute reward with all required parameters
+                    reward = self.reward_system.compute_reward(
+                        current_frame=current_frame, 
+                        next_frame=next_frame, 
+                        action=action_idx, 
+                        done=done, 
+                        info=info
+                    )
+                    
+                    # Validate the reward
+                    if math.isnan(reward) or math.isinf(reward):
+                        logger.warning(f"Invalid reward value detected: {reward}. Defaulting to 0.0")
+                        reward = 0.0
+            except Exception as e:
+                logger.error(f"Error computing reward: {e}")
                 reward = 0.0
-            
+
+            logger.critical(f"REWARD DEBUG: Computed reward: {reward}\n")
             return reward
         except Exception as e:
             logger.error(f"Error computing reward: {e}")

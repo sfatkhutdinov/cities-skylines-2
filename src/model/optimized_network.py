@@ -408,33 +408,75 @@ class OptimizedNetwork(nn.Module):
                 if len(x.shape) == 2:  # [batch, channels] shape detected
                     logger.critical(f"Reshaping input from {x.shape} to proper 4D shape for Conv2D")
                     # If this is a [batch, features] tensor, we need to reshape it to [batch, channels, height, width]
-                    if x.size(1) == self.effective_input_channels:
-                        # Reshape to square image with channels
-                        h = w = int(math.sqrt(x.size(0)))  # Simple square root for size
-                        if h * w != x.size(0):  # Not a perfect square
-                            h = w = 1  # Default minimal size
-                        # Reshape to [batch, channels, height, width]
-                        x = x.view(x.size(0), self.effective_input_channels, h, w)
-                    else:
-                        # Cannot properly reshape, create dummy tensor with correct dimensions
-                        logger.critical(f"Creating dummy tensor with correct dimensions")
-                        x = torch.zeros(x.size(0), self.effective_input_channels, 8, 8, device=x.device)
+                    batch_size = x.size(0)
+                    
+                    # Create a proper sized tensor with minimum dimensions that the conv layers can handle
+                    # Ensure height and width are at least as large as the first kernel size (typically 8x8)
+                    min_spatial_dim = 8
+                    
+                    # Create a tensor with correct shape (batch, channels, height, width)
+                    # Default to 8x8 spatial dimensions which should be large enough for first kernel
+                    x_reshaped = torch.zeros(
+                        batch_size, 
+                        self.effective_input_channels, 
+                        min_spatial_dim, 
+                        min_spatial_dim, 
+                        device=x.device
+                    )
+                    
+                    # Copy data where possible
+                    feature_count = min(x.size(1), self.effective_input_channels)
+                    
+                    # Fill the first channel(s) with the original data, spreading features across channels
+                    for i in range(min(feature_count, self.effective_input_channels)):
+                        if i < x.size(1):
+                            # Spread the feature data across the spatial dimensions
+                            # Simple approach: repeat the same value across the spatial dimensions
+                            x_reshaped[:, i, :, :] = x[:, i].unsqueeze(-1).unsqueeze(-1).expand(-1, min_spatial_dim, min_spatial_dim)
+                    
+                    # Replace x with properly reshaped tensor
+                    x = x_reshaped
+                    logger.critical(f"Reshaped input to {x.shape} for convolutional processing")
                 
-                # Final check to ensure we have 4D tensor
-                if len(x.shape) != 4:
-                    logger.critical(f"Input still doesn't have 4 dimensions, fixing shape: {x.shape}")
-                    # Create a new tensor with the correct shape
-                    dummy = torch.zeros(x.size(0), self.effective_input_channels, 8, 8, device=x.device)
+                # Final check to ensure we have 4D tensor with sufficient spatial dimensions
+                if len(x.shape) != 4 or x.shape[2] < 8 or x.shape[3] < 8:
+                    logger.critical(f"Input shape {x.shape} is not suitable for convolution, creating proper tensor")
+                    
+                    # Get current batch size or default to 1
+                    batch_size = x.size(0) if len(x.shape) > 0 else 1
+                    
+                    # Create a tensor with correct shape (batch, channels, height, width)
+                    x_proper = torch.zeros(
+                        batch_size, 
+                        self.effective_input_channels, 
+                        8, 8, 
+                        device=x.device
+                    )
+                    
                     # Copy values if possible
                     if len(x.shape) == 3:  # [batch, height, width]
-                        # Broadcast to all channels
-                        for c in range(min(self.effective_input_channels, 1)):
-                            if c < dummy.size(1):
-                                dummy[:, c] = x if x.size(1) == dummy.size(2) else dummy[:, c]
-                    x = dummy
+                        for c in range(min(self.effective_input_channels, 3)):
+                            # Broadcast to channels
+                            x_proper[:, c] = F.interpolate(
+                                x.unsqueeze(1), 
+                                size=(8, 8), 
+                                mode='nearest'
+                            ).squeeze(1)
+                    
+                    # Replace with properly dimensioned tensor
+                    x = x_proper
 
-                features = self.conv_layers(x)
-                features = features.view(features.size(0), -1)  # Flatten
+                try:
+                    features = self.conv_layers(x)
+                    features = features.view(features.size(0), -1)  # Flatten
+                except Exception as e:
+                    logger.critical(f"Forward pass failed with exception: {str(e)}")
+                    logger.critical(f"Input shape was {x.shape}")
+                    # Create fallback features with the expected output size of the conv layers
+                    # Calculate the expected output size based on our network structure
+                    expected_flatten_size = self._calculate_conv_output_size()
+                    features = torch.zeros(x.size(0), expected_flatten_size, device=x.device)
+                    logger.critical(f"Using fallback features with shape {features.shape}")
             else:
                 features = x
                 
@@ -679,4 +721,25 @@ class OptimizedNetwork(nn.Module):
         # Process through value head
         value = self.value_head(features)
         
-        return value.squeeze(-1), next_hidden 
+        return value.squeeze(-1), next_hidden
+
+    def _calculate_conv_output_size(self):
+        """Calculate the expected flattened output size of the convolutional layers."""
+        # Use the conv_channels defined in __init__
+        # Assuming stride=2 and padding=1 for each conv layer as per _build_conv_layers
+        
+        # Start with minimum input size that won't cause errors
+        h, w = 8, 8
+        
+        # Default conv channels from initialization
+        channels = getattr(self, 'conv_channels', (32, 64, 64))
+        
+        # Calculate output size after each conv layer
+        for c in channels:
+            # Formula: output_size = (input_size - kernel_size + 2*padding) / stride + 1
+            # With kernel_size=3, padding=1, stride=2
+            h = (h - 3 + 2*1) // 2 + 1
+            w = (w - 3 + 2*1) // 2 + 1
+        
+        # Final output size
+        return channels[-1] * h * w 
