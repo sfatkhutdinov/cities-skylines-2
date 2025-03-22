@@ -367,6 +367,30 @@ class OptimizedNetwork(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
+    # Add a new utility method to properly handle BatchNorm layers during inference with batch size of 1
+    def _handle_batch_norm_for_inference(self, mode=True):
+        """
+        Set BatchNorm layers to evaluation mode during inference, especially for batch size of 1.
+        This prevents 'Expected more than 1 value per channel when training' errors.
+        
+        Args:
+            mode: If True, set all BatchNorm layers to eval mode, otherwise restore their previous state
+        """
+        # Store the previous training state of BatchNorm layers if entering special handling mode
+        if mode and not hasattr(self, '_bn_previous_states'):
+            self._bn_previous_states = {}
+            for name, module in self.named_modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    self._bn_previous_states[name] = module.training
+                    module.eval()  # Set to evaluation mode
+        
+        # Restore previous state if exiting special handling mode
+        elif not mode and hasattr(self, '_bn_previous_states'):
+            for name, module in self.named_modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) and name in self._bn_previous_states:
+                    module.training = self._bn_previous_states[name]
+            delattr(self, '_bn_previous_states')
+
     def forward(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass of the network.
@@ -402,6 +426,12 @@ class OptimizedNetwork(nn.Module):
         batch_size = x.size(0)
         has_time_dim = len(x.shape) > 4
         orig_shape = x.shape
+        
+        # Check if we need to handle BatchNorm layers specially for batch size of 1
+        batch_norm_handling_needed = batch_size == 1 and self.training
+        if batch_norm_handling_needed:
+            # Set BatchNorm layers to eval mode to avoid "more than 1 value expected" errors
+            self._handle_batch_norm_for_inference(True)
         
         try:
             # Reshape if there's a time dimension
@@ -655,6 +685,11 @@ class OptimizedNetwork(nn.Module):
             value = torch.zeros(batch_size, 1, device=self.device)
             
             return action_logits, value, hidden_state
+        
+        finally:
+            # Restore BatchNorm layers to their original state if we modified them
+            if batch_norm_handling_needed:
+                self._handle_batch_norm_for_inference(False)
         
     def get_action_probs(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get action probabilities for a state.

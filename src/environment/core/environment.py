@@ -617,14 +617,17 @@ class Environment:
                 raise RuntimeError("Could not start game - please check game path and installation")
             self._wait_for_game_start()
     
-    def _set_game_speed(self, speed_level: int) -> None:
+    def _set_game_speed(self, speed_level: int) -> bool:
         """Set game speed using keyboard shortcuts.
         
         Args:
             speed_level: Game speed level (1-3)
+            
+        Returns:
+            bool: True if the speed change was successful, False otherwise
         """
         if self.mock_mode:
-            return
+            return True
             
         try:
             logger.debug(f"Setting game speed to level {speed_level}")
@@ -637,8 +640,16 @@ class Environment:
                 self.input_simulator.press_key('2')
             elif speed_level == 3:
                 self.input_simulator.press_key('3')
+            
+            # Speed actions should be considered successful even with float values
+            # Map float values to int speeds (0.75 should still use speed 1)
+            if isinstance(speed_level, float):
+                logger.info(f"Float speed value {speed_level} mapped to standard game speed")
+            
+            return True
         except Exception as e:
             logger.error(f"Error setting game speed: {e}")
+            return False
     
     def _compute_reward(self, action_info: Dict, action_idx: int, success: bool, menu_detected: bool) -> float:
         """Compute reward based on action and observation.

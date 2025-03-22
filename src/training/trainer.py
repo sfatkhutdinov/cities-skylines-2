@@ -1237,7 +1237,18 @@ class Trainer:
                         policy_loss = -torch.min(surr1, surr2).mean()
                         
                         # Value loss
-                        value_loss = F.mse_loss(values, step_returns)
+                        # Ensure values and batch_returns have the same shape for MSE loss
+                        if values.shape != batch_returns.shape:
+                            # If batch_returns is a vector but values is a 2D tensor with second dim = 1
+                            if len(values.shape) == 2 and values.shape[1] == 1 and len(batch_returns.shape) == 1:
+                                # Reshape batch_returns to match values
+                                batch_returns = batch_returns.unsqueeze(1)
+                            # If values is a vector but batch_returns is a 2D tensor with second dim = 1
+                            elif len(batch_returns.shape) == 2 and batch_returns.shape[1] == 1 and len(values.shape) == 1:
+                                # Reshape values to match batch_returns
+                                values = values.unsqueeze(1)
+                        
+                        value_loss = F.mse_loss(values, batch_returns)
                         
                         # Total loss
                         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
@@ -1284,6 +1295,17 @@ class Trainer:
                     policy_loss = -torch.min(surr1, surr2).mean()
                     
                     # Value loss
+                    # Ensure values and batch_returns have the same shape for MSE loss
+                    if values.shape != batch_returns.shape:
+                        # If batch_returns is a vector but values is a 2D tensor with second dim = 1
+                        if len(values.shape) == 2 and values.shape[1] == 1 and len(batch_returns.shape) == 1:
+                            # Reshape batch_returns to match values
+                            batch_returns = batch_returns.unsqueeze(1)
+                        # If values is a vector but batch_returns is a 2D tensor with second dim = 1
+                        elif len(batch_returns.shape) == 2 and batch_returns.shape[1] == 1 and len(values.shape) == 1:
+                            # Reshape values to match batch_returns
+                            values = values.unsqueeze(1)
+                    
                     value_loss = F.mse_loss(values, batch_returns)
                     
                     # Total loss
