@@ -6,18 +6,22 @@ value function, memory, and updater components.
 """
 
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 import logging
 import os
 import numpy as np
-from typing import Dict, Tuple, List, Any, Optional, Union
-from collections import deque
-import time
 import random
+import time
+from typing import Dict, List, Optional, Tuple, Union, Any
+from collections import deque
+import math
 
-from src.model.optimized_network import OptimizedNetwork
 from src.config.hardware_config import HardwareConfig
+from src.agent.core.network import OptimizedNetwork
 from src.agent.core.policy import Policy
-from src.agent.core.value import ValueFunction
+from src.agent.core.value_function import ValueFunction
 from src.agent.core.memory import Memory
 from src.agent.core.updater import PPOUpdater
 
@@ -36,27 +40,24 @@ class PPOAgent:
         """Initialize the PPO agent.
         
         Args:
-            state_dim: Dimensions of the state space (C, H, W)
-            action_dim: Number of possible actions
-            config: Hardware configuration
-            use_amp: Whether to use automatic mixed precision (FP16)
+            state_dim: Dimensions of the state space
+            action_dim: Dimensions of the action space
+            config: Hardware configuration with device preferences
+            use_amp: Whether to use automatic mixed precision
         """
-        # Basic setup
-        self.config = config or HardwareConfig()
-        self.device = self.config.get_device()
-        self.dtype = self.config.get_dtype()
+        # Hardware setup
+        if config is None:
+            config = HardwareConfig()
         
-        # Mixed precision setup
-        self.use_amp = use_amp and torch.cuda.is_available()
+        self.device = torch.device(config.device if hasattr(config, "device") else "cpu")
+        self.use_amp = use_amp and 'cuda' in str(self.device)
+        
         if self.use_amp:
-            logger.info("Using automatic mixed precision (FP16)")
-            self.scaler = torch.cuda.amp.GradScaler()
-        else:
-            self.scaler = None
+            logger.info("Using automatic mixed precision (AMP)")
         
-        # State and action dimensions
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+        # Print logging info on initialization
+        device_name = torch.cuda.get_device_name(self.device) if 'cuda' in str(self.device) else "CPU"
+        logger.critical(f"Initializing PPO agent on {self.device} ({device_name})")
         
         # Create neural network with proper parameters based on state shape
         if isinstance(state_dim, tuple):
@@ -102,7 +103,7 @@ class PPOAgent:
         # Agent parameters
         self.gamma = 0.99
         self.gae_lambda = 0.95
-        self.update_frequency = 32  # Update policy every 32 steps
+        self.update_frequency = 32
         
         # Apply parameters from config if available
         if config:
@@ -119,10 +120,24 @@ class PPOAgent:
         self.steps_taken = 0
         self.episodes_completed = 0
         
-        # Add menu action tracking to help avoid menu transitions
+        # Track if we're currently in a menu - initially assume we're not
+        self.in_menu = False
+        
+        # Enhanced menu action tracking with severe penalties
         self.menu_actions = {}  # Maps action index to count of menu occurrences
         self.menu_action_memory = 50  # Remember the last 50 menu occurrences
-        self.menu_penalty_factor = 0.5  # Penalty factor for actions that cause menus
+        self.menu_penalty_factor = 5.0  # Increased penalty factor for actions that cause menus
+        
+        # Track specific menu-causing actions
+        self.menu_entry_causes = {
+            'escape_key': [],  # Track actions that involved ESC key and caused menu entry
+            'gear_icon': [],   # Track actions that involved potential gear icon clicks
+            'unknown': []      # Track other actions that somehow caused menu entry
+        }
+        self.menu_exit_rewards = []  # Track actions that successfully exited menus
+        
+        # Maximum number of entries to remember per category
+        self.max_menu_cause_entries = 25
         
         # Initialize LSTM hidden state
         self.hidden_state = None
@@ -141,168 +156,62 @@ class PPOAgent:
         
         logger.info(f"Initialized PPO agent with state_dim={state_dim}, action_dim={action_dim}, device={self.device}")
     
-    def select_action(self, state, deterministic=False):
-        """Select an action based on the current state.
+    def select_action(self, state, deterministic=False, info=None):
+        """Select an action based on current state.
         
         Args:
-            state: Current state
-            deterministic: Whether to select the best action deterministically
+            state: Current state observation
+            deterministic: Whether to select the highest probability action
+            info: Additional information from environment for action selection
             
         Returns:
-            dict: Containing action, log_prob, value, and other info
+            Selected action
         """
-        logger.critical(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
-        
-        # Validate state
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, device=self.device).float()
-        
-        # Check for NaN/Inf values in state
-        if torch.isnan(state).any() or torch.isinf(state).any():
-            logger.warning("NaN/Inf detected in state input, replacing with zeros")
-            state = torch.zeros_like(state)
-        
         try:
             with torch.no_grad():
                 # Forward pass through policy network
-                # Pass and update hidden_state for LSTM memory
-                if self.use_lstm:
-                    logger.critical("Using LSTM in action selection")
-                    # Check if hidden state is None or has NaN values
-                    if self.hidden_state is not None:
-                        h, c = self.hidden_state
-                        if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(c).any() or torch.isinf(c).any():
-                            logger.warning("NaN/Inf detected in LSTM hidden state, resetting to None")
-                            self.hidden_state = None
-                            
-                    action_probs, value, next_hidden = self.policy(state, self.hidden_state)
-                    
-                    # Validate LSTM output
-                    if next_hidden is not None:
-                        h, c = next_hidden
-                        if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(c).any() or torch.isinf(c).any():
-                            logger.warning("NaN/Inf detected in LSTM output state, not updating hidden state")
-                            # Don't update hidden state if it has NaN values
-                        else:
-                            # Update hidden state for next time (only if valid)
-                            self.hidden_state = next_hidden
-                else:
-                    action_probs, value, _ = self.policy(state)
+                action_probs, value, next_hidden = self.policy(state, self.hidden_state)
                 
-                # Check for NaN in action_probs
-                if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
-                    logger.warning("NaN/Inf detected in action probabilities, using uniform distribution")
-                    action_probs = torch.ones_like(action_probs) / action_probs.size(-1)
+                # Update hidden state for next time
+                self.hidden_state = next_hidden
+                
+                # Process environment info if provided
+                if info is not None:
+                    self.process_step_info(info)
+                    
+                    # Track if we're currently in a menu
+                    self.in_menu = info.get('in_menu', False)
+                
+                # Apply menu action penalties
+                action_probs = self.adjust_action_probs(action_probs)
+                
+                # Apply action smoothing from parent class
+                action_probs = self._apply_action_smoothing(action_probs)
                 
                 # Create categorical distribution
                 action_distribution = torch.distributions.Categorical(action_probs)
-                
-                # Apply action smoothing
-                raw_action_probs = action_probs.clone()
-                
-                # Apply smoothing for continuous actions
-                if len(self.action_history) > 0 and not deterministic:
-                    action_probs = self._apply_action_smoothing(action_probs)
-                    # Recalculate distribution with smoothed probabilities
-                    action_distribution = torch.distributions.Categorical(action_probs)
                 
                 # Choose action
                 if deterministic:
                     action = torch.argmax(action_probs, dim=1)
                 else:
-                    # Use try-except to handle potential NaN values in distribution
-                    try:
-                        action = action_distribution.sample()
-                    except Exception as e:
-                        logger.error(f"Error sampling from action distribution: {e}")
-                        # Fallback to argmax
-                        action = torch.argmax(action_probs, dim=1)
+                    action = action_distribution.sample()
                 
                 # Store action in history for future smoothing
                 action_item = action.cpu().item()
                 self._update_action_history(action_item)
                 
-                # Get log probability
-                try:
-                    log_prob = action_distribution.log_prob(action)
-                except Exception as e:
-                    logger.error(f"Error computing log probability: {e}")
-                    log_prob = torch.tensor(-10.0, device=self.device)  # Very low log prob to signal issue
-                
-                # Create info dictionary
-                info = {
-                    'action_probs': action_probs,
-                    'action_distribution': action_distribution,
-                    'log_prob': log_prob,
-                    'value': value
-                }
-                
-                # Check if value is NaN
-                if torch.isnan(value).any() or torch.isinf(value).any():
-                    logger.warning("NaN/Inf detected in value, using 0.0")
-                    info['value'] = torch.tensor(0.0, device=self.device)
-                
-                # Update steps counter
-                self.steps_taken += 1
-                
-                # Apply menu action penalty to reduce likelihood of selecting
-                # actions that have frequently led to menus
-                if self.training and hasattr(self, 'get_menu_action_penalty'):
-                    action_probs = info['action_probs'].clone()
-                    
-                    # Apply penalties to actions known to cause menus
-                    for action_idx in range(self.action_dim):
-                        penalty = self.get_menu_action_penalty(action_idx)
-                        if penalty > 0:
-                            action_probs[0, action_idx] *= (1.0 - penalty)
-                            
-                    # Renormalize probabilities
-                    action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
-                    
-                    # Create new distribution
-                    penalized_distribution = torch.distributions.Categorical(action_probs)
-                    
-                    # Sample from penalized distribution
-                    if deterministic:
-                        action = torch.argmax(action_probs, dim=1)
-                    else:
-                        try:
-                            action = penalized_distribution.sample()
-                        except Exception as e:
-                            logger.error(f"Error sampling from penalized distribution: {e}")
-                            action = torch.argmax(action_probs, dim=1)
-                        
-                    # Get log probability from original distribution for learning
-                    log_prob = info['log_prob']
-                
-                # Update last_action and last_state for continuity
+                # Store current value and log probability for update
+                self.last_state = state
                 self.last_action = action_item
-                self.last_state = state.detach()
-                self.last_value = value.item() if torch.numel(value) == 1 else value.view(-1)[0].item()
-                self.last_log_prob = log_prob.item()
+                self.last_value = value
+                self.last_log_prob = action_distribution.log_prob(action)
                 
-                # Return action, log_prob, and value
-                logger.critical(f"Returning action: {action.cpu().item()}, with value: {self.last_value}")
-                return {
-                    'action': action,
-                    'log_prob': log_prob,
-                    'value': value,
-                    'action_probs': action_probs,
-                }
-                
+                return action_item
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            # Return a random action as fallback
-            random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
-            return {
-                'action': random_action,
-                'log_prob': torch.tensor(0.0, device=self.device),
-                'value': torch.tensor(0.0, device=self.device),
-                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim,
-            }
+            # Fallback to random action
+            return random.randint(0, self.action_dim - 1)
     
     def store_experience(self, state: torch.Tensor, 
                         action: torch.Tensor, 
@@ -725,49 +634,111 @@ class PPOAgent:
         
         logger.info("Agent state loaded successfully")
     
-    def update_menu_action_tracking(self, action):
-        """Track which actions tend to cause menu transitions.
+    def process_step_info(self, info):
+        """Process additional information from environment step.
         
         Args:
-            action: The action that led to a menu
-        """
-        if isinstance(action, torch.Tensor):
-            action = action.item()
-            
-        # Initialize counter if this is the first time seeing this action
-        if action not in self.menu_actions:
-            self.menu_actions[action] = deque(maxlen=self.menu_action_memory)
-            
-        # Add timestamp to track recency
-        self.menu_actions[action].append(time.time())
-        
-        logger.info(f"Updated menu action tracking for action {action}: {len(self.menu_actions[action])} occurrences")
-    
-    def get_menu_action_penalty(self, action):
-        """Get penalty for actions that frequently cause menus.
-        
-        Args:
-            action: The action to check
+            info: Information dict from environment step
             
         Returns:
-            float: Penalty factor (0 to menu_penalty_factor)
+            Modified action probabilities with penalties applied
         """
-        if isinstance(action, torch.Tensor):
-            action = action.item()
+        try:
+            # Check if menu-related info is available
+            if 'menu_entered' in info and info['menu_entered']:
+                # Extract menu entry cause if available
+                cause = 'unknown'
+                # Check for specific known causes
+                if 'is_escape_action' in info and info['is_escape_action']:
+                    cause = 'escape_key'
+                elif 'is_potential_gear_click' in info and info['is_potential_gear_click']:
+                    cause = 'gear_icon'
+                
+                # Get the action that caused menu entry
+                action_idx = self.last_action if hasattr(self, 'last_action') else -1
+                
+                # Track this action in appropriate category
+                if cause in self.menu_entry_causes:
+                    self.menu_entry_causes[cause].append(action_idx)
+                    # Keep only the most recent entries
+                    if len(self.menu_entry_causes[cause]) > self.max_menu_cause_entries:
+                        self.menu_entry_causes[cause].pop(0)
+                    
+                    logger.warning(f"Tracked menu-causing action {action_idx} as '{cause}'")
+                
+                # Track in overall menu actions dict
+                if action_idx >= 0:
+                    if action_idx in self.menu_actions:
+                        self.menu_actions[action_idx] += 1
+                    else:
+                        self.menu_actions[action_idx] = 1
             
-        if action not in self.menu_actions or len(self.menu_actions[action]) == 0:
-            return 0.0
+            # Track successful menu exits
+            if 'menu_exited' in info and info['menu_exited']:
+                if 'is_escape_action' in info and info['is_escape_action']:
+                    # Get the action that successfully exited the menu
+                    action_idx = self.last_action if hasattr(self, 'last_action') else -1
+                    if action_idx >= 0:
+                        self.menu_exit_rewards.append(action_idx)
+                        # Keep only the most recent entries
+                        if len(self.menu_exit_rewards) > self.max_menu_cause_entries:
+                            self.menu_exit_rewards.pop(0)
+                        
+                        logger.info(f"Tracked menu exit action {action_idx}")
             
-        # Calculate decay based on time since last occurrence
-        now = time.time()
-        recent_count = sum(1 for t in self.menu_actions[action] if now - t < 300)  # Count occurrences in last 5 minutes
+            # Return success
+            return True
+        except Exception as e:
+            logger.error(f"Error processing step info: {e}")
+            return False
+    
+    def adjust_action_probs(self, action_probs):
+        """Adjust action probabilities to penalize menu-causing actions.
         
-        # Normalize by memory size
-        recent_ratio = recent_count / self.menu_action_memory
-        
-        # Return penalty scaled by factor
-        return recent_ratio * self.menu_penalty_factor 
-
+        Args:
+            action_probs: Original action probabilities
+            
+        Returns:
+            Modified action probabilities with penalties applied
+        """
+        try:
+            # Clone the probabilities tensor to avoid modifying the original
+            if isinstance(action_probs, torch.Tensor):
+                adjusted_probs = action_probs.clone()
+            else:
+                return action_probs
+            
+            # Apply penalties for menu-causing actions
+            with torch.no_grad():
+                for cause, actions in self.menu_entry_causes.items():
+                    for action_idx in actions:
+                        if action_idx >= 0 and action_idx < action_probs.shape[1]:
+                            # Apply severe penalties for escape key and gear icon clicks
+                            penalty = self.menu_penalty_factor
+                            if cause in ['escape_key', 'gear_icon']:
+                                # More severe penalty for these specific actions
+                                penalty = self.menu_penalty_factor * 2.0
+                            
+                            # Reduce probability of this action
+                            adjusted_probs[0, action_idx] *= max(0.01, 1.0 - penalty / 10.0)
+                
+                # Apply bonuses for successful menu exit actions
+                for action_idx in self.menu_exit_rewards:
+                    if action_idx >= 0 and action_idx < action_probs.shape[1]:
+                        # Small bonus for actions that successfully exited menus
+                        # But only apply this if we're actually in a menu
+                        if self.in_menu:
+                            adjusted_probs[0, action_idx] *= 1.2  # 20% bonus
+                
+                # Renormalize the probabilities
+                if adjusted_probs.sum() > 0:
+                    adjusted_probs = adjusted_probs / adjusted_probs.sum(dim=1, keepdim=True)
+            
+            return adjusted_probs
+        except Exception as e:
+            logger.error(f"Error adjusting action probabilities: {e}")
+            return action_probs
+    
     def reset(self):
         """Reset agent state for a new episode."""
         logger.critical("Resetting agent state for new episode")
@@ -792,6 +763,9 @@ class PPOAgent:
         self.last_state = None
         self.last_value = None
         self.last_log_prob = None
+        
+        # We don't reset menu_actions tracking between episodes
+        # This helps the agent learn which actions cause menus across episodes
         
         # Increment episode counter
         self.episodes_completed += 1
@@ -865,46 +839,3 @@ class PPOAgent:
         # Track continuous actions separately
         if action in self.continuous_actions:
             self.last_continuous_action = action
-        
-    def update_menu_action_tracking(self, action):
-        """Track which actions tend to cause menu transitions.
-        
-        Args:
-            action: The action that led to a menu
-        """
-        if isinstance(action, torch.Tensor):
-            action = action.item()
-            
-        # Initialize counter if this is the first time seeing this action
-        if action not in self.menu_actions:
-            self.menu_actions[action] = deque(maxlen=self.menu_action_memory)
-            
-        # Add timestamp to track recency
-        self.menu_actions[action].append(time.time())
-        
-        logger.info(f"Updated menu action tracking for action {action}: {len(self.menu_actions[action])} occurrences")
-    
-    def get_menu_action_penalty(self, action):
-        """Get penalty for actions that frequently cause menus.
-        
-        Args:
-            action: The action to check
-            
-        Returns:
-            float: Penalty factor (0 to menu_penalty_factor)
-        """
-        if isinstance(action, torch.Tensor):
-            action = action.item()
-            
-        if action not in self.menu_actions or len(self.menu_actions[action]) == 0:
-            return 0.0
-            
-        # Calculate decay based on time since last occurrence
-        now = time.time()
-        recent_count = sum(1 for t in self.menu_actions[action] if now - t < 300)  # Count occurrences in last 5 minutes
-        
-        # Normalize by memory size
-        recent_ratio = recent_count / self.menu_action_memory
-        
-        # Return penalty scaled by factor
-        return recent_ratio * self.menu_penalty_factor 

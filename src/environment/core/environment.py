@@ -29,7 +29,21 @@ from src.environment.input.actions import InputSimulator
 logger = logging.getLogger(__name__)
 
 class Environment:
-    """Core environment interface for Cities: Skylines 2."""
+    """Environment class for interacting with Cities: Skylines 2.
+    
+    The Environment class handles the interaction with the game environment.
+    It provides methods for starting and stopping the environment, executing actions,
+    and retrieving observations and rewards.
+    
+    The reward system has been enhanced to specifically deter menu access:
+    - Severe penalty (-5.0) for entering a menu (via ESC key or gear icon)
+    - Small reward (+0.5) for exiting a menu using the ESC key
+    - Penalty (-2.0) for taking any non-ESC actions while in a menu
+    - Small penalty (-1.0) for actions similar to ones that previously caused menu entry
+    
+    This design aims to train the agent to avoid menu interactions entirely, and if menus
+    are accidentally accessed, to exit them immediately using the ESC key.
+    """
     
     def __init__(self, 
                  config: Optional[HardwareConfig] = None, 
@@ -83,7 +97,10 @@ class Environment:
         # Initialize the core components
         self.observation_manager = ObservationManager(config=self.config, mock_mode=mock_mode)
         self._action_space_manager = ActionSpace(observation_manager=self.observation_manager)
-        self.game_state = GameState()
+        self.game_state = GameState(
+            enabled=not self.mock_mode,
+            mock_mode=self.mock_mode
+        )
         self.performance_monitor = PerformanceMonitor(config=self.config)
         
         # Get references to key components from observation manager
@@ -174,6 +191,13 @@ class Environment:
         logger.critical(f"Initializing with frame stack size: {self.frame_stack_size}")
         self.frame_buffer = deque(maxlen=self.frame_stack_size)
         
+        # Menu handling state tracking
+        self.previous_menu_state = False
+        self._last_menu_entry_cause = None  # Track what caused menu entry: 'escape_key', 'gear_icon', or 'unknown'
+        self.last_menu_entry_time = 0
+        self.last_menu_entry_action_idx = -1
+        self.last_menu_causing_action = None
+        
         logger.info("Environment initialized successfully.")
     
     @property
@@ -240,264 +264,119 @@ class Environment:
         return stacked_observation
     
     def step(self, action_idx: int) -> Tuple[torch.Tensor, float, bool, Dict[str, Any]]:
-        """Execute an action in the environment.
+        """Execute action in the environment and return next observation, reward, done, and info.
         
         Args:
             action_idx: Index of the action to execute
             
         Returns:
-            Tuple: (observation, reward, done, info)
+            Tuple of (observation, reward, done, info)
         """
-        # Get action info from action space
-        action_info = self._action_space_manager.get_action(action_idx)
-        
-        # Add explicit debug logging for the action being executed
-        action_type = action_info.get("type", "unknown")
-        if action_type == "key":
-            key = action_info.get("key", "unknown")
-            duration = action_info.get("duration", 0.1)
-            logger.critical(f"ACTION DEBUG: Executing keyboard action - key={key}, duration={duration}")
-        elif action_type == "mouse":
-            mouse_action = action_info.get("action", "unknown")
-            button = action_info.get("button", "left")
-            position = action_info.get("position", None)
-            direction = action_info.get("direction", None)
-            logger.critical(f"ACTION DEBUG: Executing mouse action - action={mouse_action}, button={button}, position={position}, direction={direction}")
-        else:
-            logger.critical(f"ACTION DEBUG: Executing action of type: {action_type}")
-            
-        logger.critical(f"FULL ACTION INFO: {action_info}")
+        start_time = time.time()
         
         # Update step counter
         self.steps_taken += 1
         
-        # Check for game issues first
-        if not self.check_game_state():
-            # If game has issues, return a negative reward and observation that indicates an error
+        # Reset fail count if we're over the threshold
+        if self.consecutive_errors >= self.max_consecutive_errors:
+            logger.warning(f"Exceeded max consecutive errors ({self.max_consecutive_errors}). Resetting environment.")
+            self.reset()
             observation = self.get_observation()
-            reward = -1.0  # Penalty for game issues
-            done = self.steps_taken >= self.max_steps or self.consecutive_errors >= self.max_consecutive_errors
-            info = {
-                'error': True,
-                'error_type': 'game_issue',
-                'steps': self.steps_taken,
-                'action': action_idx,
-                'success': False,
-                'in_menu': False,
-                'focus_success': False,
-                'action_retries': 0,
-                'fps': self.performance_monitor.get_fps(),
-                'error_stats': self.error_recovery.get_error_stats() if self.consecutive_errors > 0 else {},
-                'action_stats': self.get_action_stats()
-            }
-            return observation, reward, done, info
+            return observation, -1.0, True, {"action_success": False, "reset": True}
         
-        # Find and focus the game window using the mouse controller directly first
-        # This is more reliable than the error_recovery method
-        logger.critical("FOCUS DEBUG: Attempting to find and focus game window directly...")
-        window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
-        logger.critical(f"FOCUS DEBUG: Window found and focused: {window_found}")
+        # Ensure the game is running and the window is focused
+        if not self._ensure_game_running():
+            # Failed to ensure the game is running
+            self.consecutive_errors += 1
+            observation = self.get_observation()
+            return observation, -1.0, False, {"action_success": False, "game_running": False}
         
-        # As a fallback, try the error_recovery method
-        focus_success = window_found
-        if not window_found and hasattr(self.error_recovery, 'focus_game_window'):
-            logger.critical("FOCUS DEBUG: Attempting to focus using error_recovery fallback...")
-            focus_success = self.error_recovery.focus_game_window()
-            logger.critical(f"FOCUS DEBUG: Focus using error_recovery: {focus_success}")
+        # Ensure window is focused
+        self._ensure_window_focused()
         
-        # Detect if we're in a menu
-        menu_detected = False
-        if hasattr(self, 'check_menu_state'):
-            logger.critical("MENU DEBUG: Checking if in menu...")
-            try:
-                menu_detected = self.check_menu_state()
-                logger.critical(f"MENU DEBUG: In menu: {menu_detected}")
-            except Exception as e:
-                logger.error(f"Error checking menu state: {e}")
+        # Check if we're in a menu before executing the action
+        in_menu_before_action = self.check_menu_state()
+        menu_type_before = self.menu_handler.get_menu_type() if in_menu_before_action else None
         
-        # Try to handle menu if detected
-        if menu_detected and hasattr(self.input_simulator, 'handle_menu_recovery'):
-            logger.critical("MENU DEBUG: Attempting to recover from menu state...")
-            try:
-                menu_recovered = self.input_simulator.handle_menu_recovery(retries=1)
-                logger.critical(f"MENU DEBUG: Menu recovery attempt: {'success' if menu_recovered else 'failed'}")
-            except Exception as e:
-                logger.error(f"Error in menu recovery: {e}")
+        # Get the action to execute
+        action_info = self._action_space_manager.get_action(action_idx)
         
-        # Prepare for action execution
-        success = False
-        action_retries = 0
-        max_action_retries = 3  # Maximum number of retry attempts for failed actions
+        # Check if this action is ESC key or potentially a gear icon click (top-right click)
+        is_escape_action = action_info.get('type') == 'key' and action_info.get('key') == 'escape'
+        is_top_right_click = (action_info.get('type') == 'mouse' and action_info.get('action') == 'click' and
+                            isinstance(action_info.get('position'), tuple) and 
+                            action_info.get('position')[0] > 0.75)
         
-        # Create delay between getting focus and executing action
-        time.sleep(0.5)  # 500ms delay to ensure window has focus
+        # Log the action information
+        if is_escape_action:
+            logger.debug(f"Executing ESCAPE KEY action: {action_info}")
+        elif is_top_right_click:
+            logger.debug(f"Executing POTENTIAL GEAR ICON (top-right) click: {action_info}")
+        else:
+            logger.debug(f"Executing action {action_idx}: {action_info}")
         
-        # Force refocusing before executing action (this is critical!)
-        if not self.mock_mode:
-            logger.critical("FOCUS DEBUG: Ensuring window focus before action execution...")
-            window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
-            logger.critical(f"FOCUS DEBUG: Window find before execution: {'succeeded' if window_found else 'failed'}")
-            time.sleep(0.2)  # Brief delay after focus
+        # Execute the action
+        success, action_results = self.action_executor.execute_action(action_info)
         
-        while not success and action_retries < max_action_retries:
-            try:
-                # Ensure window is focused before each attempt - important for retries
-                if action_retries > 0:
-                    logger.critical(f"FOCUS DEBUG: Re-focusing window before retry {action_retries}")
-                    self.input_simulator.mouse_controller.find_game_window(self.window_title)
-                    time.sleep(0.5)  # Wait a bit more before retry
-                
-                logger.critical(f"ACTION EXEC DEBUG: Attempting to execute action (attempt {action_retries + 1})")
-                
-                # Execute the action
-                if action_type == "key":
-                    if "key" in action_info:
-                        key = action_info["key"]
-                        duration = action_info.get("duration", 0.1)
-                        logger.critical(f"KEY DEBUG: Pressing key {key} for {duration}s")
-                        success = self.action_executor.execute_action("key_press", key=key, duration=duration)
-                    else:
-                        logger.critical("KEY DEBUG: Missing 'key' in action_info")
-                        success = False
-                        
-                elif action_type == "mouse":
-                    if "action" in action_info:
-                        mouse_action = action_info["action"]
-                        
-                        if mouse_action == "click":
-                            if "position" in action_info:
-                                x, y = action_info["position"]
-                                # Convert normalized coordinates to screen coordinates
-                                screen_width, screen_height = self.screen_capture.get_resolution()
-                                x = int(x * screen_width)
-                                y = int(y * screen_height)
-                                logger.critical(f"MOUSE CLICK DEBUG: Clicking at x={x}, y={y}, button={action_info.get('button', 'left')}")
-                                success = self.action_executor.execute_action("mouse_click", x=x, y=y, button=action_info.get("button", "left"))
-                            else:
-                                logger.critical("MOUSE CLICK DEBUG: No position specified, clicking at current position")
-                                success = self.action_executor.execute_action("mouse_click", button=action_info.get("button", "left"))
-                                
-                        elif mouse_action == "scroll":
-                            if "direction" in action_info:
-                                direction = action_info["direction"]
-                                logger.critical(f"MOUSE SCROLL DEBUG: Scrolling {direction}")
-                                success = self.action_executor.execute_action("mouse_scroll", direction=direction)
-                            else:
-                                logger.critical("MOUSE SCROLL DEBUG: Missing 'direction' for scroll")
-                                success = False
-                                
-                        elif mouse_action == "edge_scroll":
-                            if "direction" in action_info:
-                                direction = action_info["direction"]
-                                duration = action_info.get("duration", 0.5)
-                                logger.critical(f"EDGE SCROLL DEBUG: Edge scrolling {direction} for {duration}s")
-                                success = self.action_executor.execute_action("edge_scroll", direction=direction, duration=duration)
-                            else:
-                                logger.critical("EDGE SCROLL DEBUG: Missing 'direction' for edge_scroll")
-                                success = False
-                        else:
-                            logger.critical(f"MOUSE DEBUG: Unknown mouse action: {mouse_action}")
-                            success = False
-                    else:
-                        logger.critical("MOUSE DEBUG: Missing 'action' in mouse action_info")
-                        success = False
-                        
-                elif action_type == "speed":
-                    if "speed" in action_info:
-                        speed = action_info["speed"]
-                        logger.critical(f"SPEED DEBUG: Setting game speed to {speed}")
-                        success = self._set_game_speed(speed)
-                    else:
-                        logger.critical("SPEED DEBUG: Missing 'speed' in action_info")
-                        success = False
-                else:
-                    logger.critical(f"ACTION DEBUG: Unknown action type: {action_type}")
-                    success = False
-                
-                # Check if action was successful
-                logger.critical(f"ACTION EXEC DEBUG: Action execution {'succeeded' if success else 'failed'}")
-                if not success:
-                    logger.warning(f"Action execution failed (attempt {action_retries + 1}/{max_action_retries})")
-                    self.consecutive_errors += 1
-                    
-                    # If this wasn't the last retry, try again
-                    if action_retries < max_action_retries - 1:
-                        action_retries += 1
-                        # Force refocus the window between retries
-                        window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
-                        logger.critical(f"FOCUS DEBUG: Window refocus for retry {'succeeded' if window_found else 'failed'}")
-                        time.sleep(1.0)  # Keep 1.0s delay before retry
-                    else:
-                        break
-                        
-            except Exception as e:
-                logger.critical(f"Error executing action: {e}")
-                import traceback
-                logger.critical(f"Traceback: {traceback.format_exc()}")
-                self.consecutive_errors += 1
-                
-                # If this wasn't the last retry, try again
-                if action_retries < max_action_retries - 1:
-                    action_retries += 1
-                    # Force refocus the window between retries
-                    window_found = self.input_simulator.mouse_controller.find_game_window(self.window_title)
-                    logger.critical(f"FOCUS DEBUG: Window refocus for retry {'succeeded' if window_found else 'failed'}")
-                    time.sleep(1.0)  # Keep 1.0s delay before retry
-                else:
-                    break
+        # Update our internal tracking for consecutive failures
+        self._track_action_result(action_idx, success)
         
-        # Brief delay after action execution before capturing the next observation
-        time.sleep(0.3)
+        # Check menu state after action
+        in_menu_after_action = self.check_menu_state()
+        menu_type_after = self.menu_handler.get_menu_type() if in_menu_after_action else None
         
-        # Get next observation
-        logger.critical("OBSERVATION DEBUG: Getting next observation after action")
-        next_observation = self.get_observation()
+        # Detect menu entry/exit transitions
+        menu_entered = not in_menu_before_action and in_menu_after_action
+        menu_exited = in_menu_before_action and not in_menu_after_action
         
-        # Check for frozen game
-        if hasattr(self.error_recovery, 'check_game_frozen') and self.error_recovery.check_game_frozen(next_observation):
-            logger.warning("Game appears to be frozen, attempting recovery")
-            if self.error_recovery.restart_game():
-                # Game was restarted, get fresh observation
-                next_observation = self.get_observation()
+        # Update specific menu context based on transitions
+        if menu_entered:
+            if is_escape_action:
+                logger.warning("ESC key press caused menu entry")
+                self._last_menu_entry_cause = "escape_key"
+            elif is_top_right_click:
+                logger.warning("Top-right click (likely gear icon) caused menu entry")
+                self._last_menu_entry_cause = "gear_icon"
             else:
-                # Failed to restart, mark as error
-                self.consecutive_errors += 1
+                logger.warning(f"Menu entered after action {action_idx} (unknown cause)")
+                self._last_menu_entry_cause = "unknown"
+                
+        if menu_exited and is_escape_action:
+            logger.info("Successfully exited menu using ESC key")
         
-        # Update state with new observation
-        self.current_frame = next_observation
+        # Add a small delay to ensure that the action is completed
+        time.sleep(self.min_action_delay)
         
-        # Add new observation to frame buffer
-        self.frame_buffer.append(next_observation)
-        
-        # Use stacked observation as state
-        state = self._get_stacked_observation()
+        # Get observation after action
+        observation = self.get_observation()
         
         # Compute reward
-        reward = self._compute_reward(action_info, action_idx, success, menu_detected)
-        logger.critical(f"REWARD DEBUG: Computed reward: {reward}")
+        reward = self._compute_reward(action_info, action_idx, success, in_menu_after_action)
         
-        # Check if episode is done
+        # Check if the episode is done
         done = self.steps_taken >= self.max_steps
         
-        # Reset consecutive errors counter on success
-        if success:
-            self.consecutive_errors = 0
+        # Calculate response time
+        response_time = time.time() - start_time
         
-        # Create info dictionary
+        # Prepare info dictionary
         info = {
-            'steps': self.steps_taken,
-            'action': action_idx,
-            'success': success,
-            'in_menu': menu_detected,
-            'focus_success': focus_success,
-            'action_retries': action_retries,
-            'fps': self.performance_monitor.get_fps(),
-            'error_stats': self.error_recovery.get_error_stats() if self.consecutive_errors > 0 else {},
-            'action_stats': self.get_action_stats()
+            "action_success": success,
+            "in_menu": in_menu_after_action,
+            "menu_type": menu_type_after,
+            "step_count": self.steps_taken,
+            "response_time": response_time,
+            "menu_entered": menu_entered,
+            "menu_exited": menu_exited,
+            "is_escape_action": is_escape_action,
+            "is_potential_gear_click": is_top_right_click
         }
         
-        logger.critical(f"STEP DEBUG: Step completed - success={success}, reward={reward}, done={done}")
-        return state, reward, done, info
+        # Include the action results if available
+        if action_results:
+            info["action_results"] = action_results
+            
+        return observation, reward, done, info
     
     def get_observation(self) -> torch.Tensor:
         """Get the current observation from the environment.
@@ -668,12 +547,79 @@ class Environment:
             if self.consecutive_errors > 0:
                 logger.debug(f"Assigning negative reward due to game issues ({self.consecutive_errors} consecutive errors)")
                 return -0.5 * self.consecutive_errors
+            
+            # Track menu entry/exit state changes
+            menu_state_changed = False
+            previous_menu_state = getattr(self, 'previous_menu_state', False)
+            entered_menu = not previous_menu_state and menu_detected 
+            exited_menu = previous_menu_state and not menu_detected
+            menu_state_changed = entered_menu or exited_menu
+            
+            # Store current menu state for next comparison
+            self.previous_menu_state = menu_detected
+            
+            # Store the action that caused menu entry for future penalty
+            if entered_menu:
+                # Check if the action was ESC key or a potential gear icon click
+                is_escape_action = action_info.get('type') == 'key' and action_info.get('key') == 'escape'
+                is_top_right_click = (action_info.get('type') == 'mouse' and action_info.get('action') == 'click' and
+                                      isinstance(action_info.get('position'), tuple) and 
+                                      action_info.get('position')[0] > 0.75)  # Top-right quadrant of screen
                 
-            # If in menu, give negative reward
+                menu_causing_action = None
+                if is_escape_action:
+                    menu_causing_action = "escape_key"
+                    logger.warning("Agent pressed ESC key and entered menu - severe penalty applied")
+                elif is_top_right_click:
+                    menu_causing_action = "gear_icon"
+                    logger.warning("Agent likely clicked gear icon and entered menu - severe penalty applied")
+                
+                # Store the action that caused menu entry
+                self.last_menu_causing_action = menu_causing_action
+                self.last_menu_entry_action_idx = action_idx
+                self.last_menu_entry_time = time.time()
+                
+                # Severe penalty for entering the menu: -5.0
+                return -5.0
+            
+            # Small positive reward for properly exiting the menu via ESC key
+            if exited_menu:
+                is_escape_action = action_info.get('type') == 'key' and action_info.get('key') == 'escape'
+                
+                if is_escape_action:
+                    logger.info("Agent successfully exited menu using ESC key - small reward applied")
+                    # Small reward: +0.5 for correctly exiting
+                    return 0.5
+            
+            # If in menu, punish any action that's not ESC key
             if menu_detected:
-                logger.debug("Assigning negative reward for being in menu")
-                return -1.0  # Significantly higher penalty to create stronger learning signal
+                is_escape_action = action_info.get('type') == 'key' and action_info.get('key') == 'escape'
                 
+                if not is_escape_action:
+                    # Punish taking non-escape actions while in menu (-2.0)
+                    logger.warning(f"Agent took action {action_idx} while in menu - applying penalty")
+                    return -2.0
+                else:
+                    # Neutral reward for attempting to escape - don't punish this
+                    return 0.0
+            
+            # Check if the current action is similar to one that previously caused menu entry
+            # This helps build causality awareness in the agent
+            if not menu_detected and hasattr(self, 'last_menu_causing_action') and self.last_menu_causing_action:
+                time_since_last_menu = time.time() - getattr(self, 'last_menu_entry_time', 0)
+                
+                if time_since_last_menu < 300:  # Only consider recent menu entries (within 5 minutes)
+                    is_escape_action = action_info.get('type') == 'key' and action_info.get('key') == 'escape'
+                    is_top_right_click = (action_info.get('type') == 'mouse' and action_info.get('action') == 'click' and
+                                        isinstance(action_info.get('position'), tuple) and 
+                                        action_info.get('position')[0] > 0.75)
+                    
+                    if (self.last_menu_causing_action == "escape_key" and is_escape_action) or \
+                       (self.last_menu_causing_action == "gear_icon" and is_top_right_click):
+                        # Apply a smaller penalty for trying an action that previously caused menu entry
+                        logger.warning(f"Agent tried an action that previously caused menu entry - applying small penalty")
+                        return -1.0
+            
             # If action failed, give negative reward
             if not success:
                 logger.debug(f"Assigning negative reward for failed action {action_idx}")
@@ -689,7 +635,7 @@ class Environment:
                 # Use the raw frames directly
                 current_frame = self.observation_manager.get_current_frame()
                 next_frame = self.observation_manager.get_latest_frame()
-                
+            
             # Compute reward based on transition
             try:
                 # Check if frames are available for reward computation
