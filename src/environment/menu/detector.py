@@ -85,7 +85,48 @@ class MenuDetector:
         """
         # In a real implementation, this would load actual template images
         # For now, we'll return an empty dict and rely on visual change detection
-        return {}
+        templates = {}
+        
+        # Try to load logo template for main menu detection
+        try:
+            # Check for template directory
+            template_paths = [
+                os.path.join("menu_templates", "logo_template.png"),  # Default location
+                os.path.join("assets", "templates", "logo_template.png"),  # Alternative location
+                "logo_template.png"  # Fallback to root directory
+            ]
+            
+            for path in template_paths:
+                if os.path.exists(path):
+                    logger.info(f"Loading logo template from {path}")
+                    logo_template = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                    if logo_template is not None:
+                        # Preprocess the template (invert if it's black on white)
+                        logo_template = self._preprocess_template(logo_template)
+                        templates["main_menu_logo"] = logo_template
+                        logger.info(f"Logo template loaded with shape {logo_template.shape}")
+                        break
+        except Exception as e:
+            logger.warning(f"Failed to load logo template: {e}")
+        
+        return templates
+    
+    def _preprocess_template(self, template: np.ndarray) -> np.ndarray:
+        """Preprocess a template image for better matching.
+        
+        Args:
+            template: The template image
+            
+        Returns:
+            Preprocessed template
+        """
+        # Check if template is predominantly dark (logo is black on white)
+        if template.mean() > 127:  # If average is bright (white background)
+            # Invert the template to make it white on black for better matching
+            template = cv2.bitwise_not(template)
+            logger.debug("Inverted template for better matching")
+        
+        return template
     
     def _extract_menu_signatures(self, frame: np.ndarray) -> Dict[str, np.ndarray]:
         """Extract signature regions from frame for each menu type.
@@ -165,14 +206,43 @@ class MenuDetector:
         try:
             # Try template matching if we have templates
             if self.menu_templates:
+                # Convert current frame to grayscale if needed for template matching
+                current_frame_gray = current_frame
+                if len(current_frame.shape) == 3 and current_frame.shape[2] == 3:
+                    current_frame_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+                
                 for menu_type, template in self.menu_templates.items():
-                    # Simple template matching
-                    result = cv2.matchTemplate(current_frame, template, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, _ = cv2.minMaxLoc(result)
-                    
-                    threshold = self.MENU_TYPES[menu_type]["threshold"]
-                    if max_val > threshold:
-                        return True, menu_type, max_val
+                    try:
+                        # If "logo" in menu_type, we're looking for a logo specifically
+                        if "logo" in menu_type.lower():
+                            # Make sure template and frame have same number of channels
+                            if len(template.shape) != len(current_frame_gray.shape):
+                                if len(template.shape) == 2:  # Grayscale template
+                                    if len(current_frame_gray.shape) == 3:
+                                        current_frame_gray = cv2.cvtColor(current_frame_gray, cv2.COLOR_BGR2GRAY)
+                                else:  # Color template with grayscale frame
+                                    template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                            
+                            # Apply template matching
+                            result = cv2.matchTemplate(current_frame_gray, template, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, _ = cv2.minMaxLoc(result)
+                            
+                            # Use a slightly higher threshold for logo detection (0.8)
+                            logo_threshold = 0.8
+                            if max_val > logo_threshold:
+                                logger.info(f"Logo detected with confidence {max_val:.2f}")
+                                return True, "main_menu", max_val
+                        else:
+                            # Standard template matching for other templates
+                            result = cv2.matchTemplate(current_frame, template, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, _ = cv2.minMaxLoc(result)
+                            
+                            threshold = self.MENU_TYPES.get(menu_type, {"threshold": 0.75})["threshold"]
+                            if max_val > threshold:
+                                return True, menu_type, max_val
+                    except Exception as e:
+                        logger.warning(f"Error matching template {menu_type}: {e}")
+                        continue
             
             # Visual analysis approach
             # Extract regions that are characteristic of menus
@@ -301,3 +371,42 @@ class MenuDetector:
             Detection confidence
         """
         return self.menu_detection_confidence 
+    
+    def detect_logo(self, frame: np.ndarray) -> Tuple[bool, float]:
+        """Check if logo is detected in the frame.
+        
+        Args:
+            frame: Frame to check
+            
+        Returns:
+            Tuple of (logo_detected, confidence)
+        """
+        try:
+            # Convert frame to grayscale if needed
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:
+                frame_gray = frame
+            
+            # Get the main menu logo template
+            logo_template = self.menu_templates.get("main_menu_logo")
+            if logo_template is None:
+                logger.debug("No logo template available for detection")
+                return False, 0.0
+            
+            # Match template
+            result = cv2.matchTemplate(frame_gray, logo_template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            
+            # Logo is detected if confidence exceeds threshold
+            logo_threshold = 0.8
+            logo_detected = max_val > logo_threshold
+            
+            if logo_detected:
+                logger.debug(f"Logo detected with confidence {max_val:.2f} at {max_loc}")
+            
+            return logo_detected, max_val
+            
+        except Exception as e:
+            logger.error(f"Error in logo detection: {e}")
+            return False, 0.0 

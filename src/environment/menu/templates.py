@@ -332,4 +332,81 @@ class MenuTemplateManager:
             return self.update_template(menu_type, template, signature_regions, threshold)
         else:
             # Add new template
-            return self.add_template(menu_type, template, signature_regions, threshold) 
+            return self.add_template(menu_type, template, signature_regions, threshold)
+    
+    def create_logo_template(self, image_path=None, frame=None, region=None):
+        """Create a logo template for menu detection from an image or frame.
+        
+        Args:
+            image_path: Path to logo image (if available)
+            frame: Screen capture to extract logo from (if image_path not provided)
+            region: Region to extract from frame (normalized coordinates x1,y1,x2,y2)
+            
+        Returns:
+            bool: Whether the template was created successfully
+        """
+        try:
+            template = None
+            
+            # If image path is provided, load the image
+            if image_path and os.path.exists(image_path):
+                template = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+                if template is None:
+                    logger.error(f"Failed to load logo image from {image_path}")
+                    return False
+            
+            # If frame is provided and no image path or loading failed
+            elif frame is not None:
+                if region is not None:
+                    # Extract the region from the frame
+                    x1, y1, x2, y2 = region
+                    h, w = frame.shape[:2]
+                    
+                    # Convert normalized coordinates to pixel values
+                    x1_px, y1_px = int(x1 * w), int(y1 * h)
+                    x2_px, y2_px = int(x2 * w), int(y2 * h)
+                    
+                    # Extract the region
+                    template = frame[y1_px:y2_px, x1_px:x2_px].copy()
+                else:
+                    # Use the whole frame
+                    template = frame.copy()
+            
+            if template is None:
+                logger.error("No valid source for logo template")
+                return False
+            
+            # Convert to grayscale if it's a color image
+            if len(template.shape) == 3 and template.shape[2] == 3:
+                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            else:
+                template_gray = template
+            
+            # Invert the template if it's dark text on light background
+            if template_gray.mean() > 127:
+                template_gray = cv2.bitwise_not(template_gray)
+            
+            # Save the template
+            template_path = self.templates_dir / "logo_template.png"
+            cv2.imwrite(str(template_path), template_gray)
+            
+            # Add to templates dictionary
+            self.templates["main_menu_logo"] = template_gray
+            
+            # Add metadata
+            self.metadata["main_menu_logo"] = {
+                "type": "logo",
+                "threshold": 0.8,
+                "timestamp": str(template_path.stat().st_mtime),
+                "preprocessing": "grayscale,inverted" if template_gray.mean() < 127 else "grayscale"
+            }
+            
+            # Save metadata
+            self._save_metadata()
+            
+            logger.info(f"Created logo template at {template_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating logo template: {e}")
+            return False 

@@ -273,4 +273,84 @@ class MenuHandler:
         Returns:
             Tuple of (menu_detected, menu_type, confidence)
         """
-        return self.detector.detect_menu(current_frame) 
+        return self.detector.detect_menu(current_frame)
+    
+    def create_logo_template_from_screenshot(self, region=None):
+        """Create a logo template from the current screen for menu detection.
+        
+        Args:
+            region: Optional normalized region to extract (x1,y1,x2,y2)
+            
+        Returns:
+            bool: Whether the template was created successfully
+        """
+        try:
+            # Capture current frame
+            current_frame = self.observation_manager.capture_frame()
+            if current_frame is None:
+                logger.warning("Failed to capture frame for logo template creation")
+                return False
+            
+            # Convert to array if it's a tensor
+            if isinstance(current_frame, torch.Tensor):
+                current_frame = current_frame.cpu().numpy()
+                
+                # Convert from CxHxW to HxWxC format if needed
+                if current_frame.shape[0] == 3 and current_frame.ndim == 3:
+                    current_frame = np.transpose(current_frame, (1, 2, 0))
+                
+                # Convert to uint8 if needed
+                if current_frame.dtype != np.uint8:
+                    current_frame = (current_frame * 255).astype(np.uint8)
+            
+            # Use template manager to create logo template
+            success = self.template_manager.create_logo_template(
+                frame=current_frame,
+                region=region or (0.1, 0.05, 0.5, 0.15)  # Default to top-left area where logo is typically found
+            )
+            
+            if success:
+                logger.info("Created logo template from screenshot")
+                
+                # Reload templates in detector
+                self.detector.menu_templates = self.detector._load_menu_templates()
+                return True
+            else:
+                logger.warning("Failed to create logo template")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error creating logo template from screenshot: {e}")
+            return False
+    
+    def detect_logo(self) -> Tuple[bool, float]:
+        """Check if the logo is detected in the current frame.
+        
+        Returns:
+            Tuple of (logo_detected, confidence)
+        """
+        try:
+            # Capture current frame
+            current_frame = self.observation_manager.capture_frame()
+            if current_frame is None:
+                logger.warning("Failed to capture frame for logo detection")
+                return False, 0.0
+            
+            # Convert to array if it's a tensor
+            if isinstance(current_frame, torch.Tensor):
+                current_frame = current_frame.cpu().numpy()
+                
+                # Convert from CxHxW to HxWxC format if needed
+                if current_frame.shape[0] == 3 and current_frame.ndim == 3:
+                    current_frame = np.transpose(current_frame, (1, 2, 0))
+                
+                # Convert to uint8 if needed
+                if current_frame.dtype != np.uint8:
+                    current_frame = (current_frame * 255).astype(np.uint8)
+            
+            # Delegate to detector
+            return self.detector.detect_logo(current_frame)
+            
+        except Exception as e:
+            logger.error(f"Error checking for logo: {e}")
+            return False, 0.0 
