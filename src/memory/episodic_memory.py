@@ -309,6 +309,14 @@ class MANNController(nn.Module):
         # Ensure input is on correct device
         state_embedding = state_embedding.to(self.device)
         
+        # Get batch size if present
+        batch_size = state_embedding.shape[0] if len(state_embedding.shape) > 1 else 1
+        
+        # Reshape to 2D if needed
+        if len(state_embedding.shape) > 2:
+            original_shape = state_embedding.shape
+            state_embedding = state_embedding.view(batch_size, -1)
+        
         # Retrieve relevant memories
         memories, scores = self.memory.read(state_embedding, top_k=5)
         
@@ -342,7 +350,13 @@ class MANNController(nn.Module):
         else:
             # No memories retrieved, use fallback
             self.fallback_count += 1
-            output = self.fallback_projection(state_embedding)
+            try:
+                output = self.fallback_projection(state_embedding)
+            except RuntimeError as e:
+                # Handle dimension mismatch error with a safe fallback
+                logger.warning(f"Fallback projection error: {e}, using identity mapping")
+                # Use identity mapping as safest fallback
+                output = state_embedding.clone()
         
         return output
     

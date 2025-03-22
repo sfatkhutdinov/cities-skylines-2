@@ -99,6 +99,13 @@ class WorldModelCNN(nn.Module):
         if frame.max() > 1.0:
             frame = frame / 255.0
             
+        # Ensure correct channel order for CNN processing
+        # Check if input has channels last format [B, H, W, C] and correct to [B, C, H, W]
+        if len(frame.shape) == 4 and frame.shape[-1] == 3:
+            frame = frame.permute(0, 3, 1, 2)
+        elif len(frame.shape) == 3 and frame.shape[-1] == 3:
+            frame = frame.permute(2, 0, 1).unsqueeze(0)
+            
         # Encode
         embedding = self.encoder(frame)
         return embedding

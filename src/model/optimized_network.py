@@ -99,51 +99,73 @@ class OptimizedNetwork(nn.Module):
                  hidden_size=256, feature_size=512, frame_size=(84, 84),
                  frames_to_stack=1, use_lstm=True, lstm_hidden_size=256, num_layers=1,
                  device='cuda', use_attention=False, is_visual_input=True):
-        """
-        Initialize the network.
+        """Initialize the optimized network.
+        
+        Args:
+            input_channels: Number of input channels (in case of images)
+            num_actions: Number of actions in the action space
+            conv_channels: Tuple of convolutional channels
+            hidden_size: Size of hidden layers
+            feature_size: Size of feature representation
+            frame_size: Size of input frames (height, width)
+            frames_to_stack: Number of frames to stack
+            use_lstm: Whether to use LSTM for temporal dependencies
+            lstm_hidden_size: Size of LSTM hidden state
+            num_layers: Number of LSTM layers
+            device: Computation device
+            use_attention: Whether to use attention mechanism
+            is_visual_input: Whether input is visual (images) or vector
         """
         super(OptimizedNetwork, self).__init__()
         
-        self.input_channels = input_channels
-        self.num_actions = num_actions
-        self.hidden_size = hidden_size
-        self.feature_size = feature_size
-        self.frame_size = frame_size
-        self.frames_to_stack = frames_to_stack
         self.device = device
         self.use_lstm = use_lstm
-        self.lstm_hidden_size = lstm_hidden_size
-        self.num_layers = num_layers
-        self.use_attention = use_attention
+        self.num_actions = num_actions
         self.is_visual_input = is_visual_input
+        self.frames_to_stack = frames_to_stack
         
-        # Flag to control batch norm behavior for single samples
-        self.eval_bn_in_single_sample = True
+        # NaN/Inf detection and tracking dictionary
+        self.nan_inf_stats = {
+            'nan_occurrences': 0,
+            'inf_occurrences': 0,
+            'total_forwards': 0,
+            'last_healthy_weights': None,
+            'weight_reset_count': 0,
+            'consecutive_nan_count': 0
+        }
         
-        # Calculate effective input channels (for stacked frames)
-        self.effective_input_channels = input_channels * frames_to_stack if is_visual_input else input_channels
-        logger.critical(f"Initializing network with effective input channels: {self.effective_input_channels} (input_channels={input_channels}, frames_to_stack={frames_to_stack})")
-
-        # Build the visual encoder (convolutional layers)
+        # Set max gradient norm for clipping
+        self.max_grad_norm = 1.0
+        
+        # Weight decay for regularization
+        self.weight_decay = 1e-5
+        
+        # Add BatchNorm for stabilization
+        self.use_batch_norm = True
+        
+        # Store frame size for calculating conv output
+        self.frame_height, self.frame_width = frame_size
+        
         if is_visual_input:
+            # Build convolutional layers for processing visual input
             self.conv_layers = self._build_conv_layers(conv_channels)
-        
-        # Calculate the size of the features after convolution
-        if is_visual_input:
-            # Use effective input channels that includes frame stacking
-            dummy_input = torch.zeros(1, self.effective_input_channels, frame_size[0], frame_size[1])
-            with torch.no_grad():
-                x = self.conv_layers(dummy_input)
-                conv_output_size = x.view(1, -1).size(1)
-            logger.critical(f"Calculated conv output size: {conv_output_size} from dummy input shape {dummy_input.shape}")
+            
+            # Calculate the output size of the convolutional layers
+            conv_output_size = self._calculate_conv_output_size(
+                self.frame_height, self.frame_width, input_channels * frames_to_stack, conv_channels
+            )
+            
+            # Input size for shared layers
+            shared_input_size = conv_output_size
         else:
-            # For non-visual input, use input size directly
-            conv_output_size = input_channels
+            # For vector input, input size is just the input dimension
+            shared_input_size = input_channels * frames_to_stack
+            self.conv_layers = None
+            
+        # Shared layers
+        self.shared_layers = self._build_shared_layers(shared_input_size, feature_size)
         
-        # Build shared fully connected layers
-        self.shared_layers = self._build_shared_layers(conv_output_size, feature_size)
-        
-        # Build LSTM if requested
+        # LSTM for temporal dependencies
         if use_lstm:
             self.lstm = nn.LSTM(
                 input_size=feature_size,
@@ -151,52 +173,58 @@ class OptimizedNetwork(nn.Module):
                 num_layers=num_layers,
                 batch_first=True
             )
-            
-            # Add attention mechanism if requested
-            if use_attention:
-                # Modified attention mechanism that preserves the feature dimensions
-                self.attention = nn.Sequential(
-                    nn.Linear(lstm_hidden_size, lstm_hidden_size),
-                    nn.Tanh(),
-                    nn.Linear(lstm_hidden_size, lstm_hidden_size)
-                )
-            
-            self.output_size = lstm_hidden_size
+            self.lstm_hidden_size = lstm_hidden_size
+            feature_output_size = lstm_hidden_size
         else:
             self.lstm = None
-            self.output_size = feature_size
+            feature_output_size = feature_size
         
+        # Attention mechanism
+        if use_attention:
+            self.attention = SelfAttention(embed_dim=feature_output_size)
+        else:
+            self.attention = None
+            
         # Policy head (actor)
-        self.policy_head = nn.Sequential(
-            nn.Linear(self.output_size, 256),
-            nn.BatchNorm1d(256, track_running_stats=False),  # Add batch norm with track_running_stats=False
-            nn.ReLU(),
-            nn.Linear(256, num_actions)
-        )
+        if self.use_batch_norm:
+            self.policy_head = nn.Sequential(
+                nn.Linear(feature_output_size, hidden_size),
+                nn.BatchNorm1d(hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, num_actions)
+            )
+            
+            # Value head (critic)
+            self.value_head = nn.Sequential(
+                nn.Linear(feature_output_size, hidden_size),
+                nn.BatchNorm1d(hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, 1)
+            )
+        else:
+            self.policy_head = nn.Sequential(
+                nn.Linear(feature_output_size, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, num_actions)
+            )
+            
+            # Value head (critic)
+            self.value_head = nn.Sequential(
+                nn.Linear(feature_output_size, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, 1)
+            )
         
-        # Value head (critic)
-        self.value_head = nn.Sequential(
-            nn.Linear(self.output_size, 256),
-            nn.BatchNorm1d(256, track_running_stats=False),  # Add batch norm with track_running_stats=False
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+        # Move model to device
+        self.to(device)
         
         # Initialize weights
         self.apply(self._init_weights)
         
-        # LSTM state
-        self.hidden = None
+        # Save initial weights as fallback
+        self.save_healthy_weights()
         
-        # NaN detection and handling
-        self.nan_occurrences = {
-            'action_logits': 0,
-            'value': 0,
-            'after_softmax': 0
-        }
-        
-        # Move to the specified device
-        self.to(device)
+        logger.critical(f"Initialized OptimizedNetwork on device {device}")
 
     def _build_conv_layers(self, conv_channels):
         """
@@ -265,158 +293,138 @@ class OptimizedNetwork(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
+    def _calculate_conv_output_size(self, height, width, input_channels, conv_channels):
+        """Calculate the output size of the convolutional layers.
+        
+        Args:
+            height: Height of input
+            width: Width of input
+            input_channels: Number of input channels
+            conv_channels: Tuple of convolutional channel sizes
+            
+        Returns:
+            int: Size of flattened output
+        """
+        # Simple estimation based on common architecture
+        # Adjust if your conv architecture is different
+        h, w = height, width
+        
+        # First conv layer: 8x8 kernel, stride 4
+        h = (h - 8) // 4 + 1
+        w = (w - 8) // 4 + 1
+        
+        # Second conv layer: 4x4 kernel, stride 2
+        h = (h - 4) // 2 + 1
+        w = (w - 4) // 2 + 1
+        
+        # Third conv layer: 3x3 kernel, stride 1
+        h = (h - 3) // 1 + 1
+        w = (w - 3) // 1 + 1
+        
+        # Size of flattened output
+        return conv_channels[-1] * h * w
+
     def forward(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Forward pass through the network.
         
         Args:
-            x (torch.Tensor): Input state tensor
-            hidden_state: Optional hidden state for LSTM (h, c)
+            x (torch.Tensor): Input tensor
+            hidden_state (tuple, optional): Previous hidden state for LSTM
             
         Returns:
             Tuple: (action_probs, value, next_hidden_state)
         """
-        logger.debug(f"Network forward pass: input shape={x.shape}")
-        
-        # Detect batch size for batch norm handling
-        batch_size = x.size(0)
-        single_sample = batch_size == 1
-        
-        # Temporarily set to eval mode for batch norm if single sample
-        training_mode = self.training
-        if single_sample and training_mode:
-            self.eval()
-            
         try:
-            # Check if the input is already a feature vector
-            if len(x.shape) == 2:
-                logger.critical(f"Network forward called with input shape: {x.shape}, device: {x.device}, dtype: {x.dtype}")
-                logger.critical(f"Input appears to be a feature vector with shape {x.shape}, skipping conv layers")
+            # Track forward passes
+            self.nan_inf_stats['total_forwards'] += 1
+            
+            # Ensure input is on the correct device
+            x = x.to(self.device)
+            
+            # Store batch size
+            batch_size = x.size(0) if len(x.shape) > 1 else 1
+            
+            # Check for single sample (which may cause issues with BatchNorm)
+            single_sample = batch_size == 1
+            
+            # If single sample and network is in training mode, temporarily switch to eval
+            training_mode = self.training
+            if single_sample and training_mode:
+                self.eval()
+            
+            logger.debug(f"Network forward pass: input shape={x.shape}")
+            
+            # Process based on input type
+            if self.is_visual_input:
+                # Check if we need to add batch dimension
+                if len(x.shape) == 3:  # [C, H, W]
+                    x = x.unsqueeze(0)  # Add batch dimension
                 
-                # Input is already features from encoder, bypass convolution
-                features = x
-                # Check if feature dimensions match the expected shared layer output
-                if features.shape[1] == self.feature_size:
-                    logger.critical(f"Feature vector already matches feature_size ({self.feature_size}), skipping shared layers")
-                    logger.critical(f"Skipping shared layers, features already match expected size: {features.shape}")
-                    encoder_features = features
-                else:
-                    # Process through shared layers
-                    if single_sample:
-                        # Apply shared layers manually without batch norm for single sample
-                        for i, layer in enumerate(self.shared_layers):
-                            if isinstance(layer, nn.BatchNorm1d):
-                                continue  # Skip batch norm for single sample
-                            features = layer(features)
-                            # Apply ReLU after linear layers
-                            if isinstance(layer, nn.Linear) and i < len(self.shared_layers) - 1:
-                                features = F.relu(features)
-                        encoder_features = features
-                    else:
-                        # Normal path with batch norm for batch size > 1
-                        encoder_features = self.shared_layers(features)
+                # Process through convolutional layers
+                features = self.conv_layers(x)
+                features = features.reshape(x.size(0), -1)
+                logger.critical(f"Flatten features shape: {features.shape}")
             else:
-                # Full forward pass with convolutional layers
-                if single_sample:
-                    # For single sample, apply conv layers manually without batch norm
-                    features = x
-                    
-                    # Extract conv layers from self.conv_layers
-                    for i, layer in enumerate(self.conv_layers):
-                        if isinstance(layer, nn.BatchNorm2d):
-                            continue  # Skip batch norm for single sample
-                        features = layer(features)
-                        # Apply ReLU after conv layers
-                        if isinstance(layer, nn.Conv2d):
-                            features = F.relu(features)
-                    
-                    # Flatten
-                    features = features.view(features.size(0), -1)
-                    
-                    # Apply shared layers manually without batch norm
-                    for i, layer in enumerate(self.shared_layers):
-                        if isinstance(layer, nn.BatchNorm1d):
-                            continue  # Skip batch norm for single sample
-                        features = layer(features)
-                        # Apply ReLU after linear layers
-                        if isinstance(layer, nn.Linear) and i < len(self.shared_layers) - 1:
-                            features = F.relu(features)
-                    
-                    encoder_features = features
-                else:
-                    # Normal path with batch norm for batch size > 1
-                    # Apply convolutional layers
-                    features = self.conv_layers(x)
-                    
-                    # Flatten features for the linear layers
-                    features = features.view(batch_size, -1)
-                    
-                    # Check if shape matches expected input for shared layers
-                    logger.critical(f"Flatten features shape: {features.shape}")
-                    
-                    # Apply shared layers
-                    encoder_features = self.shared_layers(features)
+                # For vector inputs
+                if len(x.shape) == 1:  # [D]
+                    x = x.unsqueeze(0)  # Add batch dimension
+                features = x
+                
+            # Process through shared layers
+            features = self.shared_layers(features)
             
             # Process through LSTM if present
             next_hidden = None
             if self.use_lstm:
                 logger.critical(f"Processing through LSTM")
-                # Add time dimension for LSTM
-                lstm_in = encoder_features.unsqueeze(1)
-                # LSTM output
-                if hidden_state is None:
-                    # Initialize hidden state
-                    batch_size = lstm_in.size(0)
-                    h0 = torch.zeros(1, batch_size, self.lstm_hidden_size, device=self.device)
-                    c0 = torch.zeros(1, batch_size, self.lstm_hidden_size, device=self.device)
-                    hidden_state = (h0, c0)
-                else:
-                    # Reuse existing hidden state
+                # If we're given a hidden state, use it
+                if hidden_state is not None:
                     h, c = hidden_state
-                    if h.device != self.device:
-                        h = h.to(self.device)
-                    if c.device != self.device:
-                        c = c.to(self.device)
-                    hidden_state = (h, c)
+                    # Make sure hidden state is on same device
+                    h, c = h.to(self.device), c.to(self.device)
+                else:
+                    # Initialize hidden state
+                    h = torch.zeros(self.lstm.num_layers, features.size(0), self.lstm_hidden_size, device=self.device)
+                    c = torch.zeros(self.lstm.num_layers, features.size(0), self.lstm_hidden_size, device=self.device)
                 
-                lstm_out, next_hidden = self.lstm(lstm_in, hidden_state)
-                # Reshape LSTM output
-                features = lstm_out.squeeze(1)
+                # Reshape for LSTM
+                features = features.unsqueeze(1)  # Add sequence dimension
                 
-                # Process through attention if enabled
-                if self.use_attention:
-                    logger.critical(f"Processing through attention mechanism")
-                    # Store original feature shape for logging
-                    original_shape = features.shape
-                    features = self.attention(features)
-                    logger.critical(f"Attention transformation: {original_shape} -> {features.shape}")
+                # Process through LSTM
+                features, (h, c) = self.lstm(features, (h, c))
                 
-                logger.critical(f"LSTM/Attention output shape: {features.shape}")
+                # Remove sequence dimension
+                features = features.squeeze(1)
+                
+                # Save hidden state for next time
+                next_hidden = (h, c)
+            
+            # Apply attention if present
+            if self.attention is not None:
+                logger.critical(f"Processing through attention mechanism")
+                attention_input = features
+                features = self.attention(attention_input)
+                logger.critical(f"Attention transformation: {attention_input.shape} -> {features.shape}")
+            
+            logger.critical(f"LSTM/Attention output shape: {features.shape}")
             
             # Policy head (actor)
             logger.critical(f"Computing action logits")
-            if single_sample:
-                # Apply policy head manually without batch norm
+            if single_sample and self.use_batch_norm:
+                # If single sample and using batch norm, we need to manually apply layers
                 action_logits = features
                 for i, layer in enumerate(self.policy_head):
                     if isinstance(layer, nn.BatchNorm1d):
-                        continue  # Skip batch norm for single sample
-                    try:
-                        action_logits = layer(action_logits)
-                        logger.critical(f"After layer {i}, action_logits shape: {action_logits.shape}")
-                    except Exception as e:
-                        logger.critical(f"Error in policy head layer {i}: {str(e)} - input shape: {action_logits.shape}, layer: {layer}")
-                        raise
+                        # Skip batch norm for single sample
+                        continue
+                    action_logits = layer(action_logits)
                     # Apply ReLU after linear layers except the last one
                     if isinstance(layer, nn.Linear) and i < len(self.policy_head) - 1:
                         action_logits = F.relu(action_logits)
             else:
                 # Normal path with batch norm for batch size > 1
                 logger.critical(f"Applying policy_head to features of shape: {features.shape}")
-                try:
-                    action_logits = self.policy_head(features)
-                except Exception as e:
-                    logger.critical(f"Error in policy_head: {str(e)} - input shape: {features.shape}")
-                    raise
+                action_logits = self.policy_head(features)
                 
             logger.critical(f"Action logits shape: {action_logits.shape}")
             
@@ -428,39 +436,49 @@ class OptimizedNetwork(nn.Module):
                 nan_percent = 100.0 * nan_count / total_elements
                 inf_percent = 100.0 * inf_count / total_elements
                 
+                # Update NaN statistics
+                self.nan_inf_stats['nan_occurrences'] += 1
+                self.nan_inf_stats['consecutive_nan_count'] += 1
+                
                 logger.critical(f"WARNING: NaN or Inf values detected in action_logits, applying fix")
                 logger.critical(f"NaN percentage: {nan_percent:.2f}%, Inf percentage: {inf_percent:.2f}%")
                 
-                # Replace NaN/Inf with small random values instead of zeros
+                # If we've seen too many consecutive NaN values, try restoring healthy weights
+                if self.nan_inf_stats['consecutive_nan_count'] >= 5:
+                    if self.restore_healthy_weights():
+                        # Re-run forward pass with healthy weights
+                        return self.forward(x, hidden_state)
+                    
+                # Replace NaN/Inf with small random values
                 mask = torch.isnan(action_logits) | torch.isinf(action_logits)
                 random_values = torch.rand_like(action_logits) * 0.01 - 0.005  # Small values between -0.005 and 0.005
                 action_logits = torch.where(mask, random_values, action_logits)
+            else:
+                # Reset consecutive NaN counter if we see healthy values
+                self.nan_inf_stats['consecutive_nan_count'] = 0
+                
+                # If we have a reasonable number of forward passes and haven't seen NaNs,
+                # consider saving the current weights as healthy
+                if (self.nan_inf_stats['total_forwards'] % 1000 == 0 and 
+                    self.nan_inf_stats['nan_occurrences'] < self.nan_inf_stats['total_forwards'] * 0.01):
+                    self.save_healthy_weights()
             
             # Value head (critic)
             logger.critical(f"Computing value")
-            if single_sample:
+            if single_sample and self.use_batch_norm:
                 # Apply value head manually without batch norm
                 value = features
                 for i, layer in enumerate(self.value_head):
                     if isinstance(layer, nn.BatchNorm1d):
                         continue  # Skip batch norm for single sample
-                    try:
-                        value = layer(value)
-                        logger.critical(f"After value layer {i}, value shape: {value.shape}")
-                    except Exception as e:
-                        logger.critical(f"Error in value head layer {i}: {str(e)} - input shape: {value.shape}, layer: {layer}")
-                        raise
+                    value = layer(value)
                     # Apply ReLU after linear layers except the last one
                     if isinstance(layer, nn.Linear) and i < len(self.value_head) - 1:
                         value = F.relu(value)
             else:
                 # Normal path with batch norm for batch size > 1
                 logger.critical(f"Applying value_head to features of shape: {features.shape}")
-                try:
-                    value = self.value_head(features)
-                except Exception as e:
-                    logger.critical(f"Error in value_head: {str(e)} - input shape: {features.shape}")
-                    raise
+                value = self.value_head(features)
                 
             logger.critical(f"Value shape: {value.shape}")
             
@@ -471,6 +489,9 @@ class OptimizedNetwork(nn.Module):
                 total_elements = value.numel()
                 nan_percent = 100.0 * nan_count / total_elements
                 inf_percent = 100.0 * inf_count / total_elements
+                
+                # Update NaN statistics
+                self.nan_inf_stats['nan_occurrences'] += 1
                 
                 logger.critical(f"WARNING: NaN or Inf values detected in value, applying fix")
                 logger.critical(f"NaN percentage: {nan_percent:.2f}%, Inf percentage: {inf_percent:.2f}%")
@@ -505,19 +526,30 @@ class OptimizedNetwork(nn.Module):
             import traceback
             logger.critical(f"Traceback: {traceback.format_exc()}")
             
-            # Fallback to uniform distribution and zero value
-            action_probs = torch.ones((batch_size, self.policy_head[-1].out_features), device=x.device) / self.policy_head[-1].out_features
-            value = torch.zeros((batch_size, 1), device=x.device, requires_grad=True)
+            # Try restoring healthy weights and doing a second attempt
+            if self.restore_healthy_weights():
+                try:
+                    # Second attempt with restored weights
+                    return self.forward(x, hidden_state)
+                except Exception as e2:
+                    logger.critical(f"Second attempt also failed: {str(e2)}")
+                    pass
             
-            logger.critical(f"Returning fallback values with shapes: probs={action_probs.shape}, value={value.shape}")
-            logger.critical(f"Fallback values require_grad: probs={action_probs.requires_grad}, value={value.requires_grad}")
+            # If restoration failed or second attempt failed, use fallback
+            # Fallback to uniform distribution and zero value
+            action_probs = torch.ones((batch_size, self.num_actions), device=self.device) / self.num_actions
+            value = torch.zeros((batch_size, 1), device=self.device)
+            
+            # Ensure requires_grad for training
+            action_probs = action_probs.detach().requires_grad_(True)
+            value = value.detach().requires_grad_(True)
             
             # Restore original training mode if we changed it
             if single_sample and training_mode:
                 self.train()
                 
             return action_probs, value, None
-        
+
     def get_action_probs(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get action probabilities for a state.
         
@@ -631,4 +663,26 @@ class OptimizedNetwork(nn.Module):
         # Process through value head
         value = self.value_head(features)
         
-        return value.squeeze(-1), next_hidden 
+        return value.squeeze(-1), next_hidden
+
+    def save_healthy_weights(self):
+        """Save current weights as healthy weights that can be restored if NaNs occur."""
+        self.nan_inf_stats['last_healthy_weights'] = {
+            name: param.data.clone().detach() 
+            for name, param in self.named_parameters()
+        }
+        logger.critical("Saved healthy network weights")
+        
+    def restore_healthy_weights(self):
+        """Restore last known healthy weights if available."""
+        if self.nan_inf_stats['last_healthy_weights'] is not None:
+            for name, param in self.named_parameters():
+                if name in self.nan_inf_stats['last_healthy_weights']:
+                    param.data.copy_(self.nan_inf_stats['last_healthy_weights'][name])
+            
+            self.nan_inf_stats['weight_reset_count'] += 1
+            logger.critical(f"Restored healthy network weights (reset count: {self.nan_inf_stats['weight_reset_count']})")
+            return True
+        else:
+            logger.critical("No healthy weights available to restore")
+            return False 
