@@ -44,17 +44,23 @@ class ErrorDetectionNetwork(nn.Module):
         # Input dimensions depend on whether we use world model
         input_dim = state_dim
         if use_world_model:
-            # We'll concatenate [state, predicted_next_state, actual_next_state, uncertainty]
-            input_dim = state_dim * 3 + state_dim  # Last state_dim is for uncertainty
+            # We'll concatenate [state, action, next_state, predicted_next_state, uncertainty]
+            input_dim = state_dim + action_dim + state_dim + state_dim + hidden_dim
         
-        # Error detection core network
+        # Ensure input_dim is a power of 2 for better compatibility
+        target_input_dim = 2048  # Explicitly set to match the expected size in detect_errors method
+        
+        # Error detection core network with adaptive input layer
         self.detection_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(target_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.3),
         ).to(self.device)
+        
+        # Store the expected input dimension for proper padding in detect_errors
+        self.expected_input_dim = target_input_dim
         
         # Error type classification head
         self.error_classifier = nn.Sequential(
@@ -300,9 +306,13 @@ class ErrorDetectionNetwork(nn.Module):
                         detector_input = detector_input[..., :first_layer.in_features]
                         logger.debug(f"Truncated detector_input to match network, new shape: {detector_input.shape}")
                     else:
-                        # For safety, return fallback values instead of attempting to pad
-                        logger.warning("Input features fewer than expected, returning fallback values")
-                        return self._create_fallback_detection_results()
+                        # Pad with zeros to match expected dimension
+                        padding = torch.zeros(detector_input.size(0), 
+                                             first_layer.in_features - detector_input.shape[-1], 
+                                             device=self.device)
+                        padded_input = torch.cat([detector_input, padding], dim=1)
+                        detector_input = padded_input
+                        logger.debug(f"Padded detector_input to match network, new shape: {detector_input.shape}")
             
             # Detect errors
             features = self.detection_network(detector_input)

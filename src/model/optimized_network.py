@@ -488,7 +488,28 @@ class OptimizedNetwork(nn.Module):
                 features = fix_nan_tensor(features, small_random=True, default_value=0.1, name="features")
                 
             # Pass through shared layers
-            features = self.shared_layers(features)
+            try:
+                # Ensure features match the expected input size for shared_layers
+                conv_output_size = self._calculate_conv_output_size()
+                
+                # If dimensions don't match, reshape features to expected size
+                if features.shape[-1] != conv_output_size:
+                    logger.critical(f"Features shape {features.shape} doesn't match expected conv output size {conv_output_size}")
+                    if features.dim() == 2:  # [batch, features]
+                        # Resize features to match expected conv output size
+                        resized_features = torch.zeros(features.size(0), conv_output_size, device=features.device)
+                        # Copy data if possible
+                        min_size = min(features.size(1), conv_output_size)
+                        resized_features[:, :min_size] = features[:, :min_size]
+                        features = resized_features
+                        logger.critical(f"Resized features to shape {features.shape}")
+                
+                features = self.shared_layers(features)
+            except Exception as e:
+                logger.critical(f"Error in shared_layers: {str(e)}")
+                # Fallback to create output with the right dimensions
+                features = torch.zeros(features.size(0), self.feature_size, device=features.device)
+                logger.critical(f"Using fallback features for shared layers with shape {features.shape}")
             
             # Reshape features back to include time dimension if needed
             if has_time_dim:

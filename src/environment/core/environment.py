@@ -686,8 +686,8 @@ class Environment:
                     logger.warning("Missing frames for reward computation. Defaulting to 0.0 reward.")
                     reward = 0.0
                 else:
-                    # Ensure we have a valid action index
-                    action_idx = action if isinstance(action, (int, np.integer)) else 0
+                    # Ensure action_idx is valid
+                    action_idx = action_idx if isinstance(action_idx, (int, np.integer)) else 0
                     
                     # Check if the frames are valid tensors
                     if not torch.is_tensor(current_frame) or not torch.is_tensor(next_frame):
