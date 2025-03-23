@@ -415,6 +415,10 @@ class ActionExecutor:
         self.action_history = []
         self.max_history_size = 100
         
+        # Track last execution time for rate limiting
+        self.last_action_time = 0
+        self.min_action_interval = 0.2  # Minimum time between actions in seconds
+        
         logger.info("Action executor initialized")
         
     def set_controllers(
@@ -433,277 +437,334 @@ class ActionExecutor:
         self.actions = InputActions(self.keyboard, self.mouse)
         logger.info("Input controllers set for action executor")
         
-    def execute_action(self, action_name: str, **kwargs) -> bool:
-        """Execute an action by name.
+    def execute_action(self, action_info: Any) -> Tuple[bool, Dict[str, Any]]:
+        """Execute an action based on the provided information.
         
         Args:
-            action_name: Action name or dictionary with action parameters
-            **kwargs: Additional parameters for the action
+            action_info: Action name, dictionary, or index
             
         Returns:
-            True if action executed successfully, False otherwise
+            Tuple of (success status, additional information about the action execution)
         """
         # Add debugging timestamp
         start_time = time.time()
         action_id = str(time.time())[-6:]  # Use last 6 digits of timestamp as action ID
         
-        logger.info(f"[ACTION-{action_id}] Starting execution of action: {action_name} with params: {kwargs}")
+        # Apply rate limiting to ensure more consistent input
+        time_since_last = start_time - self.last_action_time
+        if time_since_last < self.min_action_interval:
+            sleep_time = self.min_action_interval - time_since_last
+            logger.info(f"[ACTION-{action_id}] Rate limiting: sleeping for {sleep_time:.4f}s")
+            time.sleep(sleep_time)
+        
+        # Store action info for results
+        action_results = {
+            "action_id": action_id,
+            "start_time": start_time,
+            "action_info": str(action_info)[:100]  # Truncate long action info
+        }
+        
+        logger.info(f"[ACTION-{action_id}] Starting execution with info: {action_info}")
         
         # Ensure input controllers are available
         if not hasattr(self, 'keyboard') or self.keyboard is None:
             logger.error(f"[ACTION-{action_id}] Keyboard controller not available")
-            return False
+            action_results["error"] = "Keyboard controller not available"
+            return False, action_results
             
         if not hasattr(self, 'mouse') or self.mouse is None:
             logger.error(f"[ACTION-{action_id}] Mouse controller not available")
-            return False
-        
-        # Handle various action formats
-        if isinstance(action_name, dict):
-            logger.info(f"[ACTION-{action_id}] Action is a dictionary: {action_name}")
+            action_results["error"] = "Mouse controller not available"
+            return False, action_results
             
-            # Handle "type" + "key" format - convert to key press
-            if 'type' in action_name and action_name['type'] == 'key' and 'key' in action_name:
-                key = action_name.get('key')
-                duration = action_name.get('duration', 0.1)
-                logger.info(f"[ACTION-{action_id}] Converting action to key press for key '{key}' with duration {duration}")
+        # Check for and fix any stuck keys before executing a new action
+        try:
+            # Use our new method if available
+            if hasattr(self.keyboard, 'check_stuck_keys'):
+                self.keyboard.check_stuck_keys()
+        except Exception as e:
+            logger.warning(f"[ACTION-{action_id}] Error checking for stuck keys: {e}")
+        
+        # Handle different action formats
+        success = False
+        
+        try:
+            # Dictionary format with type information
+            if isinstance(action_info, dict):
+                action_type = action_info.get('type')
                 
-                try:
-                    # Verify keyboard controller is ready
-                    if hasattr(self.keyboard, 'key_press'):
-                        # Execute with retry if needed
-                        for attempt in range(2):
-                            logger.info(f"[ACTION-{action_id}] Attempting key press for {key}, attempt {attempt+1}/2")
-                            result = self.keyboard.key_press(key, duration)
-                            if result:
-                                logger.info(f"[ACTION-{action_id}] Key press for {key} successful")
-                                return True
-                            elif attempt < 1:  # Don't wait after last attempt
-                                logger.warning(f"[ACTION-{action_id}] Key press for {key} failed, retrying after delay")
-                                time.sleep(0.5)
-                        logger.error(f"[ACTION-{action_id}] All key press attempts for {key} failed")
-                        return False
+                # Handle speed setting actions
+                if action_type == 'speed':
+                    speed = action_info.get('speed', 0.5)
+                    # Map speed to key actions for game speed
+                    if speed <= 0.0:
+                        success = self.keyboard.key_press('1', 0.2)
+                    elif speed <= 0.25:
+                        success = self.keyboard.key_press('1', 0.2)
+                    elif speed <= 0.5:
+                        success = self.keyboard.key_press('2', 0.2)
+                    elif speed <= 0.75:
+                        success = self.keyboard.key_press('2', 0.2)
                     else:
-                        logger.error(f"[ACTION-{action_id}] Keyboard controller doesn't support key_press method")
-                        return False
-                except Exception as e:
-                    logger.error(f"[ACTION-{action_id}] Error executing key press action for key={key}: {e}")
-                    return False
-            
-            # Handle "type" + "mouse" format - convert to appropriate mouse action
-            elif 'type' in action_name and action_name['type'] == 'mouse' and 'action' in action_name:
-                mouse_action = action_name.get('action')
-                button = action_name.get('button', 'left')
-                position = action_name.get('position', None)
-                direction = action_name.get('direction', None)
-                
-                # For scroll actions, default to center screen if no position is provided
-                if mouse_action == 'scroll' and not position:
-                    screen_width, screen_height = self._get_screen_dimensions()
-                    # Use center of screen as default position
-                    position = (0.5, 0.5)
-                    logger.info(f"[ACTION-{action_id}] No position specified for scroll action, defaulting to screen center")
-                
-                # For click actions with no position, default to center screen
-                if (mouse_action == 'click' or mouse_action == 'double_click') and not position:
-                    screen_width, screen_height = self._get_screen_dimensions()
-                    # Use center of screen as default position
-                    position = (0.5, 0.5)
-                    logger.info(f"[ACTION-{action_id}] No position specified for {mouse_action} action, defaulting to screen center")
-                
-                # Extract normalized position if provided and convert to screen coordinates
-                if position and len(position) == 2:
-                    screen_width, screen_height = self._get_screen_dimensions()
-                    x = int(position[0] * screen_width)
-                    y = int(position[1] * screen_height)
-                    logger.info(f"[ACTION-{action_id}] Converted normalized position {position} to screen coordinates ({x}, {y})")
+                        success = self.keyboard.key_press('3', 0.2)
                     
-                    try:
-                        # Verify mouse controller is ready
-                        if not hasattr(self, 'mouse') or self.mouse is None:
-                            logger.error(f"[ACTION-{action_id}] Mouse controller not available")
-                            return False
-                            
-                        from .mouse import MouseInput
-                        if isinstance(self.mouse, MouseInput):
-                            # Short delay before mouse action to ensure window is ready
-                            logger.info(f"[ACTION-{action_id}] Waiting 0.1s before mouse action")
-                            time.sleep(0.1)
-                            
-                            # Execute with retry if needed
-                            for attempt in range(2):
-                                logger.info(f"[ACTION-{action_id}] Attempting mouse {mouse_action} at ({x}, {y}), attempt {attempt+1}/2")
-                                if mouse_action == 'click':
-                                    # First ensure mouse is at the target position
-                                    logger.info(f"[ACTION-{action_id}] Moving mouse to ({x}, {y}) before click")
-                                    move_result = self.mouse.mouse_move(x, y)
-                                    if not move_result:
-                                        logger.warning(f"[ACTION-{action_id}] Failed to move mouse to ({x}, {y}) before click")
-                                        time.sleep(0.2)
-                                        # Try one more time
-                                        move_result = self.mouse.mouse_move(x, y)
-                                        
-                                    logger.info(f"[ACTION-{action_id}] Waiting 0.2s for mouse to settle after move")
-                                    time.sleep(0.2)  # Wait for mouse to settle
-                                    logger.info(f"[ACTION-{action_id}] Clicking at position ({x}, {y}) with button {button}")
-                                    result = self.mouse.mouse_click(x, y, button=button, double=False)
-                                elif mouse_action == 'double_click':
-                                    # First ensure mouse is at the target position
-                                    logger.info(f"[ACTION-{action_id}] Moving mouse to ({x}, {y}) before double-click")
-                                    move_result = self.mouse.mouse_move(x, y)
-                                    if not move_result:
-                                        logger.warning(f"[ACTION-{action_id}] Failed to move mouse to ({x}, {y}) before double-click")
-                                        time.sleep(0.2)
-                                        # Try one more time
-                                        move_result = self.mouse.mouse_move(x, y)
-                                        
-                                    logger.info(f"[ACTION-{action_id}] Waiting 0.2s for mouse to settle after move")
-                                    time.sleep(0.2)  # Wait for mouse to settle
-                                    logger.info(f"[ACTION-{action_id}] Double-clicking at position ({x}, {y}) with button {button}")
-                                    result = self.mouse.mouse_click(x, y, button=button, double=True)
-                                elif mouse_action == 'move':
-                                    logger.info(f"[ACTION-{action_id}] Moving mouse to position ({x}, {y})")
-                                    result = self.mouse.mouse_move(x, y)
-                                elif mouse_action == 'scroll':
-                                    # Get scroll direction and amount
-                                    clicks = direction if direction is not None else 1
-                                    logger.info(f"[ACTION-{action_id}] Scrolling at position ({x}, {y}) with {clicks} clicks")
-                                    result = self.mouse.mouse_scroll(clicks, x, y)
-                                else:
-                                    logger.error(f"[ACTION-{action_id}] Unknown mouse action: {mouse_action}")
-                                    return False
-                                    
-                                if result:
-                                    logger.info(f"[ACTION-{action_id}] Mouse action {mouse_action} at ({x}, {y}) successful on attempt {attempt+1}")
-                                    return True
-                                elif attempt < 1:  # Don't wait after last attempt
-                                    logger.warning(f"[ACTION-{action_id}] Mouse action {mouse_action} at ({x}, {y}) failed, retrying after delay")
-                                    time.sleep(0.5)
-                            logger.error(f"[ACTION-{action_id}] All {mouse_action} attempts at ({x}, {y}) failed")
-                            return False
-                        else:
-                            logger.error(f"[ACTION-{action_id}] Mouse controller doesn't support the required methods")
-                            return False
-                    except Exception as e:
-                        logger.error(f"[ACTION-{action_id}] Error executing mouse action {mouse_action} at ({x}, {y}): {e}")
-                        return False
-                else:
-                    logger.warning(f"[ACTION-{action_id}] Mouse action {mouse_action} requires position, but none provided or invalid")
-                    return False
-            
-            # Legacy format with 'action' key
-            elif 'action' in action_name:
-                params = {k: v for k, v in action_name.items() if k != 'action'}
-                action_str = action_name['action']
-                logger.debug(f"[ACTION-{action_id}] Extracted action '{action_str}' from dictionary with params: {params}")
-                return self.execute_action(action_str, **params)
-            else:
-                logger.error(f"[ACTION-{action_id}] Invalid action dictionary format: {action_name}")
-                return False
-            
-        # Check if the action exists as a direct method
-        action_str = str(action_name)
-        
-        if hasattr(self.actions, action_str):
-            try:
-                # Get the action method
-                action_method = getattr(self.actions, action_str)
+                    logger.info(f"[ACTION-{action_id}] Set game speed to {speed} with key press: success={success}")
+                    action_results["action_type"] = "speed"
+                    action_results["speed"] = speed
                 
-                # Execute action with appropriate parameters
-                logger.info(f"[ACTION-{action_id}] Executing action: {action_str} with params: {kwargs}")
-                start_time = time.time()
-                
-                # Add a small delay before action to ensure window is ready
-                time.sleep(0.1)
-                
-                # Execute with retry if needed
-                for attempt in range(2):
-                    result = action_method(**kwargs)
-                    if result:
-                        execution_time = time.time() - start_time
-                        # Record action with execution time
-                        self._record_action(action_str, kwargs, result, execution_time)
-                        logger.debug(f"[ACTION-{action_id}] Action {action_str} executed successfully in {execution_time:.3f}s")
-                        return True
-                    elif attempt < 1:  # Don't wait after last attempt
-                        logger.warning(f"[ACTION-{action_id}] Action {action_str} failed, retrying after delay")
-                        time.sleep(0.5)
-                
-                # If we get here, all attempts failed
-                execution_time = time.time() - start_time
-                self._record_action(action_str, kwargs, False, execution_time)
-                logger.warning(f"[ACTION-{action_id}] Action {action_str} reported failure after {execution_time:.3f}s")
-                return False
-                
-            except Exception as e:
-                logger.error(f"[ACTION-{action_id}] Error executing action {action_str}: {e}")
-                self._record_action(action_str, kwargs, False, 0, error=str(e))
-                return False
-        else:
-            # For undocumented actions, try to handle based on name conventions
-            # This allows for more flexible action handling
-            try:
-                if action_str.startswith('key_'):
-                    # Handle key_X actions (where X is a key name)
-                    # key = action_str[4:]  # Extract key name - this was wrong
-                    # Instead use the 'key' parameter from kwargs
-                    key = kwargs.get('key', '')
+                # Handle keyboard actions
+                elif action_type == 'key':
+                    key = action_info.get('key')
+                    duration = action_info.get('duration', 0.1)
                     
-                    if not key:
-                        logger.error(f"[ACTION-{action_id}] No key specified for action {action_str}")
-                        return False
+                    # Ensure minimum press duration
+                    duration = max(duration, 0.1)
+                    
+                    logger.info(f"[ACTION-{action_id}] Executing key press for '{key}' with duration {duration}")
+                    
+                    # Retry mechanism for key presses
+                    for attempt in range(3):
+                        # Try to ensure key is released first
+                        try:
+                            self.keyboard.ensure_key_released(key)
+                        except Exception as e:
+                            logger.warning(f"[ACTION-{action_id}] Error ensuring key '{key}' is released: {e}")
+                            
+                        success = self.keyboard.key_press(key, duration)
+                        if success:
+                            logger.info(f"[ACTION-{action_id}] Key press for '{key}' successful on attempt {attempt+1}")
+                            break
                         
-                    logger.info(f"[ACTION-{action_id}] Executing key press for key '{key}'")
-                    # Add a small delay before action to ensure window is ready
-                    time.sleep(0.1)
-                    result = self.keyboard.key_press(key, kwargs.get('duration', 0.1))
-                    self._record_action(action_str, kwargs, result, 0)
-                    return result
+                        logger.warning(f"[ACTION-{action_id}] Key press for '{key}' failed on attempt {attempt+1}, retrying...")
+                        time.sleep(0.2)
                     
-                elif action_str.startswith('mouse_'):
-                    # Handle mouse_X actions (click, move, etc.)
-                    logger.info(f"[ACTION-{action_id}] Attempting to handle undocumented mouse action: {action_str}")
-                    # Try to find a similar method in mouse controller
-                    for method_name in dir(self.mouse):
-                        if method_name.lower() == action_str.lower() or method_name.lower() == action_str[6:].lower():
-                            logger.info(f"[ACTION-{action_id}] Found matching mouse method: {method_name}")
-                            method = getattr(self.mouse, method_name)
-                            # Add a small delay before action to ensure window is ready
-                            time.sleep(0.1)
-                            result = method(**kwargs)
-                            self._record_action(action_str, kwargs, result, 0)
-                            return result
+                    action_results["action_type"] = "key"
+                    action_results["key"] = key
+                    action_results["attempts"] = attempt + 1
                 
-                logger.error(f"[ACTION-{action_id}] Unknown action: {action_str}")
-                return False
+                # Handle mouse actions
+                elif action_type == 'mouse':
+                    mouse_action = action_info.get('action')
+                    button = action_info.get('button', 'left')
+                    position = action_info.get('position', None)
+                    direction = action_info.get('direction', None)
+                    duration = action_info.get('duration', 0.5)
+                    
+                    action_results["action_type"] = "mouse"
+                    action_results["mouse_action"] = mouse_action
+                    
+                    # Get screen dimensions for position calculations
+                    screen_width, screen_height = self._get_screen_dimensions()
+                    
+                    # Handle click actions
+                    if mouse_action in ['click', 'double_click', 'right_click']:
+                        # Default to center if no position
+                        if not position:
+                            position = (0.5, 0.5)
+                            logger.info(f"[ACTION-{action_id}] No position for {mouse_action}, using center")
+                        
+                        # Convert normalized position to screen coordinates
+                        x = int(position[0] * screen_width)
+                        y = int(position[1] * screen_height)
+                        
+                        logger.info(f"[ACTION-{action_id}] Mouse {mouse_action} at position ({x}, {y})")
+                        
+                        # Retry mechanism
+                        for attempt in range(3):
+                            if mouse_action == 'click':
+                                success = self.mouse.mouse_click(x, y, button=button)
+                            elif mouse_action == 'double_click':
+                                success = self.mouse.mouse_double_click(x, y, button=button)
+                            elif mouse_action == 'right_click':
+                                success = self.mouse.mouse_click(x, y, button='right')
+                            
+                            if success:
+                                logger.info(f"[ACTION-{action_id}] {mouse_action} at ({x}, {y}) successful on attempt {attempt+1}")
+                                break
+                                
+                            logger.warning(f"[ACTION-{action_id}] {mouse_action} at ({x}, {y}) failed on attempt {attempt+1}, retrying...")
+                            time.sleep(0.2)
+                        
+                        action_results["position"] = (x, y)
+                        action_results["attempts"] = attempt + 1
+                    
+                    # Handle scroll actions
+                    elif mouse_action == 'scroll':
+                        if not position:
+                            position = (0.5, 0.5)
+                        
+                        x = int(position[0] * screen_width)
+                        y = int(position[1] * screen_height)
+                        
+                        scroll_amount = direction or 1
+                        
+                        logger.info(f"[ACTION-{action_id}] Mouse scroll at ({x}, {y}) with amount {scroll_amount}")
+                        
+                        for attempt in range(3):
+                            success = self.mouse.mouse_scroll(scroll_amount, x, y)
+                            if success:
+                                logger.info(f"[ACTION-{action_id}] Scroll at ({x}, {y}) successful on attempt {attempt+1}")
+                                break
+                                
+                            logger.warning(f"[ACTION-{action_id}] Scroll at ({x}, {y}) failed on attempt {attempt+1}, retrying...")
+                            time.sleep(0.2)
+                        
+                        action_results["position"] = (x, y)
+                        action_results["scroll_amount"] = scroll_amount
+                        action_results["attempts"] = attempt + 1
+                    
+                    # Handle drag actions
+                    elif mouse_action == 'drag':
+                        # Need start and end positions
+                        start_pos = action_info.get('start_position', position)
+                        end_pos = action_info.get('end_position', None)
+                        
+                        if not start_pos or not end_pos:
+                            logger.error(f"[ACTION-{action_id}] Drag action requires both start and end positions")
+                            action_results["error"] = "Missing positions for drag"
+                            return False, action_results
+                        
+                        start_x = int(start_pos[0] * screen_width)
+                        start_y = int(start_pos[1] * screen_height)
+                        end_x = int(end_pos[0] * screen_width)
+                        end_y = int(end_pos[1] * screen_height)
+                        
+                        logger.info(f"[ACTION-{action_id}] Mouse drag from ({start_x}, {start_y}) to ({end_x}, {end_y})")
+                        
+                        for attempt in range(3):
+                            success = self.mouse.mouse_drag(start_x, start_y, end_x, end_y, duration)
+                            if success:
+                                logger.info(f"[ACTION-{action_id}] Drag successful on attempt {attempt+1}")
+                                break
+                                
+                            logger.warning(f"[ACTION-{action_id}] Drag failed on attempt {attempt+1}, retrying...")
+                            time.sleep(0.3)
+                        
+                        action_results["start_pos"] = (start_x, start_y)
+                        action_results["end_pos"] = (end_x, end_y)
+                        action_results["attempts"] = attempt + 1
+                        
+                    # Handle edge scrolling
+                    elif mouse_action == 'edge_scroll':
+                        edge_direction = action_info.get('direction', 'up')
+                        scroll_duration = action_info.get('duration', 0.5)
+                        
+                        # Map direction to edge positions
+                        direction_map = {
+                            'up': (screen_width // 2, 5),
+                            'down': (screen_width // 2, screen_height - 5),
+                            'left': (5, screen_height // 2),
+                            'right': (screen_width - 5, screen_height // 2)
+                        }
+                        
+                        if edge_direction not in direction_map:
+                            logger.error(f"[ACTION-{action_id}] Invalid edge scroll direction: {edge_direction}")
+                            action_results["error"] = f"Invalid edge scroll direction: {edge_direction}"
+                            return False, action_results
+                        
+                        x, y = direction_map[edge_direction]
+                        
+                        logger.info(f"[ACTION-{action_id}] Edge scroll in direction {edge_direction} at ({x}, {y})")
+                        
+                        for attempt in range(3):
+                            # Move mouse to edge position and hold
+                            self.mouse.move_mouse(x, y)
+                            time.sleep(0.1)  # Ensure mouse arrived at position
+                            success = self.mouse.mouse_click(x, y, hold=True)
+                            if success:
+                                # Hold for the specified duration
+                                time.sleep(scroll_duration)
+                                # Release
+                                self.mouse.mouse_release(x, y)
+                                logger.info(f"[ACTION-{action_id}] Edge scroll successful on attempt {attempt+1}")
+                                success = True
+                                break
+                            
+                            logger.warning(f"[ACTION-{action_id}] Edge scroll failed on attempt {attempt+1}, retrying...")
+                            time.sleep(0.2)
+                        
+                        action_results["direction"] = edge_direction
+                        action_results["position"] = (x, y)
+                        action_results["attempts"] = attempt + 1
+                    
+                    else:
+                        logger.error(f"[ACTION-{action_id}] Unknown mouse action: {mouse_action}")
+                        action_results["error"] = f"Unknown mouse action: {mouse_action}"
+                        return False, action_results
                 
-            except Exception as e:
-                logger.error(f"[ACTION-{action_id}] Error handling undocumented action {action_str}: {e}")
-                self._record_action(action_str, kwargs, False, 0, error=str(e))
-                return False
+                # Unknown action type
+                else:
+                    logger.error(f"[ACTION-{action_id}] Unknown action type: {action_type}")
+                    action_results["error"] = f"Unknown action type: {action_type}"
+                    return False, action_results
+            
+            # String action name - pass to the actions object if available
+            elif isinstance(action_info, str) and self.actions:
+                action_name = action_info
+                
+                # Check if the action exists as a method
+                if hasattr(self.actions, action_name):
+                    method = getattr(self.actions, action_name)
+                    logger.info(f"[ACTION-{action_id}] Executing named action: {action_name}")
+                    success = method()
+                    action_results["action_type"] = "named_action"
+                    action_results["action_name"] = action_name
+                else:
+                    logger.error(f"[ACTION-{action_id}] Unknown action name: {action_name}")
+                    action_results["error"] = f"Unknown action name: {action_name}"
+                    return False, action_results
+            
+            # Integer action - treat as action index from action space
+            elif isinstance(action_info, (int, np.integer)):
+                # For now, just log this case - would need action space integration to handle properly
+                logger.warning(f"[ACTION-{action_id}] Raw action index {action_info} - not directly supported")
+                action_results["error"] = f"Raw action index not supported, use action dictionary instead"
+                return False, action_results
+            
+            # Unknown action format
+            else:
+                logger.error(f"[ACTION-{action_id}] Unsupported action format: {type(action_info)}")
+                action_results["error"] = f"Unsupported action format: {type(action_info)}"
+                return False, action_results
+        
+        except Exception as e:
+            logger.error(f"[ACTION-{action_id}] Exception during action execution: {e}")
+            # Include stack trace for debugging
+            import traceback
+            logger.error(f"[ACTION-{action_id}] Stack trace: {traceback.format_exc()}")
+            action_results["error"] = f"Exception: {str(e)}"
+            success = False
+        
+        # Record final execution time and update last action time
+        end_time = time.time()
+        execution_time = end_time - start_time
+        action_results["execution_time"] = execution_time
+        action_results["success"] = success
+        
+        self.last_action_time = end_time
+        
+        # Record in action history
+        self._record_action(
+            str(action_info)[:50], 
+            {}, 
+            success, 
+            execution_time,
+            error=action_results.get("error", None)
+        )
+        
+        logger.info(f"[ACTION-{action_id}] Completed execution with success={success} in {execution_time:.3f}s")
+        return success, action_results
     
     def _get_screen_dimensions(self) -> Tuple[int, int]:
-        """Get screen dimensions for position calculations.
+        """Get the dimensions of the screen.
         
         Returns:
-            Tuple[int, int]: Width and height of screen
+            Tuple of (width, height)
         """
-        try:
-            # Default dimensions
-            default_width, default_height = 1920, 1080
-            
-            # Try to get actual screen dimensions
-            import win32api
-            screen_width = win32api.GetSystemMetrics(0)
-            screen_height = win32api.GetSystemMetrics(1)
-            
-            # Return valid dimensions or defaults
-            if screen_width > 0 and screen_height > 0:
-                return screen_width, screen_height
-                
-            return default_width, default_height
-        except Exception as e:
-            logger.error(f"Error getting screen dimensions: {e}")
+        if hasattr(self, 'mouse') and self.mouse:
+            return self.mouse.screen_width, self.mouse.screen_height
+        else:
+            # Default resolution if mouse controller not available
             return 1920, 1080
     
     def _record_action(self, action_name: str, params: dict, success: bool, execution_time: float = 0, error: str = None):

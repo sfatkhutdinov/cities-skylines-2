@@ -46,60 +46,62 @@ class KeyboardInput:
         
         logger.info("Keyboard input initialized")
     
-    def key_press(self, key: str, duration: float = 0.1) -> bool:
-        """Press a key on the keyboard.
+    def key_press(self, key: str, duration: float = 0.1, force_direct: bool = False) -> bool:
+        """Press a key for the specified duration.
         
         Args:
-            key: String representation of the key to press
-            duration: Duration to hold the key down in seconds
+            key: Key to press
+            duration: Duration to hold the key in seconds
+            force_direct: Force using direct input even for escape key
             
         Returns:
-            True if successful, False otherwise
+            bool: True if successful, False otherwise
         """
-        key_id = str(time.time())[-6:]  # Use last 6 digits of timestamp as key ID
-        logger.info(f"[KEY-{key_id}] Pressing key '{key}' for {duration} seconds")
+        # Generate a unique ID for this key press operation
+        operation_id = f"{int(time.time() * 1000) % 100000:05d}"
+        logger.info(f"[KEY-{operation_id}] Pressing key '{key}' for {duration} seconds")
         
+        # Special handling for escape key
+        if key.lower() == 'escape' and self.block_escape and not force_direct:
+            logger.warning(f"[KEY-{operation_id}] Escape key is blocked. Use force_direct=True to override.")
+            return False
+            
         try:
-            # Map string to Key object if needed
-            try:
-                mapped_key = self._map_key(key)
-                logger.debug(f"[KEY-{key_id}] Mapped key '{key}' to {mapped_key}")
-            except ValueError as e:
-                logger.error(f"[KEY-{key_id}] Failed to map key '{key}': {e}")
-                return False
+            # Map the key to a virtual key code
+            logger.debug(f"[KEY-{operation_id}] Mapped key '{key}' to {self._map_key_to_vk(key)}")
             
-            # Ensure game window is focused
-            game_hwnd = win32gui.FindWindow(None, "Cities: Skylines II")
-            if game_hwnd:
-                # Bring window to foreground
-                win32gui.SetForegroundWindow(game_hwnd)
-                # Wait for window to be ready
-                time.sleep(0.1)
+            # First ensure key is released
+            self.ensure_key_released(key)
             
-            # Press key down
-            logger.debug(f"[KEY-{key_id}] Pressing key down")
-            self.keyboard.press(mapped_key)
+            # Use the more reliable direct method
+            success = self._direct_key_press(key, duration)
+            if not success:
+                logger.warning(f"[KEY-{operation_id}] Direct key press failed, falling back to normal key press")
+                
+                # Press the key down
+                logger.debug(f"[KEY-{operation_id}] Pressing key down")
+                if not self._key_down(key):
+                    logger.error(f"[KEY-{operation_id}] Failed to press key down")
+                    return False
+                    
+                # Wait for the specified duration
+                logger.debug(f"[KEY-{operation_id}] Waiting for {duration} seconds")
+                time.sleep(duration)
+                
+                # Release the key
+                logger.debug(f"[KEY-{operation_id}] Releasing key")
+                if not self._key_up(key):
+                    logger.error(f"[KEY-{operation_id}] Failed to release key")
+                    return False
             
-            # Wait for specified duration
-            logger.debug(f"[KEY-{key_id}] Waiting for {duration} seconds")
-            time.sleep(duration)
+            logger.info(f"[KEY-{operation_id}] Successfully pressed key '{key}'")
             
-            # Release key
-            logger.debug(f"[KEY-{key_id}] Releasing key")
-            self.keyboard.release(mapped_key)
+            # Add a small delay after key press to ensure it's processed
+            time.sleep(0.1)
             
-            logger.info(f"[KEY-{key_id}] Successfully pressed key '{key}'")
             return True
-            
         except Exception as e:
-            logger.error(f"[KEY-{key_id}] Error pressing key '{key}': {e}")
-            # Ensure key is released in case of error
-            try:
-                if 'mapped_key' in locals():
-                    logger.debug(f"[KEY-{key_id}] Attempting to release key after error")
-                    self.keyboard.release(mapped_key)
-            except Exception as release_error:
-                logger.error(f"[KEY-{key_id}] Failed to release key after error: {release_error}")
+            logger.error(f"[KEY-{operation_id}] Error in key_press for key '{key}': {e}")
             return False
     
     def press_key(self, key: str) -> bool:
@@ -210,4 +212,330 @@ class KeyboardInput:
             pass
             
         # If we get here, we couldn't map the key
-        raise ValueError(f"Could not map key: {key}") 
+        raise ValueError(f"Could not map key: {key}")
+
+    def ensure_key_released(self, key: str) -> bool:
+        """Ensure a key is released (not being held down).
+        
+        Args:
+            key: Key to ensure is released
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Map key to virtual key code
+            vk_code = self._map_key_to_vk(key)
+            if vk_code is None:
+                logger.error(f"Could not map key '{key}' to virtual key code")
+                return False
+                
+            # Check if key is down and send keyup if needed
+            key_state = ctypes.windll.user32.GetAsyncKeyState(vk_code)
+            if key_state & 0x8000:  # Key is down
+                logger.warning(f"Key '{key}' appears to be held down, sending keyup event")
+                
+                # Send key up using the new method
+                if not self._key_up(key):
+                    logger.error(f"Failed to release held key '{key}'")
+                    return False
+                
+                # Brief pause to let it register
+                time.sleep(0.05)
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error in ensure_key_released for key '{key}': {e}")
+            return False
+
+    def _map_key_to_vk(self, key: str) -> Optional[int]:
+        """Map a string key representation to a virtual key code.
+        
+        Args:
+            key: String representation of the key
+            
+        Returns:
+            Virtual key code or None if the key cannot be mapped
+        """
+        # First check if it's a one-character key (a-z, 0-9, etc.)
+        if len(key) == 1:
+            return ord(key)
+            
+        # Check if it's in our key_map
+        if key.lower() in self.key_map:
+            mapped_key = self.key_map[key.lower()]
+            
+            # If it's a Key object from pynput, handle it specially
+            if isinstance(mapped_key, Key):
+                # Map common special keys to their virtual key codes
+                if mapped_key == Key.shift:
+                    return 0x10  # VK_SHIFT
+                elif mapped_key == Key.ctrl:
+                    return 0x11  # VK_CONTROL
+                elif mapped_key == Key.alt:
+                    return 0x12  # VK_MENU (Alt)
+                elif mapped_key == Key.space:
+                    return 0x20  # VK_SPACE
+                elif mapped_key == Key.enter:
+                    return 0x0D  # VK_RETURN
+                elif mapped_key == Key.esc:
+                    return 0x1B  # VK_ESCAPE
+                elif mapped_key == Key.tab:
+                    return 0x09  # VK_TAB
+                elif mapped_key == Key.backspace:
+                    return 0x08  # VK_BACK
+                elif mapped_key == Key.up:
+                    return 0x26  # VK_UP
+                elif mapped_key == Key.down:
+                    return 0x28  # VK_DOWN
+                elif mapped_key == Key.left:
+                    return 0x25  # VK_LEFT
+                elif mapped_key == Key.right:
+                    return 0x27  # VK_RIGHT
+                elif mapped_key == Key.home:
+                    return 0x24  # VK_HOME
+                elif mapped_key == Key.end:
+                    return 0x23  # VK_END
+                elif mapped_key == Key.page_up:
+                    return 0x21  # VK_PRIOR
+                elif mapped_key == Key.page_down:
+                    return 0x22  # VK_NEXT
+                elif mapped_key == Key.delete:
+                    return 0x2E  # VK_DELETE
+                elif mapped_key == Key.f1:
+                    return 0x70  # VK_F1
+                elif mapped_key == Key.f2:
+                    return 0x71  # VK_F2
+                elif mapped_key == Key.f3:
+                    return 0x72  # VK_F3
+                elif mapped_key == Key.f4:
+                    return 0x73  # VK_F4
+                elif mapped_key == Key.f5:
+                    return 0x74  # VK_F5
+                elif mapped_key == Key.f6:
+                    return 0x75  # VK_F6
+                elif mapped_key == Key.f7:
+                    return 0x76  # VK_F7
+                elif mapped_key == Key.f8:
+                    return 0x77  # VK_F8
+                elif mapped_key == Key.f9:
+                    return 0x78  # VK_F9
+                elif mapped_key == Key.f10:
+                    return 0x79  # VK_F10
+                elif mapped_key == Key.f11:
+                    return 0x7A  # VK_F11
+                elif mapped_key == Key.f12:
+                    return 0x7B  # VK_F12
+                else:
+                    logger.warning(f"Unmapped special key: {mapped_key}")
+                    return None
+            else:
+                # For regular character keys
+                return ord(mapped_key)
+            
+        # Try to find it in Key enum
+        try:
+            if hasattr(Key, key.lower()):
+                return self._map_key_to_vk(getattr(Key, key.lower()))
+        except (AttributeError, TypeError):
+            pass
+            
+        # If we get here, we couldn't map the key
+        return None
+
+    def _key_down(self, key: str) -> bool:
+        """Press a key down.
+        
+        Args:
+            key: Key to press down
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Map the key to a virtual key code
+            vk_code = self._map_key_to_vk(key)
+            if vk_code is None:
+                logger.error(f"Could not map key '{key}' to virtual key code")
+                return False
+            
+            # Press the key down
+            keyboard_input = self._create_keyboard_input(vk_code, 0x0000)  # KEYDOWN
+            result = ctypes.windll.user32.SendInput(1, ctypes.byref(keyboard_input), ctypes.sizeof(keyboard_input))
+            if result != 1:
+                logger.error(f"SendInput failed for key down '{key}'")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error pressing key down for key '{key}': {e}")
+            return False
+
+    def _key_up(self, key: str) -> bool:
+        """Release a key.
+        
+        Args:
+            key: Key to release
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Map the key to a virtual key code
+            vk_code = self._map_key_to_vk(key)
+            if vk_code is None:
+                logger.error(f"Could not map key '{key}' to virtual key code")
+                return False
+            
+            # Release the key
+            keyboard_input = self._create_keyboard_input(vk_code, 0x0002)  # KEYUP
+            result = ctypes.windll.user32.SendInput(1, ctypes.byref(keyboard_input), ctypes.sizeof(keyboard_input))
+            if result != 1:
+                logger.error(f"SendInput failed for key up '{key}'")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error releasing key for key '{key}': {e}")
+            return False
+
+    def _create_keyboard_input(self, vk_code: int, flags: int) -> ctypes.Structure:
+        """Create a keyboard input structure.
+        
+        Args:
+            vk_code: Virtual key code
+            flags: Flags for the input
+            
+        Returns:
+            INPUT structure for SendInput
+        """
+        # Define the required ctypes structures
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))
+            ]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_short),
+                ("wParamH", ctypes.c_ushort)
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [
+                ("mi", MOUSEINPUT),
+                ("ki", KEYBDINPUT),
+                ("hi", HARDWAREINPUT)
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_ulong),
+                ("union", INPUT_UNION)
+            ]
+
+        # Create and configure a keyboard INPUT structure
+        extra = ctypes.c_ulong(0)
+        
+        # Get the scan code for virtual key - this makes key recognition more reliable
+        scan_code = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)  # MAPVK_VK_TO_VSC
+        
+        # Create the keyboard input structure
+        kb_input = KEYBDINPUT()
+        kb_input.wVk = vk_code  # Virtual key code
+        kb_input.wScan = scan_code  # Use proper scan code
+        kb_input.dwFlags = flags
+        kb_input.time = 0
+        kb_input.dwExtraInfo = ctypes.pointer(extra)
+        
+        # Create the INPUT structure
+        input_struct = INPUT()
+        input_struct.type = 1  # INPUT_KEYBOARD
+        input_struct.union.ki = kb_input
+        
+        return input_struct
+
+    def _direct_key_press(self, key: str, duration: float = 0.1) -> bool:
+        """Press a key directly using Win32 API which can be more reliable than pynput.
+        
+        Args:
+            key: Key to press
+            duration: Duration to hold key
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Map key to VK code
+            vk_code = self._map_key_to_vk(key)
+            if vk_code is None:
+                logger.error(f"Could not map key '{key}' to virtual key code")
+                return False
+                
+            # Constants for key events
+            KEYEVENTF_KEYDOWN = 0x0000
+            KEYEVENTF_KEYUP = 0x0002
+            
+            # Press key down
+            kb_down = self._create_keyboard_input(vk_code, KEYEVENTF_KEYDOWN)
+            result_down = ctypes.windll.user32.SendInput(1, ctypes.byref(kb_down), ctypes.sizeof(kb_down))
+            if result_down != 1:
+                logger.error(f"SendInput failed for key down '{key}', error code: {ctypes.GetLastError()}")
+                return False
+                
+            # Wait for specified duration
+            time.sleep(duration)
+            
+            # Release key
+            kb_up = self._create_keyboard_input(vk_code, KEYEVENTF_KEYUP)
+            result_up = ctypes.windll.user32.SendInput(1, ctypes.byref(kb_up), ctypes.sizeof(kb_up))
+            if result_up != 1:
+                logger.error(f"SendInput failed for key up '{key}', error code: {ctypes.GetLastError()}")
+                return False
+                
+            # Additional wait to ensure key event is processed
+            time.sleep(0.05)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error in direct key press for '{key}': {e}")
+            return False
+
+    # Add a helper method to check if a key is stuck
+    def check_stuck_keys(self) -> None:
+        """Check if any keys are stuck down and release them."""
+        # Common keys to check
+        keys_to_check = [
+            'a', 'w', 's', 'd', 'q', 'e', 'shift', 'ctrl', 'alt', 
+            'f', 'escape', 'space', '1', '2', '3', '4', '5'
+        ]
+        
+        for key in keys_to_check:
+            try:
+                vk_code = self._map_key_to_vk(key)
+                if vk_code is None:
+                    continue
+                    
+                # Check if the key is down
+                key_state = ctypes.windll.user32.GetAsyncKeyState(vk_code)
+                if key_state & 0x8000:  # Key is down
+                    logger.warning(f"Key '{key}' appears to be stuck, releasing it")
+                    self._key_up(key)
+                    time.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Error checking stuck key '{key}': {e}") 

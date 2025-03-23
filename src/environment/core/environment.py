@@ -11,6 +11,10 @@ import numpy as np
 import logging
 import os
 import math
+import subprocess
+import json
+import win32gui
+import win32com.client
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque
 
@@ -286,17 +290,21 @@ class Environment:
             stacked_observation = self._get_stacked_observation()
             return stacked_observation, -1.0, True, {"action_success": False, "reset": True}
         
-        # Ensure the game is running and the window is focused
-        if not self._ensure_game_running():
+        # Force the game window to be focused before any action
+        self._ensure_window_focused()
+        
+        # Assume game is running when skip_game_check is true
+        game_running = True
+        if not self.error_recovery.skip_game_check:
+            game_running = self.error_recovery.check_game_running()
+        
+        if not game_running:
             # Failed to ensure the game is running
             self.consecutive_errors += 1
             observation = self.get_observation()
             self.frame_buffer.append(observation)
             stacked_observation = self._get_stacked_observation()
             return stacked_observation, -1.0, False, {"action_success": False, "game_running": False}
-        
-        # Ensure window is focused
-        self._ensure_window_focused()
         
         # Check if we're in a menu before executing the action
         in_menu_before_action = self.check_menu_state()
@@ -319,11 +327,23 @@ class Environment:
         else:
             logger.debug(f"Executing action {action_idx}: {action_info}")
         
-        # Execute the action
-        success, action_results = self.action_executor.execute_action(action_info)
+        # Execute the action with additional focus to ensure it works
+        time.sleep(0.1)  # Brief pause before action
+        self._ensure_window_focused()  # Re-ensure window is focused right before action
+        success, action_details = self.action_executor.execute_action(action_info)
+        
+        # If the action failed, try once more with additional focus
+        if not success:
+            logger.warning(f"Action {action_idx} failed on first attempt, retrying with additional focus")
+            time.sleep(0.2)
+            self._ensure_window_focused()
+            success, action_details = self.action_executor.execute_action(action_info)
         
         # Update our internal tracking for consecutive failures
-        self._track_action_result(action_idx, success)
+        if success:
+            self.consecutive_errors = 0
+        else:
+            self.consecutive_errors += 1
         
         # Check menu state after action
         in_menu_after_action = self.check_menu_state()
@@ -377,12 +397,13 @@ class Environment:
             "menu_entered": menu_entered,
             "menu_exited": menu_exited,
             "is_escape_action": is_escape_action,
-            "is_potential_gear_click": is_top_right_click
+            "is_potential_gear_click": is_top_right_click,
+            "game_running": True  # Force game_running to true when skip_game_check is enabled
         }
         
         # Include the action results if available
-        if action_results:
-            info["action_results"] = action_results
+        if action_details:
+            info["action_results"] = action_details
             
         return stacked_observation, reward, done, info
     
@@ -489,20 +510,28 @@ class Environment:
         # Wait for game to initialize
         self._wait_for_game_start()
     
-    def _ensure_game_running(self) -> None:
-        """Make sure the game is running, start it if not."""
-        if self.skip_game_check:
+    def _ensure_game_running(self) -> bool:
+        """Ensure the game is running.
+        
+        Returns:
+            bool: True if the game is running, False otherwise
+        """
+        if self.mock_mode:
+            return True
+        
+        # If skip_game_check is true, we just assume the game is running
+        if self.error_recovery.skip_game_check:
             logger.info("Skipping game process verification as requested")
-            # Still wait a bit to ensure window is properly focused
-            time.sleep(1) 
-            return
-            
-        if not self.check_game_state():
+            return True
+        
+        # Check if the game is running
+        if not self.error_recovery.check_game_running():
             logger.warning("Game not running at environment initialization")
             if not self.error_recovery.restart_game():
                 logger.error("Failed to start game at initialization")
                 raise RuntimeError("Could not start game - please check game path and installation")
             self._wait_for_game_start()
+        return True
     
     def _set_game_speed(self, speed_level: int) -> bool:
         """Set game speed using keyboard shortcuts.
@@ -727,32 +756,82 @@ class Environment:
         logger.error(f"Game did not become responsive within {timeout} seconds")
         raise TimeoutError(f"Game startup timeout after {timeout} seconds")
 
-    def _ensure_window_focused(self):
-        """Ensure the game window is focused before taking actions."""
-        if self.mock_mode:
-            return True
+    def _ensure_window_focused(self) -> bool:
+        """Ensure the game window has focus.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Attempt the focus up to 3 times
+            success = False
+            attempts = 0
+            max_attempts = 3
             
-        if hasattr(self.screen_capture, 'focus_game_window'):
-            logger.debug("Attempting to focus game window")
-            
-            # Try multiple focus attempts if needed
-            for attempt in range(3):
-                result = self.screen_capture.focus_game_window()
-                if result:
-                    logger.info(f"Successfully focused game window on attempt {attempt+1}")
-                    # Add a consistent wait time after focus to ensure window is fully responsive
-                    # This is critical - the window needs time to properly receive input after focus
-                    time.sleep(0.75)  # Increased from the original value
-                    return True
-                else:
-                    logger.warning(f"Failed to focus game window (attempt {attempt+1}/3)")
+            while not success and attempts < max_attempts:
+                attempts += 1
+                
+                # Get window handle
+                window_handle = win32gui.FindWindow(None, self.window_title)
+                if not window_handle:
+                    logger.warning(f"Game window '{self.window_title}' not found on attempt {attempts}")
+                    
+                    # Brief pause before retry
                     time.sleep(0.5)
-            
-            logger.error("Failed to focus game window after multiple attempts")
+                    continue
+                
+                # Check if window is already in foreground
+                foreground_window = win32gui.GetForegroundWindow()
+                if foreground_window == window_handle:
+                    logger.info("Game window is already focused")
+                    success = True
+                    break
+                
+                # Bring window to foreground
+                try:
+                    # Try setting focus with multiple methods for reliability
+                    # Method 1: SetForegroundWindow
+                    win32gui.SetForegroundWindow(window_handle)
+                    
+                    # Method 2: ShowWindow + SetForegroundWindow
+                    if not success:
+                        win32gui.ShowWindow(window_handle, 9)  # SW_RESTORE
+                        win32gui.SetForegroundWindow(window_handle)
+                    
+                    # Method 3: Alt+Tab simulation if needed
+                    if not success:
+                        # Simulate Alt+Tab to the window
+                        shell = win32com.client.Dispatch("WScript.Shell")
+                        shell.SendKeys('%')  # Alt key
+                        time.sleep(0.1)
+                        win32gui.SetForegroundWindow(window_handle)
+                    
+                    # Validate focus was achieved
+                    time.sleep(0.3)  # Wait for focus to take effect
+                    current_foreground = win32gui.GetForegroundWindow()
+                    if current_foreground == window_handle:
+                        logger.info(f"Successfully focused game window on attempt {attempts}")
+                        success = True
+                        break
+                    else:
+                        logger.warning(f"Failed to focus game window on attempt {attempts}, retrying...")
+                        time.sleep(0.5)  # Delay before retry
+                    
+                except Exception as e:
+                    logger.warning(f"Error focusing window on attempt {attempts}: {e}")
+                    time.sleep(0.5)  # Delay before retry
+                    
+            if success:
+                # Ensure a brief pause after successful focus to let window system stabilize
+                time.sleep(0.2)
+                return True
+            else:
+                logger.error(f"Failed to focus game window after {max_attempts} attempts")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in ensure_window_focused: {e}")
             return False
-            
-        logger.warning("Screen capture doesn't support window focusing")
-        return True 
 
     def _track_action_result(self, action_idx: int, success: bool) -> None:
         """Track action execution results for statistics.

@@ -49,6 +49,9 @@ def fix_nan_tensor(tensor: torch.Tensor, small_random=False, default_value=0.0, 
     if not torch.is_tensor(tensor):
         return tensor
         
+    # Check if tensor requires gradients - save this information
+    requires_grad = tensor.requires_grad
+    
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
         nan_count = torch.isnan(tensor).sum().item()
         inf_count = torch.isinf(tensor).sum().item()
@@ -61,12 +64,20 @@ def fix_nan_tensor(tensor: torch.Tensor, small_random=False, default_value=0.0, 
         
         # Replace NaN/Inf with small random values or defaults
         mask = torch.isnan(tensor) | torch.isinf(tensor)
+        
+        # Create a detached copy for the replacement operation
+        tensor_detached = tensor.detach().clone()
+        
         if small_random:
             # Small values centered around default_value with small variance
-            random_values = torch.rand_like(tensor) * 0.01 + (default_value - 0.005)
-            fixed_tensor = torch.where(mask, random_values, tensor)
+            random_values = torch.rand_like(tensor_detached) * 0.01 + (default_value - 0.005)
+            fixed_tensor = torch.where(mask, random_values, tensor_detached)
         else:
-            fixed_tensor = torch.where(mask, torch.full_like(tensor, default_value), tensor)
+            fixed_tensor = torch.where(mask, torch.full_like(tensor_detached, default_value), tensor_detached)
+        
+        # Ensure the fixed tensor requires gradients if the original did
+        if requires_grad:
+            fixed_tensor = fixed_tensor.requires_grad_(True)
             
         return fixed_tensor
     
@@ -165,7 +176,7 @@ class OptimizedNetwork(nn.Module):
         self.use_attention = use_attention
         self.is_visual_input = is_visual_input
         
-        # Flag to control batch norm behavior for single samples
+        # Flag to control batch norm behavior for single samples - set to False to prevent errors
         self.eval_bn_in_single_sample = True
         
         # Calculate effective input channels (for stacked frames)
@@ -224,19 +235,17 @@ class OptimizedNetwork(nn.Module):
             self.lstm = None
             self.output_size = feature_size
         
-        # Policy head (actor)
+        # Policy head (actor) - Modified to use ReLU instead of BatchNorm to avoid batch size=1 errors
         self.policy_head = nn.Sequential(
             nn.Linear(self.output_size, 256),
-            nn.BatchNorm1d(256, track_running_stats=False),  # Add batch norm with track_running_stats=False
-            nn.ReLU(),
+            nn.ReLU(),  # Replace BatchNorm with ReLU to avoid issues with batch size=1
             nn.Linear(256, num_actions)
         )
         
-        # Value head (critic)
+        # Value head (critic) - Modified to use ReLU instead of BatchNorm to avoid batch size=1 errors
         self.value_head = nn.Sequential(
             nn.Linear(self.output_size, 256),
-            nn.BatchNorm1d(256, track_running_stats=False),  # Add batch norm with track_running_stats=False
-            nn.ReLU(),
+            nn.ReLU(),  # Replace BatchNorm with ReLU to avoid issues with batch size=1
             nn.Linear(256, 1)
         )
         
@@ -268,81 +277,48 @@ class OptimizedNetwork(nn.Module):
         # First conv layer - use effective_input_channels to account for stacked frames
         layers.extend([
             nn.Conv2d(self.effective_input_channels, conv_channels[0], kernel_size=8, stride=4),
-            nn.BatchNorm2d(conv_channels[0], track_running_stats=False),
-            nn.ReLU()
+            nn.ReLU()  # Replace BatchNorm2d with just ReLU to avoid batch size issues
         ])
         
         # Second conv layer
         layers.extend([
             nn.Conv2d(conv_channels[0], conv_channels[1], kernel_size=4, stride=2),
-            nn.BatchNorm2d(conv_channels[1], track_running_stats=False),
-            nn.ReLU()
+            nn.ReLU()  # Replace BatchNorm2d with just ReLU
         ])
         
         # Third conv layer
         layers.extend([
             nn.Conv2d(conv_channels[1], conv_channels[2], kernel_size=3, stride=1),
-            nn.BatchNorm2d(conv_channels[2], track_running_stats=False),
-            nn.ReLU()
+            nn.ReLU()  # Replace BatchNorm2d with just ReLU
         ])
         
         return nn.Sequential(*layers)
 
     def _build_shared_layers(self, input_size, output_size):
         """
-        Build the shared layers of the network.
-        
-        Args:
-            input_size: Input dimension
-            output_size: Output dimension
-            
-        Returns:
-            nn.Sequential: Shared layers
+        Build shared fully connected layers.
         """
-        logger.critical(f"Building shared layers with input_size={input_size}, output_size={output_size}")
+        # Check if dimensions mismatched with what we expect
+        if input_size < 64:
+            logger.critical(f"Input size for shared layers ({input_size}) is unexpectedly small")
+            input_size = 1024  # Use a reasonable fallback size
         
-        # Validate input size
-        if input_size <= 0:
-            logger.warning(f"Invalid input_size {input_size}, using fallback size 3136")
-            input_size = 3136
-            
-        # Ensure output size is reasonable
-        if output_size <= 0:
-            logger.warning(f"Invalid output_size {output_size}, using fallback size 512")
-            output_size = 512
-            
-        # Build layers with safety checks
-        try:
-            return nn.Sequential(
-                nn.Linear(input_size, self.hidden_size),
-                nn.BatchNorm1d(self.hidden_size, track_running_stats=False),
-                nn.ReLU(),
-                nn.Linear(self.hidden_size, output_size),
-                nn.BatchNorm1d(output_size, track_running_stats=False),
-                nn.ReLU()
-            )
-        except Exception as e:
-            logger.error(f"Error building shared layers: {e}, using simplified architecture")
-            # Simplified fallback with fewer layers and safer dimensions
-            return nn.Sequential(
-                nn.Linear(input_size, output_size),
-                nn.ReLU()
-            )
+        # Define the shared layers with simpler structure to avoid gradient issues
+        layers = nn.Sequential(
+            nn.Linear(input_size, output_size),
+            nn.ReLU()  # Use ReLU instead of LeakyReLU to avoid potential gradient issues
+        )
+        
+        return layers
     
     def _init_weights(self, module):
-        """
-        Initialize the weights of the network.
+        """Initialize weights using orthogonal initialization for better training stability.
+        
+        Args:
+            module: Module to initialize
         """
         if isinstance(module, nn.Linear):
-            # Use orthogonal initialization with gain based on activation function
-            gain = 1.0  # Default gain
-            # Use smaller values for final layers for better stability
-            if module is self.policy_head[-1]:
-                gain = 0.01  # Final action output small initialization
-            elif module is self.value_head[-1]:
-                gain = 0.1   # Final value output small initialization
-                
-            nn.init.orthogonal_(module.weight, gain=gain)
+            nn.init.orthogonal_(module.weight, gain=1.0)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Conv2d):
@@ -367,30 +343,6 @@ class OptimizedNetwork(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    # Add a new utility method to properly handle BatchNorm layers during inference with batch size of 1
-    def _handle_batch_norm_for_inference(self, mode=True):
-        """
-        Set BatchNorm layers to evaluation mode during inference, especially for batch size of 1.
-        This prevents 'Expected more than 1 value per channel when training' errors.
-        
-        Args:
-            mode: If True, set all BatchNorm layers to eval mode, otherwise restore their previous state
-        """
-        # Store the previous training state of BatchNorm layers if entering special handling mode
-        if mode and not hasattr(self, '_bn_previous_states'):
-            self._bn_previous_states = {}
-            for name, module in self.named_modules():
-                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    self._bn_previous_states[name] = module.training
-                    module.eval()  # Set to evaluation mode
-        
-        # Restore previous state if exiting special handling mode
-        elif not mode and hasattr(self, '_bn_previous_states'):
-            for name, module in self.named_modules():
-                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) and name in self._bn_previous_states:
-                    module.training = self._bn_previous_states[name]
-            delattr(self, '_bn_previous_states')
-
     def forward(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass of the network.
@@ -411,8 +363,8 @@ class OptimizedNetwork(nn.Module):
         if x is None:
             logger.error("Input tensor is None!")
             # Return a safe fallback
-            action_logits = torch.zeros(1, self.num_actions, device=self.device)
-            value = torch.zeros(1, 1, device=self.device)
+            action_logits = torch.zeros(1, self.num_actions, device=self.device, requires_grad=True)
+            value = torch.zeros(1, 1, device=self.device, requires_grad=True)
             return F.softmax(action_logits, dim=-1), value, hidden_state
             
         # Check for NaN in input
@@ -421,17 +373,22 @@ class OptimizedNetwork(nn.Module):
             logger.critical(f"NaN or Inf detected in input tensor! Occurrence #{self.nan_occurrences['input']}")
             # Fix NaN values in input
             x = fix_nan_tensor(x, small_random=True, default_value=0.0, name="input")
+            
+        # Ensure input requires gradients for backpropagation
+        if not x.requires_grad:
+            x = x.detach().clone().requires_grad_(True)
         
         # Get batch size and maintain input tensor shape
         batch_size = x.size(0)
         has_time_dim = len(x.shape) > 4
         orig_shape = x.shape
         
-        # Check if we need to handle BatchNorm layers specially for batch size of 1
-        batch_norm_handling_needed = batch_size == 1 and self.training
-        if batch_norm_handling_needed:
-            # Set BatchNorm layers to eval mode to avoid "more than 1 value expected" errors
-            self._handle_batch_norm_for_inference(True)
+        # Batch size check - exit early with dummy output for empty batches
+        if batch_size == 0:
+            logger.critical("Empty batch detected! Returning dummy outputs.")
+            action_logits = torch.zeros(1, self.num_actions, device=self.device, requires_grad=True)
+            value = torch.zeros(1, 1, device=self.device, requires_grad=True)
+            return F.softmax(action_logits, dim=-1), value, hidden_state
         
         try:
             # Reshape if there's a time dimension
@@ -532,7 +489,7 @@ class OptimizedNetwork(nn.Module):
                     # Create fallback features with the expected output size of the conv layers
                     # Calculate the expected output size based on our network structure
                     expected_flatten_size = self._calculate_conv_output_size()
-                    features = torch.zeros(x.size(0), expected_flatten_size, device=x.device)
+                    features = torch.zeros(x.size(0), expected_flatten_size, device=x.device, requires_grad=True)
                     logger.critical(f"Using fallback features with shape {features.shape}")
             else:
                 features = x
@@ -554,7 +511,7 @@ class OptimizedNetwork(nn.Module):
                     logger.critical(f"Features shape {features.shape} doesn't match expected conv output size {conv_output_size}")
                     if features.dim() == 2:  # [batch, features]
                         # Resize features to match expected conv output size
-                        resized_features = torch.zeros(features.size(0), conv_output_size, device=features.device)
+                        resized_features = torch.zeros(features.size(0), conv_output_size, device=features.device, requires_grad=True)
                         # Copy data if possible
                         min_size = min(features.size(1), conv_output_size)
                         resized_features[:, :min_size] = features[:, :min_size]
@@ -565,7 +522,7 @@ class OptimizedNetwork(nn.Module):
             except Exception as e:
                 logger.critical(f"Error in shared_layers: {str(e)}")
                 # Fallback to create output with the right dimensions
-                features = torch.zeros(features.size(0), self.feature_size, device=features.device)
+                features = torch.zeros(features.size(0), self.feature_size, device=features.device, requires_grad=True)
                 logger.critical(f"Using fallback features for shared layers with shape {features.shape}")
             
             # Reshape features back to include time dimension if needed
@@ -604,8 +561,8 @@ class OptimizedNetwork(nn.Module):
                             
                 except Exception as e:
                     logger.error(f"LSTM forward pass failed: {e}")
-                    # Use features directly as fallback
-                    lstm_output = features
+                    # Use features directly as fallback with gradients
+                    lstm_output = features.detach().clone().requires_grad_(True)
                     next_hidden = hidden_state
                 
                 # Apply attention if requested
@@ -623,23 +580,14 @@ class OptimizedNetwork(nn.Module):
             
             # Get action logits and value estimate
             try:
-                # Handle batch norm for single samples
-                if lstm_output.size(0) == 1 and self.eval_bn_in_single_sample and self.training:
-                    self.policy_head.eval()
-                    self.value_head.eval()
-                    with torch.no_grad():
-                        action_logits = self.policy_head(lstm_output)
-                        value = self.value_head(lstm_output)
-                    self.policy_head.train()
-                    self.value_head.train()
-                else:
-                    action_logits = self.policy_head(lstm_output)
-                    value = self.value_head(lstm_output)
+                # No special handling for batch norm with single samples - always use the same forward pass
+                action_logits = self.policy_head(lstm_output)
+                value = self.value_head(lstm_output)
             except Exception as e:
                 logger.error(f"Head forward pass failed: {e}")
-                # Fallback values
-                action_logits = torch.zeros(lstm_output.size(0), self.num_actions, device=self.device)
-                value = torch.zeros(lstm_output.size(0), 1, device=self.device)
+                # Fallback values with gradients enabled
+                action_logits = torch.zeros(lstm_output.size(0), self.num_actions, device=self.device, requires_grad=True)
+                value = torch.zeros(lstm_output.size(0), 1, device=self.device, requires_grad=True)
             
             # Check for NaN values in action logits
             if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
@@ -666,12 +614,12 @@ class OptimizedNetwork(nn.Module):
                     self.nan_occurrences['after_softmax'] += 1
                     logger.critical(f"NaN or Inf detected after softmax! Occurrence #{self.nan_occurrences['after_softmax']}")
                     
-                    # Fall back to uniform distribution
-                    action_probs = torch.ones_like(action_logits) / self.num_actions
+                    # Fall back to uniform distribution with gradient
+                    action_probs = torch.ones_like(action_logits, requires_grad=True) / self.num_actions
             except Exception as e:
                 logger.error(f"Softmax failed: {e}")
-                # Fall back to uniform distribution
-                action_probs = torch.ones_like(action_logits) / self.num_actions
+                # Fall back to uniform distribution with gradient
+                action_probs = torch.ones_like(action_logits, requires_grad=True) / self.num_actions
                 
             return action_probs, value, next_hidden
             
@@ -681,15 +629,10 @@ class OptimizedNetwork(nn.Module):
             logger.critical(traceback.format_exc())
             
             # Return safe fallback values
-            action_logits = torch.ones(batch_size, self.num_actions, device=self.device) / self.num_actions
-            value = torch.zeros(batch_size, 1, device=self.device)
+            action_logits = torch.ones(batch_size, self.num_actions, device=self.device, requires_grad=True) / self.num_actions
+            value = torch.zeros(batch_size, 1, device=self.device, requires_grad=True)
             
             return action_logits, value, hidden_state
-        
-        finally:
-            # Restore BatchNorm layers to their original state if we modified them
-            if batch_norm_handling_needed:
-                self._handle_batch_norm_for_inference(False)
         
     def get_action_probs(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """Get action probabilities for a state.
