@@ -86,8 +86,10 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         # Set up input/output dimensions
         if isinstance(observation_space, tuple):
             self.input_shape = observation_space
+            self.state_dim = observation_space
         else:
             self.input_shape = observation_space.shape
+            self.state_dim = observation_space.shape
             
         if hasattr(action_space, 'n'):
             self.action_dim = action_space.n
