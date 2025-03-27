@@ -6,6 +6,7 @@ import torch
 import torch.cuda.amp as amp
 from typing import Tuple, Dict, Any, Optional
 import logging
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -14,15 +15,57 @@ class HardwareConfig:
     
     def __init__(
         self,
+        # Hardware params
         batch_size: int = 64,
-        learning_rate: float = 1e-4, 
+        learning_rate: float = 3e-4,
         device: str = "auto",
-        resolution: Tuple[int, int] = (320, 240),
-        frame_stack: int = 1,
+        resolution: Tuple[int, int] = (84, 84),
+        frame_stack: int = 4,
         frame_skip: int = 2,
-        use_fp16: bool = False,
-        cpu_threads: int = 0,  # 0 means use all available
-        force_cpu: bool = False
+        use_fp16: bool = True,
+        cpu_threads: int = 0,
+        force_cpu: bool = False,
+
+        # Training loop params
+        num_episodes: int = 1000,
+        max_steps: int = 1000,
+        early_stop_reward: Optional[float] = None,
+        update_frequency: int = 2048,
+
+        # Optimizer params
+        optimizer: str = "adam",
+        weight_decay: float = 0.0,
+
+        # PPO params
+        gamma: float = 0.99,
+        ppo_epochs: int = 4,
+        clip_param: float = 0.2,
+        value_loss_coef: float = 0.5,
+        entropy_coef: float = 0.01,
+        max_grad_norm: float = 0.5,
+        gae_lambda: float = 0.95,
+
+        # Checkpointing params
+        checkpoint_dir: str = "checkpoints",
+        checkpoint_freq: int = 100,
+        max_checkpoints: int = 5,
+
+        # Logging / Visualization
+        tensorboard_dir: str = "logs",
+        visualizer_update_interval: int = 10,
+        use_wandb: bool = False,
+
+        # Performance Safeguards
+        monitor_hardware: bool = True,
+        min_fps: int = 10,
+        max_memory_usage: float = 0.9,
+        safeguard_cooldown: int = 60,
+
+        # Memory settings
+        memory: Optional[Dict[str, Any]] = None,
+
+        # Hierarchical settings
+        hierarchical: Optional[Dict[str, Any]] = None,
     ):
         """Initialize hardware configuration.
         
@@ -36,7 +79,33 @@ class HardwareConfig:
             use_fp16 (bool): Whether to use half precision (FP16)
             cpu_threads (int): Number of CPU threads to use (0 = all available)
             force_cpu (bool): Whether to force CPU usage
+            num_episodes (int): Number of training episodes
+            max_steps (int): Maximum number of steps per episode
+            early_stop_reward (Optional[float]): Reward threshold for early stopping
+            update_frequency (int): Frequency of updates in training loop
+            optimizer (str): Optimizer to use
+            weight_decay (float): Weight decay for optimizer
+            gamma (float): Discount factor for PPO
+            ppo_epochs (int): Number of PPO epochs
+            clip_param (float): Clipping parameter for PPO
+            value_loss_coef (float): Value loss coefficient for PPO
+            entropy_coef (float): Entropy coefficient for PPO
+            max_grad_norm (float): Maximum gradient norm for PPO
+            gae_lambda (float): Lambda parameter for GAE
+            checkpoint_dir (str): Directory for saving checkpoints
+            checkpoint_freq (int): Frequency of checkpoint saving
+            max_checkpoints (int): Maximum number of checkpoints to keep
+            tensorboard_dir (str): Directory for TensorBoard logs
+            visualizer_update_interval (int): Interval for visualizer updates
+            use_wandb (bool): Whether to use Weights & Biases for logging
+            monitor_hardware (bool): Whether to monitor hardware resources
+            min_fps (int): Minimum frames per second for monitoring
+            max_memory_usage (float): Maximum memory usage for monitoring
+            safeguard_cooldown (int): Cooldown period for safeguard actions
+            memory (Optional[Dict[str, Any]]): Memory settings
+            hierarchical (Optional[Dict[str, Any]]): Hierarchical settings
         """
+        # Hardware params
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self._device_str = device
@@ -44,32 +113,98 @@ class HardwareConfig:
         self.frame_stack = max(1, frame_stack)
         self.frame_skip = max(1, frame_skip)
         self.use_fp16 = use_fp16 and self._supports_fp16()
-        # Alias for use_fp16 for compatibility
         self.use_mixed_precision = self.use_fp16
         self.cpu_threads = cpu_threads
         self.force_cpu = force_cpu
-        
-        # RL-specific parameters
-        self.gamma = 0.99
-        self.ppo_epochs = 4
-        self.clip_range = 0.2
-        self.value_loss_coef = 0.5
-        self.entropy_coef = 0.01
-        self.max_grad_norm = 0.5
-        self.gae_lambda = 0.95
-        
-        # Auto-configure device
+
+        # Training loop params
+        self.num_episodes = num_episodes
+        self.max_steps = max_steps
+        self.early_stop_reward = early_stop_reward
+        self.update_frequency = update_frequency
+
+        # Optimizer params
+        self.optimizer = optimizer
+        self.weight_decay = weight_decay
+
+        # PPO params
+        self.gamma = gamma
+        self.ppo_epochs = ppo_epochs
+        self.clip_param = clip_param
+        self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
+        self.max_grad_norm = max_grad_norm
+        self.gae_lambda = gae_lambda
+
+        # Checkpointing params
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_freq = checkpoint_freq
+        self.max_checkpoints = max_checkpoints
+
+        # Logging / Visualization
+        self.tensorboard_dir = tensorboard_dir
+        self.visualizer_update_interval = visualizer_update_interval
+        self.use_wandb = use_wandb
+
+        # Performance Safeguards
+        self.monitor_hardware = monitor_hardware
+        self.min_fps = min_fps
+        self.max_memory_usage = max_memory_usage
+        self.safeguard_cooldown = safeguard_cooldown
+
+        # Memory settings
+        self.memory = memory if memory is not None else {
+            'enabled': True,
+            'memory_size': 2000,
+            'key_size': 128,
+            'value_size': 256,
+            'retrieval_threshold': 0.5,
+            'warmup_episodes': 10,
+            'use_curriculum': True,
+            'curriculum_phases': {
+                'observation': 10,
+                'retrieval': 30,
+                'integration': 50,
+                'refinement': 100
+            },
+            'memory_use_probability': 0.8
+        }
+
+        # Hierarchical settings
+        self.hierarchical = hierarchical if hierarchical is not None else {
+            'enabled': True,
+            'feature_dim': 512,
+            'latent_dim': 256,
+            'prediction_horizon': 5,
+            'adaptive_memory_use': True,
+            'adaptive_memory_threshold': 0.7,
+            'training_schedules': {
+                'visual_network': 10,
+                'world_model': 5,
+                'error_detection': 20
+            },
+            'batch_sizes': {
+                'visual_network': 32,
+                'world_model': 64,
+                'error_detection': 32
+            },
+            'progressive_training': True,
+            'progressive_phases': {
+                'visual_network': 50,
+                'world_model': 100,
+                'error_detection': 150
+            }
+        }
+
+        # Auto-configure device, dtype, threads
         self._device = self._configure_device()
         self._dtype = torch.float16 if self.use_fp16 else torch.float32
-        
-        # Log configuration
-        logger.info(f"Hardware config initialized - Device: {self._device}, Resolution: {resolution}, "
-                   f"Batch size: {batch_size}, FP16: {self.use_fp16}")
-        
-        # Set CPU threads if specified
         if self.cpu_threads > 0:
             torch.set_num_threads(self.cpu_threads)
             logger.info(f"Set CPU threads to {self.cpu_threads}")
+
+        logger.info(f"Hardware config initialized - Device: {self._device}, Resolution: {self.resolution}, "
+                   f"Batch size: {self.batch_size}, FP16: {self.use_fp16}")
     
     def _configure_device(self) -> torch.device:
         """Configure the device to use based on availability.
@@ -77,23 +212,26 @@ class HardwareConfig:
         Returns:
             torch.device: Configured device
         """
+        if self.force_cpu:
+            return torch.device("cpu")
+
         if self._device_str == "auto":
-            # Auto-detect optimal device
             if torch.cuda.is_available():
                 device = torch.device("cuda:0")
-                logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+                logger.info(f"Auto-detected CUDA device: {torch.cuda.get_device_name(0)}")
             else:
                 device = torch.device("cpu")
                 logger.info("CUDA not available, using CPU")
         else:
-            # Use specified device
             try:
                 device = torch.device(self._device_str)
                 if device.type == "cuda" and not torch.cuda.is_available():
                     logger.warning("CUDA requested but not available, falling back to CPU")
                     device = torch.device("cpu")
+                else:
+                    logger.info(f"Using specified device: {device}")
             except Exception as e:
-                logger.error(f"Invalid device {self._device_str}: {e}, falling back to CPU")
+                logger.error(f"Invalid device string {self._device_str}: {e}, falling back to CPU")
                 device = torch.device("cpu")
                 
         return device
@@ -104,39 +242,23 @@ class HardwareConfig:
         Returns:
             bool: True if FP16 is supported, False otherwise
         """
-        if not torch.cuda.is_available():
+        device = self._configure_device()
+        if device.type != "cuda":
             return False
             
         try:
-            # Check specific GPU compute capability for FP16 support
-            cuda_device = torch.cuda.current_device()
-            capability = torch.cuda.get_device_capability(cuda_device)
-            major, minor = capability
-            
-            # Pascal (6.x) and higher architectures support FP16 well
-            return major >= 6
+            capability = torch.cuda.get_device_capability(device)
+            return capability[0] >= 7  # Volta and newer have good FP16 support
         except Exception as e:
             logger.warning(f"Error checking FP16 support: {e}")
             return False
     
     def get_device(self) -> torch.device:
-        """Get the appropriate device for computation.
-        
-        Returns:
-            torch.device: Device to use for computation
-        """
-        if torch.cuda.is_available() and not self.force_cpu:
-            # Always use cuda:0 for consistency
-            return torch.device('cuda:0')
-        else:
-            return torch.device('cpu')
+        """Get the configured device."""
+        return self._device
     
     def get_dtype(self) -> torch.dtype:
-        """Get the data type to use for training.
-        
-        Returns:
-            torch.dtype: Data type to use
-        """
+        """Get the data type based on mixed precision setting."""
         return self._dtype
         
     def to_dict(self) -> Dict[str, Any]:
@@ -145,23 +267,7 @@ class HardwareConfig:
         Returns:
             Dict[str, Any]: Configuration as dictionary
         """
-        return {
-            "batch_size": self.batch_size,
-            "learning_rate": self.learning_rate,
-            "device": str(self._device),
-            "resolution": self.resolution,
-            "frame_stack": self.frame_stack,
-            "frame_skip": self.frame_skip,
-            "use_fp16": self.use_fp16,
-            "cpu_threads": self.cpu_threads,
-            "gamma": self.gamma,
-            "ppo_epochs": self.ppo_epochs,
-            "clip_range": self.clip_range,
-            "value_loss_coef": self.value_loss_coef,
-            "entropy_coef": self.entropy_coef,
-            "max_grad_norm": self.max_grad_norm,
-            "gae_lambda": self.gae_lambda
-        }
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
         
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'HardwareConfig':
@@ -173,36 +279,9 @@ class HardwareConfig:
         Returns:
             HardwareConfig: Configuration object
         """
-        # Extract core parameters
-        instance = cls(
-            batch_size=config_dict.get("batch_size", 64),
-            learning_rate=config_dict.get("learning_rate", 1e-4),
-            device=config_dict.get("device", "auto"),
-            resolution=config_dict.get("resolution", (320, 240)),
-            frame_stack=config_dict.get("frame_stack", 1),
-            frame_skip=config_dict.get("frame_skip", 2),
-            use_fp16=config_dict.get("use_fp16", False),
-            cpu_threads=config_dict.get("cpu_threads", 0),
-            force_cpu=config_dict.get("force_cpu", False)
-        )
-        
-        # Set additional parameters
-        if "gamma" in config_dict:
-            instance.gamma = config_dict["gamma"]
-        if "ppo_epochs" in config_dict:
-            instance.ppo_epochs = config_dict["ppo_epochs"]
-        if "clip_range" in config_dict:
-            instance.clip_range = config_dict["clip_range"]
-        if "value_loss_coef" in config_dict:
-            instance.value_loss_coef = config_dict["value_loss_coef"]
-        if "entropy_coef" in config_dict:
-            instance.entropy_coef = config_dict["entropy_coef"]
-        if "max_grad_norm" in config_dict:
-            instance.max_grad_norm = config_dict["max_grad_norm"]
-        if "gae_lambda" in config_dict:
-            instance.gae_lambda = config_dict["gae_lambda"]
-            
-        return instance
+        init_keys = cls.__init__.__code__.co_varnames[1:cls.__init__.__code__.co_argcount]
+        filtered_dict = {k: v for k, v in config_dict.items() if k in init_keys}
+        return cls(**filtered_dict)
 
     def optimize_for_inference(self) -> None:
         """Configure PyTorch for optimal inference performance."""
@@ -214,8 +293,18 @@ class HardwareConfig:
                 
     def get_amp_context(self):
         """Get the appropriate autocast context for mixed precision."""
-        if self._device.type == "cuda" and self.use_fp16:
-            return torch.amp.autocast(device_type='cuda', dtype=self._dtype)
+        if self.use_mixed_precision and self._device.type == 'cuda':
+            return torch.cuda.amp.autocast()
         else:
-            # Return a dummy context manager that does nothing
-            return torch.no_grad()
+            @contextlib.contextmanager
+            def nullcontext():
+                yield
+            return nullcontext()
+
+    def is_memory_enabled(self) -> bool:
+        """Check if memory augmentation is enabled."""
+        return self.memory.get('enabled', False)
+
+    def is_hierarchical_enabled(self) -> bool:
+        """Check if hierarchical learning is enabled."""
+        return self.hierarchical.get('enabled', False)

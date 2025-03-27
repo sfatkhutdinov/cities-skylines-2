@@ -165,10 +165,24 @@ class PPOAgent:
             info: Additional information from environment for action selection
             
         Returns:
-            Selected action
+            Dictionary containing:
+                - action: Selected action tensor
+                - log_prob: Log probability of selected action
+                - value: Value estimate for current state
+                - action_probs: Action probabilities tensor
         """
         try:
             with torch.no_grad():
+                # Ensure state is a tensor and on the correct device
+                if not isinstance(state, torch.Tensor):
+                    state = torch.as_tensor(state, device=self.device).float()
+                elif state.device != self.device:
+                    state = state.to(self.device)
+
+                # Add batch dim if missing
+                if state.dim() == 3:  # [C, H, W]
+                    state = state.unsqueeze(0)
+
                 # Forward pass through policy network
                 action_probs, value, next_hidden = self.policy(state, self.hidden_state)
                 
@@ -203,15 +217,28 @@ class PPOAgent:
                 
                 # Store current value and log probability for update
                 self.last_state = state
-                self.last_action = action_item
+                self.last_action_tensor = action  # Store the tensor action for potential updates
+                self.last_action = action_item  # Store the int action for history/logging
                 self.last_value = value
                 self.last_log_prob = action_distribution.log_prob(action)
                 
-                return action_item
+                # Return standardized dictionary
+                return {
+                    'action': action,  # Return the tensor action
+                    'log_prob': self.last_log_prob,
+                    'value': self.last_value,
+                    'action_probs': action_probs  # Include probs if needed elsewhere
+                }
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
-            # Fallback to random action
-            return random.randint(0, self.action_dim - 1)
+            # Fallback
+            random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
+            return {
+                'action': random_action,
+                'log_prob': torch.tensor(0.0, device=self.device),
+                'value': torch.tensor(0.0, device=self.device),
+                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim
+            }
     
     def store_experience(self, state: torch.Tensor, 
                         action: torch.Tensor, 

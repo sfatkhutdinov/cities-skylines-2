@@ -97,41 +97,56 @@ class MemoryAugmentedAgent(PPOAgent):
         
         logger.critical(f"Initialized memory-augmented agent with memory size {memory_size}")
     
-    def select_action(self, state, deterministic=False):
-        """Select an action based on the current state with memory augmentation.
+    def select_action(self, state, deterministic=False, info=None):
+        """Select an action based on current state and memory.
         
         Args:
-            state: Current state
-            deterministic: Whether to select the action deterministically
+            state: Current state observation
+            deterministic: Whether to select the highest probability action
+            info: Additional information from environment for action selection
             
         Returns:
-            dict: Containing action, log_prob, value, and other info
+            Dictionary containing:
+                - action: Selected action tensor
+                - log_prob: Log probability of selected action
+                - value: Value estimate for current state
+                - action_probs: Action probabilities tensor
         """
-        logger.critical(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
-        
-        # Ensure state is a tensor
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, device=self.device).float()
-        
         try:
             with torch.no_grad():
-                # Decide whether to use memory for this decision
-                use_memory = self.memory_enabled and np.random.random() < self.memory_use_prob
-                
-                # Forward pass through policy network with memory
-                action_probs, value, next_hidden = self.policy(
-                    state, 
-                    self.hidden_state, 
-                    use_memory=use_memory
-                )
+                # Ensure state is a tensor and on the correct device
+                if not isinstance(state, torch.Tensor):
+                    state = torch.as_tensor(state, device=self.device).float()
+                elif state.device != self.device:
+                    state = state.to(self.device)
+
+                # Add batch dim if missing
+                if state.dim() == 3:  # [C, H, W]
+                    state = state.unsqueeze(0)
+
+                # Get memory context if enabled
+                memory_context = None
+                if self.memory_enabled and self.policy.memory_network is not None:
+                    memory_context = self.policy.memory_network.get_context(state)
+
+                # Forward pass through policy network with memory context
+                action_probs, value, next_hidden = self.policy(state, self.hidden_state, memory_context)
                 
                 # Update hidden state for next time
                 self.hidden_state = next_hidden
                 
-                # Apply action smoothing from parent class (if using)
-                if len(self.action_history) > 0 and not deterministic:
-                    action_probs = self._apply_action_smoothing(action_probs)
-                    # Recalculate distribution with smoothed probabilities
+                # Process environment info if provided
+                if info is not None:
+                    self.process_step_info(info)
+                    
+                    # Track if we're currently in a menu
+                    self.in_menu = info.get('in_menu', False)
+                
+                # Apply menu action penalties
+                action_probs = self.adjust_action_probs(action_probs)
+                
+                # Apply action smoothing
+                action_probs = self._apply_action_smoothing(action_probs)
                 
                 # Create categorical distribution
                 action_distribution = torch.distributions.Categorical(action_probs)
@@ -146,54 +161,33 @@ class MemoryAugmentedAgent(PPOAgent):
                 action_item = action.cpu().item()
                 self._update_action_history(action_item)
                 
-                # Get log probability
-                log_prob = action_distribution.log_prob(action)
+                # Store current value and log probability for update
+                self.last_state = state
+                self.last_action_tensor = action  # Store the tensor action for potential updates
+                self.last_action = action_item  # Store the int action for history/logging
+                self.last_value = value
+                self.last_log_prob = action_distribution.log_prob(action)
                 
-                # Extract state embedding for potential memory storage
-                try:
-                    state_embedding = self.policy.extract_state_embedding(state, self.hidden_state)
-                    # Store info for experience processing
-                    self.last_state_embedding = state_embedding
-                except Exception as e:
-                    logger.error(f"Error extracting state embedding: {e}")
-                    state_embedding = None
-                    self.last_state_embedding = None
+                # Update memory if enabled
+                if self.memory_enabled and self.policy.memory_network is not None:
+                    self.policy.memory_network.update(state, action, value)
                 
-                # Create info dictionary
-                info = {
-                    'action_probs': action_probs,
-                    'action_distribution': action_distribution,
-                    'log_prob': log_prob,
-                    'value': value,
-                    'used_memory': use_memory,
-                    'state_embedding': state_embedding
-                }
-                
-                # Return action information
-                logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
+                # Return standardized dictionary
                 return {
-                    'action': action,
-                    'log_prob': log_prob,
-                    'value': value,
-                    'action_probs': action_probs,
-                    'state_embedding': state_embedding,
-                    'used_memory': use_memory
+                    'action': action,  # Return the tensor action
+                    'log_prob': self.last_log_prob,
+                    'value': self.last_value,
+                    'action_probs': action_probs  # Include probs if needed elsewhere
                 }
-                
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            # Return a random action as fallback
+            # Fallback
             random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
             return {
                 'action': random_action,
                 'log_prob': torch.tensor(0.0, device=self.device),
                 'value': torch.tensor(0.0, device=self.device),
-                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim,
-                'state_embedding': None,
-                'used_memory': False
+                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim
             }
     
     def process_experience(self, state, action, reward, next_state, done, info=None):

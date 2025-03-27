@@ -202,81 +202,62 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                 return observation.reshape(-1)
             return observation
     
-    def select_action(self, state, deterministic=False):
-        """Select an action based on the current state with hierarchical processing.
+    def select_action(self, state, deterministic=False, info=None):
+        """Select an action based on current state using hierarchical policy.
         
         Args:
-            state: Current state (raw observation)
-            deterministic: Whether to select the action deterministically
+            state: Current state observation
+            deterministic: Whether to select the highest probability action
+            info: Additional information from environment for action selection
             
         Returns:
-            tuple: (action, log_prob, value) for compatibility with the trainer
+            Dictionary containing:
+                - action: Selected action tensor
+                - log_prob: Log probability of selected action
+                - value: Value estimate for current state
+                - action_probs: Action probabilities tensor
         """
-        logger.debug(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
-        
         try:
-            # 1. Process through Visual Understanding Network if enabled
-            processed_state = self.preprocess_observation(state)
-            
-            # 2. Check for errors in the previous action if available
-            error_detected = False
-            error_info = None
-            
-            if self.use_error_detection and self.last_state is not None and self.last_action is not None:
-                with torch.no_grad():
-                    error_result = self.error_network.detect_errors(
-                        self.last_state,
-                        self.last_action,
-                        processed_state,
-                        self.last_prediction,
-                        self.last_uncertainty
-                    )
-                    
-                    # Check if any serious error was detected
-                    error_severity = error_result['error_severity'].item()
-                    error_detected = error_severity > self.adaptive_memory_threshold
-                    
-                    if error_detected:
-                        error_types = error_result['error_types']
-                        explanations = self.error_network.get_error_explanation(error_types)
-                        error_info = {
-                            'severity': error_severity,
-                            'types': error_types.cpu().numpy(),
-                            'explanations': explanations
-                        }
-                        logger.info(f"Error detected: {error_info}")
-                        
-                        # Adjust memory usage based on error detection
-                        if self.adaptive_memory_use:
-                            # Increase memory usage when errors are detected
-                            self.memory_use_prob = min(1.0, self.memory_use_prob + 0.1)
-                            logger.debug(f"Increased memory usage to {self.memory_use_prob}")
-            
-            # 3. Pass through the memory-augmented policy network
-            # Ensure state is a tensor
-            if not isinstance(processed_state, torch.Tensor):
-                processed_state = torch.tensor(processed_state, device=self.device).float()
-                
-            if len(processed_state.shape) == 1:
-                processed_state = processed_state.unsqueeze(0)
-                
-            # Decide whether to use memory for this decision
-            use_memory = self.memory_enabled and (np.random.random() < self.memory_use_prob or error_detected)
-            
-            # Forward pass through policy network with memory
             with torch.no_grad():
+                # Ensure state is a tensor and on the correct device
+                if not isinstance(state, torch.Tensor):
+                    state = torch.as_tensor(state, device=self.device).float()
+                elif state.device != self.device:
+                    state = state.to(self.device)
+
+                # Add batch dim if missing
+                if state.dim() == 3:  # [C, H, W]
+                    state = state.unsqueeze(0)
+
+                # Get high-level features and latent representation
+                high_level_features = self.visual_network(state)
+                latent_state = self.world_model.encode(high_level_features)
+                
+                # Get hierarchical context
+                hierarchical_context = self.world_model.get_context(latent_state)
+                
+                # Forward pass through policy network with hierarchical context
                 action_probs, value, next_hidden = self.policy(
-                    processed_state, 
-                    self.hidden_state, 
-                    use_memory=use_memory
+                    state, 
+                    self.hidden_state,
+                    hierarchical_context=hierarchical_context
                 )
                 
                 # Update hidden state for next time
                 self.hidden_state = next_hidden
                 
-                # Apply action smoothing from parent class (if using)
-                if len(self.action_history) > 0 and not deterministic:
-                    action_probs = self._apply_action_smoothing(action_probs)
+                # Process environment info if provided
+                if info is not None:
+                    self.process_step_info(info)
+                    
+                    # Track if we're currently in a menu
+                    self.in_menu = info.get('in_menu', False)
+                
+                # Apply menu action penalties
+                action_probs = self.adjust_action_probs(action_probs)
+                
+                # Apply action smoothing
+                action_probs = self._apply_action_smoothing(action_probs)
                 
                 # Create categorical distribution
                 action_distribution = torch.distributions.Categorical(action_probs)
@@ -291,56 +272,35 @@ class HierarchicalAgent(MemoryAugmentedAgent):
                 action_item = action.cpu().item()
                 self._update_action_history(action_item)
                 
-                # Get log probability
-                log_prob = action_distribution.log_prob(action)
+                # Store current value and log probability for update
+                self.last_state = state
+                self.last_action_tensor = action  # Store the tensor action for potential updates
+                self.last_action = action_item  # Store the int action for history/logging
+                self.last_value = value
+                self.last_log_prob = action_distribution.log_prob(action)
                 
-                # Extract state embedding for potential memory storage
-                try:
-                    state_embedding = self.policy.extract_state_embedding(processed_state, self.hidden_state)
-                    # Store info for experience processing
-                    self.last_state_embedding = state_embedding
-                except Exception as e:
-                    logger.error(f"Error extracting state embedding: {e}")
-                    state_embedding = None
-                    self.last_state_embedding = None
-            
-            # 4. Use world model to predict the next state if enabled
-            predicted_next_state = None
-            uncertainty = None
-            
-            if self.use_world_model:
-                with torch.no_grad():
-                    predicted_next_state, uncertainty = self.world_model(processed_state, action)
-                    
-                    # Store for future error detection
-                    self.last_prediction = predicted_next_state
-                    self.last_uncertainty = uncertainty
-            
-            # Store current state and action for future error detection
-            self.last_state = processed_state
-            self.last_action = action
-            
-            # Store additional info as instance variables for process_experience
-            self.last_action_probs = action_probs
-            self.last_state_embedding = state_embedding
-            self.last_used_memory = use_memory
-            self.last_error_detected = error_detected
-            self.last_error_info = error_info
-            self.last_predicted_next_state = predicted_next_state
-            self.last_uncertainty = uncertainty
-            
-            logger.debug(f"Returning action: {action.cpu().numpy().item()}")
-            # Return the triple expected by the trainer
-            return action.cpu().item(), log_prob.cpu().item(), value.cpu().item()
+                # Update world model and error detection
+                if self.training:
+                    self.world_model.update(latent_state, action, value)
+                    self.error_network.update(state, action, value)
                 
+                # Return standardized dictionary
+                return {
+                    'action': action,  # Return the tensor action
+                    'log_prob': self.last_log_prob,
+                    'value': self.last_value,
+                    'action_probs': action_probs  # Include probs if needed elsewhere
+                }
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            # Return a random action as fallback - using the format expected by the trainer
-            random_action = torch.randint(0, self.action_dim, (1,), device=self.device).item()
-            return random_action, 0.0, 0.0
+            # Fallback
+            random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
+            return {
+                'action': random_action,
+                'log_prob': torch.tensor(0.0, device=self.device),
+                'value': torch.tensor(0.0, device=self.device),
+                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim
+            }
     
     def process_experience(self, state, action, reward, next_state, done, info=None):
         """Process experience to potentially store in episodic memory.

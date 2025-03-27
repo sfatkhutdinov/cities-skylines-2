@@ -464,275 +464,233 @@ class Trainer:
         return experiences
     
     def train_episode(
-        self, 
-        episode_num: int, 
+        self,
+        episode_num: int,
         render: bool = False,
         max_steps: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Train for a single episode.
-        
+        """Train for one episode.
+
         Args:
             episode_num: Current episode number
             render: Whether to render the environment
-            max_steps: Maximum steps for this episode (overrides default)
-            
+            max_steps: Maximum number of steps per episode (overrides config)
+
         Returns:
-            Dict with episode metrics
+            Dictionary containing episode statistics
         """
-        logger.critical(f"===== STARTING EPISODE {episode_num} =====")
-        
-        # Reset agent's LSTM state at the beginning of each episode
-        if hasattr(self.agent, 'reset'):
-            logger.critical("Resetting agent state for new episode")
-            self.agent.reset()
-        
-        # Check if using mock environment
-        using_mock = hasattr(self.env, '_update_city_state')
-        logger.critical(f"Using mock environment: {using_mock}")
-        
-        # Set agent to training mode
-        self.agent.train()
-        
-        # Get max steps for this episode
-        max_steps = max_steps or self.max_steps
-        logger.critical(f"Episode configured for max_steps={max_steps}")
-        
-        # Start episode timer
+        if max_steps is None:
+            max_steps = self.config.max_steps
+
         episode_start_time = time.time()
-        
-        # Reset performance tracking
-        if self.performance_safeguards:
-            self.performance_safeguards.reset()
-        
-        # Reset environment and get initial state
-        logger.critical("About to reset environment...")
-        state = self.env.reset()
-        logger.critical(f"Environment reset complete. Observation shape: {state.shape if hasattr(state, 'shape') else 'unknown'}")
-        
-        # Initialize episode variables
-        step = 0
         total_reward = 0.0
-        done = False
-        experiences = []
-        action_counts = {}
-        in_menu = False
-        menu_duration = 0
-        error_states = 0
-        episode_stats = {}
-        
-        # For mixed precision training
-        torch_amp_available = hasattr(torch.cuda, 'amp') and torch.cuda.is_available()
-        using_mixed_precision = self.config.use_mixed_precision and torch_amp_available
-        scaler = torch.cuda.amp.GradScaler() if using_mixed_precision else None
-        
-        logger.critical("Starting episode loop...")
+        episode_steps = 0
+        episode_stats = {
+            "episode": episode_num,
+            "reward": 0.0,
+            "steps": 0,
+            "duration": 0.0,
+            "fps": 0.0,
+            "memory_usage": 0.0,
+            "action_distribution": {},
+            "error_count": 0
+        }
+
+        # Reset agent state
+        self.agent.reset()
+        self.frame_buffer.clear()
+
+        # Reset environment
+        state = self.env.reset()
+        if state is None:
+            logger.error("Environment reset failed, cannot start episode.")
+            return {"episode": episode_num, "reward": 0, "steps": 0, "error": "Reset failed"}
+
+        # Initial frame buffer fill
+        stacked_state = self._get_initial_stacked_observation(state)
+        if stacked_state is None:
+            logger.error("Could not get initial stacked observation.")
+            return {"episode": episode_num, "reward": 0, "steps": 0, "error": "Initial observation failed"}
+
         # Main episode loop
-        while not done and step < max_steps:
-            logger.critical(f"--- Step {step} ---")
-            # Get step start time for timing
+        for step in range(max_steps):
+            logger.debug(f"--- Step {step} ---")
             step_start_time = time.time()
-            
-            # If we're using the mock environment, we'll handle potential errors directly
-            observation_valid = True
-            
-            # Check for early termination request
+
+            # Check for exit request
             if is_exit_requested():
-                logger.critical("Exit requested, ending episode early")
+                logger.info("Exit requested, ending episode")
                 break
-            
+
             # Select action using agent policy
-            logger.critical("Selecting action from policy...")
-            with torch.set_grad_enabled(False):
-                action, log_prob, value = self.agent.select_action(state)
-            logger.critical(f"Selected action: {action}")
-            
-            # Track action distribution
-            action_counts[action] = action_counts.get(action, 0) + 1
-            
+            action_result = self.agent.select_action(stacked_state, info={'step': step})
+
+            # Extract values from action_result dict
+            if isinstance(action_result, dict):
+                action = action_result.get('action')
+                log_prob = action_result.get('log_prob')
+                value = action_result.get('value')
+                action_probs = action_result.get('action_probs')
+            else:
+                logger.error("Agent returned invalid action format")
+                return {"episode": episode_num, "reward": 0, "steps": 0, "error": "Invalid action format"}
+
+            # Basic validation
+            if action is None:
+                logger.warning("Agent returned None action, using random action")
+                action = torch.randint(0, self.agent.action_dim, (1,), device=self.device)
+                log_prob = torch.tensor(0.0, device=self.device)
+                value = torch.tensor(0.0, device=self.device)
+                action_probs = torch.ones(1, self.agent.action_dim, device=self.device) / self.agent.action_dim
+
+            # Convert action tensor to item if needed by env.step
+            action_item = action.item() if isinstance(action, torch.Tensor) else action
+
             # Execute action in environment
-            logger.critical(f"Executing action {action} in environment...")
-            # Force window focus before each step
-            if hasattr(self.env, 'error_recovery') and hasattr(self.env.error_recovery, 'focus_game_window'):
-                focus_success = self.env.error_recovery.focus_game_window()
-                logger.critical(f"Pre-step window focus {'succeeded' if focus_success else 'failed'}")
-                
             try:
-                next_state, reward, done, info = self.env.step(action)
-                logger.critical(f"Step complete. Reward: {reward}, Done: {done}")
-                if info:
-                    logger.critical(f"Step info: {info}")
+                next_state_raw, reward, done, info = self.env.step(action_item)
+                success = info.get("action_success", True)
             except Exception as e:
-                logger.critical(f"ERROR during environment step: {e}")
-                import traceback
-                logger.critical(f"Traceback: {traceback.format_exc()}")
-                # Mark observation as invalid for error handling below
-                observation_valid = False
-                next_state = state
+                logger.error(f"Error during environment step: {e}")
+                next_state_raw = stacked_state  # Use current state as next if error
                 reward = -10.0
                 done = True
                 info = {"error": str(e)}
-                error_states += 1
-                logger.critical("Marked state as invalid due to exception")
-            
-            # Detect menu or invalid state
-            if hasattr(self.env, 'check_menu_state'):
-                pre_menu = in_menu
-                in_menu = self.env.check_menu_state()
-                if in_menu:
-                    menu_duration += 1
-                    logger.critical(f"Menu detected. Menu duration: {menu_duration}")
-                
-                # Log menu transitions and apply immediate learning feedback
-                if pre_menu != in_menu:
-                    if in_menu:
-                        logger.critical(f"Menu transition: {pre_menu} -> {in_menu}")
-                        # Apply immediate additional penalty for transitioning to a menu
-                        reward -= 2.0
-                        # Record the action that led to a menu for future avoidance
-                        if hasattr(self.agent, 'update_menu_action_tracking'):
-                            self.agent.update_menu_action_tracking(action)
-                    else:
-                        logger.critical(f"Menu transition: {pre_menu} -> {in_menu}")
-                        # Give small bonus for exiting a menu
-                        reward += 0.5
-            
-            # Handle invalid observations
-            if not observation_valid or (hasattr(self.env, 'is_observation_valid') and not self.env.is_observation_valid(next_state)):
-                error_states += 1
-                done = True
-                reward = -10.0  # Penalty for invalid state
-                logger.critical(f"Invalid observation detected. Error states: {error_states}")
-                if not done:
-                    # If not already done, use the last valid state
-                    next_state = state
-                    logger.critical("Using last valid state due to invalid observation")
-            
-            # Store experience for updates
-            if observation_valid and (not hasattr(self.env, 'is_observation_valid') or self.env.is_observation_valid(next_state)):
-                # Only store valid experiences
-                if step == 0:
-                    logger.critical("Storing first experience for policy update")
-                experience = (state, action, reward, next_state, done, log_prob, value)
-                experiences.append(experience)
-                logger.critical(f"Added experience to buffer. Buffer size now: {len(experiences)}")
-            
+                success = False
+                episode_stats["error_count"] += 1
+
+            # Add new observation to frame buffer and get next stacked state
+            self.frame_buffer.append(next_state_raw)
+            next_stacked_state = self._get_stacked_observation()
+
+            # Store experience in agent's memory
+            self.agent.store_experience(
+                stacked_state,
+                action,  # Store the tensor action
+                reward,
+                next_stacked_state,
+                done,
+                info={'log_prob': log_prob, 'value': value, 'action_probs': action_probs, **info}
+            )
+
             # Update state for next iteration
-            if observation_valid:
-                state = next_state
-            
-            # Update running totals
+            stacked_state = next_stacked_state
+
+            # Update episode statistics
             total_reward += reward
-            
-            # Increment step counter
-            step += 1
+            episode_steps += 1
             self.total_steps += 1
-            
-            # Calculate step time
-            step_time = time.time() - step_start_time
-            logger.critical(f"Step took {step_time:.3f}s")
-            
-            # Check for resource limits and throttle if needed
-            if self.performance_safeguards and step % 10 == 0:
-                self.performance_safeguards.check_limits()
-                
-                # Apply throttling if needed
-                throttle_time = self.performance_safeguards.get_throttle_time()
-                if throttle_time > 0:
-                    logger.critical(f"Throttling for {throttle_time:.2f}s due to resource limits")
-                    time.sleep(throttle_time)
-            
-            # Periodically run updates if we have enough experiences
-            if len(experiences) >= self.agent.update_frequency and step % self.agent.update_frequency == 0:
-                logger.critical(f"Updating policy with {len(experiences)} experiences")
-                self._update_policy(experiences, scaler=scaler)
-                experiences = []
-                
+
+            # Update action distribution statistics
+            action_idx = action_item
+            episode_stats["action_distribution"][action_idx] = episode_stats["action_distribution"].get(action_idx, 0) + 1
+
+            # Check if it's time to update the agent
+            if self.agent.memory.size() >= self.config.update_frequency:
+                logger.debug(f"Collected {self.agent.memory.size()} steps, triggering agent update.")
+                update_metrics = self.agent.update()
+
+                # Log update metrics
+                if update_metrics:
+                    self.writer.add_scalar('Loss/Policy', update_metrics['actor_loss'], self.total_steps)
+                    self.writer.add_scalar('Loss/Value', update_metrics['critic_loss'], self.total_steps)
+                    self.writer.add_scalar('Loss/Entropy', update_metrics['entropy'], self.total_steps)
+                    self.visualizer.record_training_metrics(
+                        update_metrics['actor_loss'],
+                        update_metrics['critic_loss'],
+                        update_metrics['entropy']
+                    )
+
             # Render if requested
             if render:
                 self.env.render()
-                
-            # Monitor hardware resources if available
-            if self.hardware_monitor and step % 10 == 0:
-                metrics = self.hardware_monitor.get_metrics()
-                
-                # Update safeguards with current metrics
-                if self.performance_safeguards:
-                    self.performance_safeguards.update_metrics(metrics)
-                    
-                # Log metrics to wandb
-                if self.use_wandb and step % 50 == 0:
-                    # Remove non-serializable items
-                    wandb_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float, bool))}
-                    wandb.log({f"hardware/{k}": v for k, v in wandb_metrics.items()})
-        
-        # Final update with remaining experiences
-        if len(experiences) > 0:
-            logger.critical(f"Final policy update with {len(experiences)} experiences")
-            self._update_policy(experiences, scaler=scaler)
-        
-        # Calculate episode duration
+
+            # Check for episode termination
+            if done:
+                logger.debug(f"Episode {episode_num} finished at step {step+1}.")
+                break
+
+            # Monitor hardware if enabled
+            if self.config.monitor_hardware and self.hardware_monitor:
+                self.hardware_monitor.check_resources()
+
+            # Apply performance safeguards if enabled
+            if self.performance_safeguards:
+                self.performance_safeguards.check_performance()
+
+        # Calculate episode statistics
         episode_duration = time.time() - episode_start_time
-        
-        logger.critical(f"===== EPISODE {episode_num} COMPLETED =====")
-        logger.critical(f"Total steps: {step}")
-        logger.critical(f"Total reward: {total_reward}")
-        logger.critical(f"Duration: {episode_duration:.2f}s")
-        
-        # Update stats
-        self.episode_rewards.append(total_reward)
-        self.episode_lengths.append(step)
-        self.recent_rewards.append(total_reward)
-        if len(self.recent_rewards) > 100:
-            self.recent_rewards.pop(0)
-        
-        # Update best reward
-        if total_reward > self.best_reward:
-            self.best_reward = total_reward
-            # Save best checkpoint
-            self._save_checkpoint(episode_num, is_best=True)
-        
-        # Update visualizer metrics
-        self.visualizer.record_episode_metrics(
-            episode=episode_num,
-            reward=total_reward,
-            length=step
-        )
-        
-        # Log to wandb if enabled
-        if self.use_wandb:
-            wandb.log({
-                "episode": episode_num,
-                "reward": total_reward,
-                "steps": step,
-                "duration_seconds": episode_duration,
-                "menu_duration": menu_duration,
-                "error_states": error_states,
-                "actions": action_counts,
-                "learning_rate": self.optimizer.param_groups[0]['lr'],
-                "best_reward": self.best_reward,
-                "mean_reward_100": sum(self.recent_rewards) / len(self.recent_rewards) if self.recent_rewards else 0
-            })
-        
-        # Compile episode statistics
-        episode_stats = {
-            "episode": episode_num,
+        episode_stats.update({
             "reward": total_reward,
-            "steps": step,
+            "steps": episode_steps,
             "duration": episode_duration,
-            "menu_duration": menu_duration,
-            "error_states": error_states,
-            "mean_reward_100": sum(self.recent_rewards) / len(self.recent_rewards) if self.recent_rewards else 0,
-            "learning_rate": self.optimizer.param_groups[0]['lr'],
-            "best_reward": self.best_reward,
-            "total_steps": self.total_steps,
-            "action_distribution": action_counts
-        }
-        
-        # Debug log
-        logger.debug(f"Episode {episode_num} completed: reward={total_reward:.2f}, steps={step}, "
-                    f"duration={episode_duration:.2f}s, menu_steps={menu_duration}, errors={error_states}")
-        
+            "fps": episode_steps / episode_duration if episode_duration > 0 else 0,
+            "memory_usage": torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+        })
+
+        # Log episode statistics
+        logger.info(f"===== EPISODE {episode_num} COMPLETED =====")
+        logger.info(f"Total Reward: {total_reward:.2f}")
+        logger.info(f"Steps: {episode_steps}")
+        logger.info(f"Duration: {episode_duration:.2f}s")
+        logger.info(f"FPS: {episode_stats['fps']:.2f}")
+        logger.info(f"Memory Usage: {episode_stats['memory_usage']:.2f}MB")
+        logger.info(f"Error Count: {episode_stats['error_count']}")
+
+        # Save checkpoint if needed
+        if episode_num % self.config.checkpoint_freq == 0:
+            self._save_checkpoint(episode_num, is_best=episode_stats['reward'] == self.best_reward)
+
         return episode_stats
+
+    def _get_initial_stacked_observation(self, initial_obs):
+        """Create the initial stacked observation."""
+        self.frame_buffer.clear()
+        if initial_obs is None:
+            return None
+        # Ensure initial_obs is a tensor
+        if not isinstance(initial_obs, torch.Tensor):
+            initial_obs = torch.as_tensor(initial_obs, device=self.device).float()
+
+        for _ in range(self.frame_stack_size):
+            self.frame_buffer.append(initial_obs)
+        return self._get_stacked_observation()
+
+    def _get_stacked_observation(self):
+        """Stack frames from the buffer."""
+        if not self.frame_buffer:
+            return None
+        # Ensure all frames are tensors and on the correct device
+        processed_frames = []
+        for frame in self.frame_buffer:
+            if frame is None:
+                continue  # Skip None frames
+            if not isinstance(frame, torch.Tensor):
+                frame = torch.as_tensor(frame, device=self.device).float()
+            elif frame.device != self.device:
+                frame = frame.to(self.device)
+            processed_frames.append(frame)
+
+        if not processed_frames:
+            return None
+
+        # Stack frames along channel dimension
+        try:
+            # Check if all frames have the same shape
+            first_shape = processed_frames[0].shape
+            if not all(f.shape == first_shape for f in processed_frames):
+                logger.error("Inconsistent frame shapes in buffer, cannot stack.")
+                # Fallback: return the last valid frame repeated
+                last_valid_frame = processed_frames[-1]
+                return torch.cat([last_valid_frame] * self.frame_stack_size, dim=0)
+
+            stacked = torch.cat(processed_frames, dim=0)  # Assumes frames are [C, H, W]
+            return stacked
+        except Exception as e:
+            logger.error(f"Error stacking frames: {e}")
+            # Fallback: return the last valid frame repeated
+            last_valid_frame = processed_frames[-1]
+            return torch.cat([last_valid_frame] * self.frame_stack_size, dim=0)
     
     def train(self, render: bool = False) -> Dict[str, Any]:
         """Train the agent for the specified number of episodes.
