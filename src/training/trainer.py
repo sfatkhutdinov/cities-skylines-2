@@ -75,8 +75,11 @@ class Trainer:
             else:
                 return default_value
         
-        # Set up memory
-        self.memory = Memory(self.device)
+        # Set up memory - USE AGENT'S MEMORY
+        # self.memory = Memory(self.device) # Removed: Trainer should use agent's memory
+        if not hasattr(agent, 'memory'):
+             raise ValueError("Agent must have a 'memory' attribute for the Trainer")
+        self.memory = agent.memory # Use agent's memory directly
         
         # Set up optimizer
         self.optimizer = self._create_optimizer()
@@ -369,31 +372,27 @@ class Trainer:
                     break
             
             # Select action from policy
-            action_result = self.agent.select_action(observation)
+            action = self.agent.select_action(observation)
             
-            # Ensure action_result contains required fields
-            if isinstance(action_result, dict):
-                action = action_result.get('action')
-                log_prob = action_result.get('log_prob')
-                value = action_result.get('value', torch.tensor(0.0, device=self.agent.device))
-                action_probs = action_result.get('action_probs')
-            else:
-                logger.critical(f"Unexpected action result type: {type(action_result)}")
-                action = action_result
-                log_prob = None
-                value = None
-                action_probs = None
-                
-            # Basic validation
-            if action is None:
-                logger.critical("Agent returned None action, using random action")
-                action = torch.randint(0, self.agent.num_actions, (1,), device=self.agent.device)
-                
-            logger.critical(f"Step {step}: Selected action {action}, log_prob {log_prob}")
+            # Ensure action is a tensor for env.step if needed (depends on env requirements)
+            # Assuming env.step can handle an integer action
+            if isinstance(action, torch.Tensor):
+                 action_tensor = action.to(self.agent.device)
+                 action_item = action.item()
+            else: # Assuming action is already an int
+                 action_item = action
+                 action_tensor = torch.tensor([action], device=self.agent.device) 
             
-            # Take step in environment
+            # Retrieve log_prob, value, etc., from agent instance variables
+            log_prob = getattr(self.agent, 'last_log_prob', None)
+            value = getattr(self.agent, 'last_value', None)
+            action_probs = getattr(self.agent, 'last_action_probs', None)
+            
+            logger.critical(f"Step {step}: Selected action {action_item}, log_prob {log_prob}")
+            
+            # Take step in environment using the integer action
             try:
-                next_observation, reward, done, info = self.env.step(action)
+                next_observation, reward, done, info = self.env.step(action_item)
                 logger.critical(f"Step {step}: Action executed, reward={reward}, done={done}")
                 
                 # Check for game crashes
@@ -409,24 +408,24 @@ class Trainer:
                     logger.info("Detected return from menu state")
                     in_menu = False
                     
-                # Store experience
+                # Store experience using the agent's stored values
                 if self.memory:
                     self.memory.add(
                         state=observation,
-                        action=action,
+                        action=action_tensor, # Store action tensor if needed by memory/updater
                         reward=reward,
                         next_state=next_observation,
                         done=done,
-                        log_prob=log_prob,
-                        value=value,
-                        action_probs=action_probs
+                        log_prob=log_prob, # Use value from agent
+                        value=value, # Use value from agent
+                        action_probs=action_probs # Use value from agent
                     )
-                    logger.critical(f"Added experience to memory: reward={reward}, done={done}")
+                    logger.critical(f"Added experience to agent memory. Buffer size now: {self.memory.size()}")
                 
                 # Add to experiences list
                 experiences.append({
                     'state': observation,
-                    'action': action,
+                    'action': action_item,
                     'reward': reward,
                     'next_state': next_observation,
                     'done': done,
@@ -513,7 +512,6 @@ class Trainer:
         step = 0
         total_reward = 0.0
         done = False
-        experiences = []
         action_counts = {}
         in_menu = False
         menu_duration = 0
@@ -543,7 +541,10 @@ class Trainer:
             # Select action using agent policy
             logger.critical("Selecting action from policy...")
             with torch.set_grad_enabled(False):
-                action, log_prob, value = self.agent.select_action(state)
+                action = self.agent.select_action(state)
+                # Retrieve other values from agent state after select_action call
+                log_prob = getattr(self.agent, 'last_log_prob', None)
+                value = getattr(self.agent, 'last_value', None)
             logger.critical(f"Selected action: {action}")
             
             # Track action distribution
@@ -612,9 +613,25 @@ class Trainer:
                 # Only store valid experiences
                 if step == 0:
                     logger.critical("Storing first experience for policy update")
-                experience = (state, action, reward, next_state, done, log_prob, value)
-                experiences.append(experience)
-                logger.critical(f"Added experience to buffer. Buffer size now: {len(experiences)}")
+                
+                # Convert action to tensor if it isn't already
+                if not isinstance(action, torch.Tensor):
+                    action_tensor = torch.tensor([action], device=self.agent.device)
+                else:
+                    action_tensor = action.to(self.agent.device) # Ensure it's on the right device
+
+                # Add experience directly to agent's memory
+                self.memory.add(
+                    state=state,
+                    action=action_tensor, 
+                    reward=reward,
+                    next_state=next_state,
+                    done=done,
+                    log_prob=log_prob,
+                    value=value,
+                    action_probs=getattr(self.agent, 'last_action_probs', None) # Add action_probs if available
+                )
+                logger.critical(f"Added experience to agent memory. Buffer size now: {self.memory.size()}")
             
             # Update state for next iteration
             if observation_valid:
@@ -641,12 +658,13 @@ class Trainer:
                     logger.critical(f"Throttling for {throttle_time:.2f}s due to resource limits")
                     time.sleep(throttle_time)
             
-            # Periodically run updates if we have enough experiences
-            if len(experiences) >= self.agent.update_frequency and step % self.agent.update_frequency == 0:
-                logger.critical(f"Updating policy with {len(experiences)} experiences")
-                self._update_policy(experiences, scaler=scaler)
-                experiences = []
-                
+            # Check if it's time to update the agent's policy
+            if self.memory.is_full() or (step > 0 and step % self.agent.update_frequency == 0):
+                 logger.critical(f"Calling agent.update() at step {step}, memory size: {self.memory.size()}")
+                 update_stats = self.agent.update() # Delegate update to the agent
+                 logger.critical(f"Agent update completed. Stats: {update_stats}")
+                 # Agent's update method should handle clearing memory after update
+            
             # Render if requested
             if render:
                 self.env.render()
@@ -664,11 +682,6 @@ class Trainer:
                     # Remove non-serializable items
                     wandb_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float, bool))}
                     wandb.log({f"hardware/{k}": v for k, v in wandb_metrics.items()})
-        
-        # Final update with remaining experiences
-        if len(experiences) > 0:
-            logger.critical(f"Final policy update with {len(experiences)} experiences")
-            self._update_policy(experiences, scaler=scaler)
         
         # Calculate episode duration
         episode_duration = time.time() - episode_start_time
@@ -885,7 +898,11 @@ class Trainer:
         
         for i in range(num_episodes):
             # Collect trajectory without training
-            _, episode_reward, episode_steps = self.collect_trajectory(render=render)
+            trajectory = self.collect_trajectory(render=render)
+            
+            # Calculate reward and steps from the collected trajectory
+            episode_reward = sum(exp['reward'] for exp in trajectory) if trajectory else 0
+            episode_steps = len(trajectory)
             
             rewards.append(episode_reward)
             lengths.append(episode_steps)
@@ -936,453 +953,4 @@ class Trainer:
         if training_mode:
             self.agent.train()
         
-        return eval_summary
-    
-    def _prepare_batches(self, states, actions, log_probs, returns, advantages, values=None):
-        """Prepare minibatches for policy update.
-        
-        Args:
-            states: State batch
-            actions: Action batch
-            log_probs: Log probability batch
-            returns: Returns batch
-            advantages: Advantages batch
-            values: Old value predictions batch
-            
-        Returns:
-            List of batches
-        """
-        # Get agent properties
-        use_lstm = False
-        sequence_length = 0
-        batch_size = 64  # Default batch size
-        
-        if hasattr(self, 'agent'):
-            if hasattr(self.agent, 'use_lstm'):
-                use_lstm = self.agent.use_lstm
-            if hasattr(self, "sequence_length"):
-                sequence_length = self.sequence_length
-            elif use_lstm:
-                sequence_length = 16  # Default for LSTM
-            if hasattr(self, "batch_size"):
-                batch_size = self.batch_size
-        
-        # Convert to tensors if they aren't already (safely)
-        if not isinstance(states, torch.Tensor):
-            try:
-                # If it's a list of tensors, stack them
-                if isinstance(states[0], torch.Tensor):
-                    states = torch.stack(states)
-                else:
-                    states = torch.tensor(states, device=self.device)
-            except (ValueError, TypeError):
-                # Handle potential errors when converting complex structures
-                logger.critical(f"Error converting states to tensor, shape: {np.shape(states)}")
-                # Convert states to a flat batch if needed
-                if hasattr(states, '__len__') and hasattr(states[0], 'shape'):
-                    states = torch.cat([s.reshape(1, -1) for s in states], dim=0).to(self.device)
-        
-        if not isinstance(actions, torch.Tensor):
-            try:
-                # If it's a list of tensors, stack them
-                if isinstance(actions[0], torch.Tensor):
-                    actions = torch.stack(actions)
-                else:
-                    actions = torch.tensor(actions, device=self.device)
-            except (ValueError, TypeError):
-                logger.critical(f"Error converting actions to tensor, shape: {np.shape(actions)}")
-                actions = torch.tensor([a.item() if hasattr(a, 'item') else a for a in actions], device=self.device)
-        
-        if not isinstance(log_probs, torch.Tensor):
-            try:
-                # If it's a list of tensors, stack them
-                if isinstance(log_probs[0], torch.Tensor):
-                    log_probs = torch.stack(log_probs)
-                else:
-                    log_probs = torch.tensor(log_probs, device=self.device)
-            except (ValueError, TypeError):
-                logger.critical(f"Error converting log_probs to tensor, shape: {np.shape(log_probs)}")
-                log_probs = torch.tensor([lp.item() if hasattr(lp, 'item') else float(lp) for lp in log_probs], device=self.device)
-        
-        if not isinstance(returns, torch.Tensor):
-            try:
-                # If it's a list of tensors, stack them
-                if isinstance(returns[0], torch.Tensor):
-                    returns = torch.stack(returns)
-                else:
-                    returns = torch.tensor(returns, device=self.device)
-            except (ValueError, TypeError):
-                logger.critical(f"Error converting returns to tensor, shape: {np.shape(returns)}")
-                returns = torch.tensor([r.item() if hasattr(r, 'item') else float(r) for r in returns], device=self.device)
-        
-        if not isinstance(advantages, torch.Tensor):
-            try:
-                # If it's a list of tensors, stack them
-                if isinstance(advantages[0], torch.Tensor):
-                    advantages = torch.stack(advantages)
-                else:
-                    advantages = torch.tensor(advantages, device=self.device)
-            except (ValueError, TypeError):
-                logger.critical(f"Error converting advantages to tensor, shape: {np.shape(advantages)}")
-                advantages = torch.tensor([a.item() if hasattr(a, 'item') else float(a) for a in advantages], device=self.device)
-        
-        if values is not None and not isinstance(values, torch.Tensor):
-            try:
-                # If it's a list of tensors, stack them
-                if isinstance(values[0], torch.Tensor):
-                    values = torch.stack(values)
-                else:
-                    values = torch.tensor(values, device=self.device)
-            except (ValueError, TypeError):
-                logger.critical(f"Error converting values to tensor, shape: {np.shape(values)}")
-                values = torch.tensor([v.item() if hasattr(v, 'item') else float(v) for v in values], device=self.device)
-            
-        # Create batches based on whether we're using LSTM or not
-        if use_lstm:
-            logger.info(f"Preparing sequence-based batches with sequence length {sequence_length}")
-            return self._prepare_sequence_batches(
-                states, actions, log_probs, returns, advantages, values,
-                sequence_length, batch_size
-            )
-        else:
-            logger.info("Preparing regular mini-batches")
-            # Regular mini-batches without sequence consideration
-            dataset = torch.utils.data.TensorDataset(
-                states, actions, log_probs, returns, advantages,
-                values if values is not None else torch.zeros_like(returns)
-            )
-            dataloader = torch.utils.data.DataLoader(
-                dataset, batch_size=batch_size, shuffle=True
-            )
-            return list(dataloader)
-    
-    def _prepare_sequence_batches(self, states, actions, log_probs, returns, advantages, values, 
-                                  sequence_length, batch_size):
-        """Prepare batches that respect sequence boundaries for LSTM training.
-        
-        Args:
-            states: State tensor
-            actions: Action tensor
-            log_probs: Log probability tensor
-            returns: Returns tensor
-            advantages: Advantages tensor
-            values: Values tensor
-            sequence_length: Length of sequences for LSTM
-            batch_size: Number of sequences per batch
-            
-        Returns:
-            List of sequence batches
-        """
-        total_steps = states.size(0)
-        logger.info(f"Preparing sequence batches from {total_steps} steps")
-        
-        # Determine starting indices for sequences
-        num_sequences = total_steps // sequence_length
-        if num_sequences == 0:
-            # Not enough data for even one sequence
-            logger.warning(f"Not enough data for sequence batching, falling back to standard batching")
-            dataset = torch.utils.data.TensorDataset(
-                states, actions, log_probs, returns, advantages,
-                values if values is not None else torch.zeros_like(returns)
-            )
-            dataloader = torch.utils.data.DataLoader(
-                dataset, batch_size=batch_size, shuffle=True
-            )
-            return list(dataloader)
-            
-        # Create sequence indices that respect episode boundaries
-        sequence_starts = []
-        for seq_idx in range(num_sequences):
-            start_idx = seq_idx * sequence_length
-            sequence_starts.append(start_idx)
-            
-        # Shuffle the sequence starts
-        random.shuffle(sequence_starts)
-        
-        # Create batches of sequences
-        batches = []
-        num_batches = (len(sequence_starts) + batch_size - 1) // batch_size
-        
-        for batch_idx in range(num_batches):
-            # Get the sequence starts for this batch
-            batch_starts = sequence_starts[batch_idx * batch_size:
-                                          min((batch_idx + 1) * batch_size, len(sequence_starts))]
-            
-            batch_states = []
-            batch_actions = []
-            batch_log_probs = []
-            batch_returns = []
-            batch_advantages = []
-            batch_values = []
-            
-            # Collect sequences for this batch
-            for start_idx in batch_starts:
-                end_idx = min(start_idx + sequence_length, total_steps)
-                batch_states.append(states[start_idx:end_idx])
-                batch_actions.append(actions[start_idx:end_idx])
-                batch_log_probs.append(log_probs[start_idx:end_idx])
-                batch_returns.append(returns[start_idx:end_idx])
-                batch_advantages.append(advantages[start_idx:end_idx])
-                if values is not None:
-                    batch_values.append(values[start_idx:end_idx])
-                    
-            # Pad sequences if necessary
-            for i in range(len(batch_states)):
-                if batch_states[i].size(0) < sequence_length:
-                    padding_size = sequence_length - batch_states[i].size(0)
-                    if len(batch_states[i].shape) > 1:
-                        # For multidimensional states
-                        padding = torch.zeros(padding_size, *batch_states[i].shape[1:], 
-                                             device=self.device)
-                    else:
-                        # For 1D states
-                        padding = torch.zeros(padding_size, device=self.device)
-                    
-                    batch_states[i] = torch.cat([batch_states[i], padding])
-                    batch_actions[i] = torch.cat([batch_actions[i], torch.zeros(padding_size, device=self.device)])
-                    batch_log_probs[i] = torch.cat([batch_log_probs[i], torch.zeros(padding_size, device=self.device)])
-                    batch_returns[i] = torch.cat([batch_returns[i], torch.zeros(padding_size, device=self.device)])
-                    batch_advantages[i] = torch.cat([batch_advantages[i], torch.zeros(padding_size, device=self.device)])
-                    if values is not None:
-                        batch_values[i] = torch.cat([batch_values[i], torch.zeros(padding_size, device=self.device)])
-            
-            # Stack sequences into batch tensors
-            batch_states = torch.stack(batch_states)  # [batch_size, sequence_length, ...]
-            batch_actions = torch.stack(batch_actions)
-            batch_log_probs = torch.stack(batch_log_probs)
-            batch_returns = torch.stack(batch_returns)
-            batch_advantages = torch.stack(batch_advantages)
-            if values is not None:
-                batch_values = torch.stack(batch_values)
-            else:
-                batch_values = torch.zeros_like(batch_returns)
-                
-            # Add to batches
-            batches.append((batch_states, batch_actions, batch_log_probs, 
-                           batch_returns, batch_advantages, batch_values))
-                
-        logger.info(f"Created {len(batches)} sequence batches with size {batch_size}")
-        return batches
-    
-    def update_policy(self, states, actions, log_probs, returns, advantages, values=None):
-        """Update policy using the collected experiences.
-        
-        Args:
-            states: States from experience buffer
-            actions: Actions from experience buffer  
-            log_probs: Log probabilities from experience buffer
-            returns: Returns from experience buffer
-            advantages: Advantages from experience buffer
-            values: Values from experience buffer (optional)
-            
-        Returns:
-            Dict of training statistics
-        """
-        # Get training hyperparameters
-        # Try to get values from config based on its type
-        clip_param = 0.2  # Default value
-        value_coef = 0.5  # Default value
-        entropy_coef = 0.01  # Default value
-        max_grad_norm = 0.5  # Default value
-        num_epochs = 10  # Default value
-        
-        if hasattr(self.config, "get"):
-            # Config is a dict-like object
-            clip_param = self.config.get("training", {}).get("clip_param", 0.2)
-            value_coef = self.config.get("training", {}).get("value_coef", 0.5)
-            entropy_coef = self.config.get("training", {}).get("entropy_coef", 0.01)
-            max_grad_norm = self.config.get("training", {}).get("max_grad_norm", 0.5)
-            num_epochs = self.config.get("training", {}).get("update_epochs", 10)
-        else:
-            # Config is likely a HardwareConfig object
-            # Try to access attributes directly
-            if hasattr(self, "clip_param"):
-                clip_param = self.clip_param
-            if hasattr(self, "value_coef"):
-                value_coef = self.value_coef
-            if hasattr(self, "entropy_coef"):
-                entropy_coef = self.entropy_coef
-            if hasattr(self, "max_grad_norm"):
-                max_grad_norm = self.max_grad_norm
-            if hasattr(self, "num_epochs"):
-                num_epochs = self.num_epochs
-            elif hasattr(self, "update_epochs"):
-                num_epochs = self.update_epochs
-
-        # Prepare batches for update
-        batches = self._prepare_batches(states, actions, log_probs, returns, advantages, values)
-        
-        # Track metrics
-        metrics = {
-            'policy_loss': 0,
-            'value_loss': 0,
-            'entropy': 0,
-            'approx_kl': 0,
-            'clip_fraction': 0,
-            'explained_variance': 0,
-            'update_time': 0,
-        }
-        
-        # Begin timing update
-        update_start = time.time()
-        
-        # Run multiple epochs of training
-        use_lstm = False  # Default value
-        if hasattr(self.config, "get"):
-            use_lstm = self.config.get("model", {}).get("use_lstm", False)
-        else:
-            # Config is likely a HardwareConfig object
-            if hasattr(self.agent, "use_lstm"):
-                use_lstm = self.agent.use_lstm
-        
-        for epoch in range(num_epochs):
-            # Process each batch
-            for batch in batches:
-                batch_states, batch_actions, batch_old_log_probs, batch_returns, batch_advantages, batch_values = batch
-                
-                # Initialize LSTM hidden state for sequence processing
-                hidden_state = None
-                
-                # Handle batch shape depending on whether we're using sequences
-                if use_lstm:
-                    # For sequence batches, we have [batch_size, sequence_length, ...] shape
-                    batch_size, sequence_length = batch_states.shape[0], batch_states.shape[1]
-                    
-                    # Process entire sequences
-                    self.agent.optimizer.zero_grad()
-                    
-                    # Reshape tensors to process in batch
-                    batch_loss = 0
-                    batch_policy_loss = 0
-                    batch_value_loss = 0
-                    batch_entropy = 0
-                    
-                    # Get initial hidden state
-                    h0 = torch.zeros(1, batch_size, self.agent.policy.lstm_hidden_size, device=self.device)
-                    c0 = torch.zeros(1, batch_size, self.agent.policy.lstm_hidden_size, device=self.device)
-                    hidden_state = (h0, c0)
-                    
-                    # Process each step in the sequence
-                    for step_idx in range(sequence_length):
-                        step_states = batch_states[:, step_idx]
-                        step_actions = batch_actions[:, step_idx]
-                        step_old_log_probs = batch_old_log_probs[:, step_idx]
-                        step_returns = batch_returns[:, step_idx]
-                        step_advantages = batch_advantages[:, step_idx]
-                        
-                        # Forward pass with LSTM state
-                        action_probs, values, hidden_state = self.agent.policy(step_states, hidden_state)
-                        
-                        # Calculate new log probs and entropy
-                        dist = torch.distributions.Categorical(action_probs)
-                        new_log_probs = dist.log_prob(step_actions)
-                        entropy = dist.entropy().mean()
-                        
-                        # PPO loss calculation
-                        ratio = torch.exp(new_log_probs - step_old_log_probs)
-                        surr1 = ratio * step_advantages
-                        surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * step_advantages
-                        policy_loss = -torch.min(surr1, surr2).mean()
-                        
-                        # Value loss
-                        # Ensure values and batch_returns have the same shape for MSE loss
-                        if values.shape != batch_returns.shape:
-                            # If batch_returns is a vector but values is a 2D tensor with second dim = 1
-                            if len(values.shape) == 2 and values.shape[1] == 1 and len(batch_returns.shape) == 1:
-                                # Reshape batch_returns to match values
-                                batch_returns = batch_returns.unsqueeze(1)
-                            # If values is a vector but batch_returns is a 2D tensor with second dim = 1
-                            elif len(batch_returns.shape) == 2 and batch_returns.shape[1] == 1 and len(values.shape) == 1:
-                                # Reshape values to match batch_returns
-                                values = values.unsqueeze(1)
-                        
-                        value_loss = F.mse_loss(values, batch_returns)
-                        
-                        # Total loss
-                        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
-                        
-                        # Accumulate batch loss
-                        batch_loss += loss
-                        batch_policy_loss += policy_loss.item()
-                        batch_value_loss += value_loss.item()
-                        batch_entropy += entropy.item()
-                    
-                    # Average losses over sequence steps
-                    batch_loss /= sequence_length
-                    batch_policy_loss /= sequence_length
-                    batch_value_loss /= sequence_length
-                    batch_entropy /= sequence_length
-                    
-                    # Backward pass and update
-                    batch_loss.backward()
-                    if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), max_grad_norm)
-                    self.agent.optimizer.step()
-                    
-                    # Update metrics
-                    metrics['policy_loss'] += batch_policy_loss / num_epochs
-                    metrics['value_loss'] += batch_value_loss / num_epochs
-                    metrics['entropy'] += batch_entropy / num_epochs
-                    
-                else:
-                    # Standard non-sequence processing (original method)
-                    self.agent.optimizer.zero_grad()
-                    
-                    # Forward pass
-                    action_probs, values, _ = self.agent.policy(batch_states)
-                    dist = torch.distributions.Categorical(action_probs)
-                    new_log_probs = dist.log_prob(batch_actions)
-                    entropy = dist.entropy().mean()
-                    
-                    # Ratio for PPO
-                    ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                    
-                    # Clipped surrogate objective
-                    surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * batch_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # Value loss
-                    # Ensure values and batch_returns have the same shape for MSE loss
-                    if values.shape != batch_returns.shape:
-                        # If batch_returns is a vector but values is a 2D tensor with second dim = 1
-                        if len(values.shape) == 2 and values.shape[1] == 1 and len(batch_returns.shape) == 1:
-                            # Reshape batch_returns to match values
-                            batch_returns = batch_returns.unsqueeze(1)
-                        # If values is a vector but batch_returns is a 2D tensor with second dim = 1
-                        elif len(batch_returns.shape) == 2 and batch_returns.shape[1] == 1 and len(values.shape) == 1:
-                            # Reshape values to match batch_returns
-                            values = values.unsqueeze(1)
-                    
-                    value_loss = F.mse_loss(values, batch_returns)
-                    
-                    # Total loss
-                    loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
-                    
-                    # Backward pass and optimize
-                    loss.backward()
-                    if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.agent.policy.parameters(), max_grad_norm)
-                    self.agent.optimizer.step()
-                    
-                    # Update metrics
-                    metrics['policy_loss'] += policy_loss.item() / num_epochs
-                    metrics['value_loss'] += value_loss.item() / num_epochs
-                    metrics['entropy'] += entropy.item() / num_epochs
-                    approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
-                    metrics['approx_kl'] += approx_kl / num_epochs
-                    metrics['clip_fraction'] += ((ratio - 1.0).abs() > clip_param).float().mean().item() / num_epochs
-        
-        # Calculate explained variance
-        if values is not None:
-            var_y = torch.var(returns)
-            if var_y > 0:
-                explained_var = 1 - torch.var(returns - values) / var_y
-            else:
-                explained_var = torch.tensor(0.0, device=self.device)
-            metrics['explained_variance'] = explained_var.item()
-            
-        # Record update time
-        metrics['update_time'] = time.time() - update_start
-        
-        return metrics 
+        return eval_summary 

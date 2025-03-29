@@ -104,82 +104,6 @@ def parse_args(parser=None):
     
     return parser.parse_args()
 
-def setup_config(args):
-    """Set up configuration from command-line arguments and optionally a config file.
-    
-    Args:
-        args: Parsed command-line arguments
-        
-    Returns:
-        Dictionary containing configuration
-    """
-    logger = logging.getLogger(__name__)
-    config = {}
-    
-    # Start with defaults
-    config = {
-        "training": {
-            "num_episodes": 100,
-            "max_steps": 1000,
-            "batch_size": 64,
-            "learning_rate": 0.0003,
-            "gamma": 0.99,
-            "gae_lambda": 0.95,
-            "clip_param": 0.2,
-            "early_stop_reward": None,
-        },
-        "environment": {
-            "mock_env": False,
-            "disable_menu_detection": False,
-            "skip_game_check": True,
-            "window_title": "Cities: Skylines II",
-        },
-        "hardware": {
-            "device": "cuda" if torch.cuda.is_available() else "cpu",
-            "resolution": "84x84",
-            "mixed_precision": False,
-        },
-        "checkpointing": {
-            "checkpoint_dir": "checkpoints",
-            "checkpoint_interval": 10,
-        }
-    }
-    
-    # Override with command-line arguments if provided
-    if args.num_episodes is not None:
-        config["training"]["num_episodes"] = args.num_episodes
-    if args.max_steps is not None:
-        config["training"]["max_steps"] = args.max_steps
-    if args.learning_rate is not None:
-        config["training"]["learning_rate"] = args.learning_rate
-    if args.early_stop_reward is not None:
-        config["training"]["early_stop_reward"] = args.early_stop_reward
-        
-    if args.mock_env:
-        config["environment"]["mock_env"] = True
-    if args.disable_menu_detection:
-        config["environment"]["disable_menu_detection"] = True
-    config["environment"]["skip_game_check"] = args.skip_game_check
-    if args.window_title:
-        config["environment"]["window_title"] = args.window_title
-    if args.game_path:
-        config["environment"]["game_path"] = args.game_path
-        
-    if args.device:
-        config["hardware"]["device"] = args.device
-    if args.resolution:
-        config["hardware"]["resolution"] = args.resolution
-    if args.mixed_precision:
-        config["hardware"]["mixed_precision"] = True
-        
-    if args.checkpoint_dir:
-        config["checkpointing"]["checkpoint_dir"] = args.checkpoint_dir
-    if args.checkpoint_interval:
-        config["checkpointing"]["checkpoint_interval"] = args.checkpoint_interval
-    
-    logger.info(f"Configuration: {config}")
-    return config
-
 def setup_hardware_config(args):
     """Set up hardware configuration from command-line arguments and configuration.
     
@@ -197,59 +121,86 @@ def setup_hardware_config(args):
     resolution = None
     if hasattr(args, 'resolution') and args.resolution:
         try:
+            # Expect resolution like 'widthxheight', e.g., '800x600'
+            # HardwareConfig expects (height, width)
             width, height = map(int, args.resolution.split('x'))
-            resolution = (width, height)
+            resolution = (height, width) # Correct order for HardwareConfig
         except (ValueError, AttributeError):
             logger.warning(f"Invalid resolution format: {args.resolution}. Using default.")
     
     # Determine device to use
-    device = None
+    device = 'auto' # Default to auto-detection within HardwareConfig
     if hasattr(args, 'device') and args.device:
         device = args.device
-    elif hasattr(args, 'force_cpu') and args.force_cpu:
+    elif hasattr(args, 'cpu') and args.cpu: # Check for --cpu flag
         device = 'cpu'
-    else:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Create hardware configuration
-    mixed_precision = hasattr(args, 'mixed_precision') and args.mixed_precision
-    batch_size = args.batch_size if hasattr(args, 'batch_size') else 64
+        
+    # Extract arguments relevant to HardwareConfig constructor
+    # Use getattr with defaults to handle missing args gracefully
+    batch_size = getattr(args, 'batch_size', 64) # Default from HardwareConfig used if arg missing
+    learning_rate = getattr(args, 'learning_rate', 1e-4) # Default from HardwareConfig used if arg missing
+    use_fp16 = getattr(args, 'mixed_precision', False) # Default from HardwareConfig used if arg missing
+    force_cpu = getattr(args, 'cpu', False) # Check for --cpu flag
     
     hardware_config = HardwareConfig(
         device=device,
-        resolution=resolution,  # If None, will use default from HardwareConfig
+        resolution=resolution,  # Pass parsed tuple or None
         batch_size=batch_size,
-        use_fp16=mixed_precision
+        learning_rate=learning_rate,
+        use_fp16=use_fp16,
+        force_cpu=force_cpu 
     )
     
-    # Add memory configuration
+    # Add memory configuration using args
     hardware_config.memory = {
         'enabled': not (hasattr(args, 'disable_memory') and args.disable_memory),
-        'memory_size': args.memory_size if hasattr(args, 'memory_size') else 2000,
-        'memory_use_probability': args.memory_use_prob if hasattr(args, 'memory_use_prob') else 0.9,
-        'key_size': 128,
-        'value_size': 256,
-        'retrieval_threshold': 0.5,
-        'warmup_episodes': args.memory_warmup if hasattr(args, 'memory_warmup') else 10,
-        'use_curriculum': True,
+        'memory_size': getattr(args, 'memory_size', 2000), # Use getattr
+        'memory_use_probability': getattr(args, 'memory_use_prob', 0.9), # Use getattr
+        'key_size': 128, # Default value
+        'value_size': 256, # Default value
+        'retrieval_threshold': 0.5, # Default value
+        'warmup_episodes': getattr(args, 'memory_warmup', 10), # Use getattr
+        'use_curriculum': getattr(args, 'memory_curriculum', True), # Use getattr
+        # Example curriculum phases (can be adjusted or made configurable)
+        'curriculum_phases': {
+            'observation': 10,
+            'retrieval': 30,
+            'integration': 50,
+            'refinement': 100
+        }
     }
     
-    # Add required configuration attributes
-    hardware_config.clip_param = args.clip_param if hasattr(args, 'clip_param') else 0.2
-    hardware_config.value_loss_coef = 0.5
-    hardware_config.entropy_coef = 0.01
-    hardware_config.learning_rate = args.learning_rate if hasattr(args, 'learning_rate') else 0.0001
-    hardware_config.num_episodes = args.num_episodes if hasattr(args, 'num_episodes') else 1000
-    hardware_config.max_steps = args.max_steps if hasattr(args, 'max_steps') else 2000
-    hardware_config.max_checkpoints = 5
-    hardware_config.max_grad_norm = 0.5
+    # Add hierarchical configuration using args
+    use_hierarchical = not (hasattr(args, 'disable_hierarchical') and args.disable_hierarchical)
+    hardware_config.hierarchical = {
+        'enabled': use_hierarchical,
+        # Add other hierarchical defaults or get from args if defined
+        'feature_dim': 512,
+        'latent_dim': 256,
+        'prediction_horizon': 5,
+        'adaptive_memory_use': True,
+        'adaptive_memory_threshold': 0.7,
+        # Example schedules/phases (can be adjusted or made configurable)
+        'training_schedules': {
+            'visual_network': 10,      
+            'world_model': 5,          
+            'error_detection': 20      
+        },
+        'batch_sizes': {
+            'visual_network': 32,
+            'world_model': 64,
+            'error_detection': 32
+        },
+        'progressive_training': True,
+        'progressive_phases': {
+            'visual_network': 50,      
+            'world_model': 100,        
+            'error_detection': 150     
+        }
+    }
     
     # Log hardware configuration
-    logger.info(f"Hardware configuration initialized - Device: {device}, Resolution: {resolution}, Batch size: {batch_size}, FP16: {mixed_precision}")
-    logger.info(f"  Device: {hardware_config.get_device()}")
-    logger.info(f"  Resolution: {hardware_config.resolution}")
-    logger.info(f"  Batch size: {hardware_config.batch_size}")
-    logger.info(f"  Mixed precision: {hardware_config.use_fp16}")
+    logger.info(f"Hardware configuration initialized - Device: {hardware_config.get_device()}, Resolution: {hardware_config.resolution}, Batch size: {hardware_config.batch_size}, FP16: {hardware_config.use_fp16}")
     
     return hardware_config
 
@@ -370,40 +321,6 @@ def setup_environment(args, hardware_config, env_config=None, override_game_path
             logger.warning(f"Error getting initial observation: {e}")
     
     return env
-
-def setup_agent(args, hardware_config, observation_space, action_space):
-    """Set up agent using hardware configuration and environment spaces.
-    
-    Args:
-        args: Command-line arguments
-        hardware_config: Hardware configuration
-        observation_space: Environment observation space
-        action_space: Environment action space
-        
-    Returns:
-        Agent instance
-    """
-    from src.agent.core.ppo_agent import PPOAgent
-    
-    logger = logging.getLogger(__name__)
-    
-    logger.info(f"Creating PPO agent with state_dim={observation_space.shape}, action_dim={action_space.n}")
-    
-    # Extract only parameters accepted by PPOAgent
-    ppo_params = {
-        'state_dim': observation_space.shape,
-        'action_dim': action_space.n,
-        'config': hardware_config,
-        'use_amp': args.mixed_precision if hasattr(args, 'mixed_precision') else False
-    }
-    
-    # Create agent
-    agent = PPOAgent(**ppo_params)
-    
-    agent.to(hardware_config.get_device())
-    logger.info(f"Agent initialized on {hardware_config.get_device()}")
-    
-    return agent
 
 def args_to_dict(args):
     """Convert arguments to dictionary.

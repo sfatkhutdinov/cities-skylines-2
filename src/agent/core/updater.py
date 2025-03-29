@@ -52,11 +52,12 @@ class PPOUpdater:
         
         logger.info(f"Initialized PPO updater with lr={lr}")
     
-    def update(self, memory) -> Dict[str, float]:
+    def update(self, memory, scaler: Optional[torch.cuda.amp.GradScaler] = None) -> Dict[str, float]:
         """Update policy and value function using PPO.
         
         Args:
             memory: Experience memory
+            scaler: Optional GradScaler for mixed precision
             
         Returns:
             Dict with update statistics
@@ -86,37 +87,58 @@ class PPOUpdater:
                 returns = batch['returns'].to(self.device)
                 advantages = batch['advantages'].to(self.device)
                 
-                # Forward pass through network
-                action_probs, values = self.network(states)
+                # --- AMP Handling Start ---
+                # Use autocast context if scaler is provided
+                autocast_context = torch.cuda.amp.autocast() if scaler else torch.no_grad() # Use dummy context if no scaler
                 
-                # Compute log probabilities of actions
-                dist_entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-10), dim=1).mean()
-                new_log_probs = torch.log(torch.gather(action_probs, 1, actions.unsqueeze(1)).squeeze(1) + 1e-10)
-                
-                # Compute ratio and clipped ratio
-                ratio = torch.exp(new_log_probs - old_log_probs)
-                clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-                
-                # Compute surrogate losses
-                surrogate1 = ratio * advantages
-                surrogate2 = clipped_ratio * advantages
-                policy_loss = -torch.min(surrogate1, surrogate2).mean()
-                
-                # Compute value loss
-                value_loss = nn.functional.mse_loss(values, returns)
-                
-                # Compute total loss
-                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * dist_entropy
-                
+                with autocast_context:
+                    # Forward pass through network
+                    action_probs, values = self.network(states)
+                    
+                    # TODO: Review log_prob calculation - assumes Categorical distribution implicitly
+                    # Consider using torch.distributions directly if network output allows
+                    # Calculate new log probs using Categorical distribution assumption
+                    dist = torch.distributions.Categorical(probs=action_probs)
+                    new_log_probs = dist.log_prob(actions)
+                    dist_entropy = dist.entropy().mean()
+                    
+                    # Compute ratio and clipped ratio
+                    ratio = torch.exp(new_log_probs - old_log_probs)
+                    clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+                    
+                    # Compute surrogate losses
+                    surrogate1 = ratio * advantages
+                    surrogate2 = clipped_ratio * advantages
+                    policy_loss = -torch.min(surrogate1, surrogate2).mean()
+                    
+                    # Compute value loss (standard MSE, consider clipped value loss if needed)
+                    value_loss = nn.functional.mse_loss(values.squeeze(-1), returns) # Ensure value has correct shape
+                    
+                    # Compute total loss
+                    loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * dist_entropy
+                # --- AMP Handling End ---
+
                 # Backward pass and optimization
                 self.optimizer.zero_grad()
-                loss.backward()
                 
-                # Clip gradients
-                nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
-                
-                # Update parameters
-                self.optimizer.step()
+                if scaler:
+                    # Use scaler for backward pass
+                    scaler.scale(loss).backward()
+                    # Unscale gradients before clipping
+                    scaler.unscale_(self.optimizer)
+                    # Clip gradients
+                    nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+                    # Step optimizer using scaler
+                    scaler.step(self.optimizer)
+                    # Update scaler for next iteration
+                    scaler.update()
+                else:
+                    # Standard backward pass and step
+                    loss.backward()
+                    # Clip gradients
+                    nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+                    # Update parameters
+                    self.optimizer.step()
                 
                 # Track metrics
                 total_policy_loss += policy_loss.item()

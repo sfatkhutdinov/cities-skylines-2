@@ -118,14 +118,6 @@ class Memory:
             elif action_probs.device != self.device:
                 action_probs = action_probs.to(self.device)
             self.action_probs.append(action_probs)
-        
-        # Track episode statistics
-        if done:
-            current_episode_reward = sum(self.rewards[-1:])
-            current_episode_length = 1
-            self.episode_rewards.append(current_episode_reward)
-            self.episode_lengths.append(current_episode_length)
-            logger.info(f"Episode complete: reward={current_episode_reward:.2f}, length={current_episode_length}")
     
     def compute_returns(self, gamma: float, gae_lambda: float) -> None:
         """Compute returns and advantages using GAE.

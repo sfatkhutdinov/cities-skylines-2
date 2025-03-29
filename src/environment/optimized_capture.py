@@ -5,6 +5,8 @@ This module provides high-performance screen capture functionality
 with various optimization techniques for game state observation.
 """
 
+# --- DLL path code removed, moved to train.py ---
+
 import time
 import logging
 import numpy as np

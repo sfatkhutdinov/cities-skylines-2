@@ -45,6 +45,10 @@ class PPOAgent:
             config: Hardware configuration with device preferences
             use_amp: Whether to use automatic mixed precision
         """
+        # Store state and action dimensions
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
         # Hardware setup
         if config is None:
             config = HardwareConfig()
@@ -52,8 +56,11 @@ class PPOAgent:
         self.device = torch.device(config.device if hasattr(config, "device") else "cpu")
         self.use_amp = use_amp and 'cuda' in str(self.device)
         
+        # Initialize GradScaler if using AMP
+        self.scaler = None
         if self.use_amp:
-            logger.info("Using automatic mixed precision (AMP)")
+            self.scaler = torch.cuda.amp.GradScaler()
+            logger.info("Using automatic mixed precision (AMP) with GradScaler")
         
         # Print logging info on initialization
         device_name = torch.cuda.get_device_name(self.device) if 'cuda' in str(self.device) else "CPU"
@@ -88,7 +95,7 @@ class PPOAgent:
             feature_size=512,
             hidden_size=256,
             use_lstm=True,
-            frames_to_stack=4 if is_visual_input else 1,
+            frames_to_stack=config.frame_stack if hasattr(config, 'frame_stack') else 1,
             device=self.device,
             use_attention=True,
             is_visual_input=is_visual_input
@@ -213,166 +220,33 @@ class PPOAgent:
             # Fallback to random action
             return random.randint(0, self.action_dim - 1)
     
-    def store_experience(self, state: torch.Tensor, 
-                        action: torch.Tensor, 
-                        reward: float, 
-                        next_state: Optional[torch.Tensor], 
-                        done: bool, 
-                        info: Dict[str, Any]) -> None:
-        """Store an experience in memory.
-        
-        Args:
-            state: Current state
-            action: Action taken
-            reward: Reward received
-            next_state: Next state
-            done: Whether episode ended
-            info: Additional information
-        """
+    def update(self) -> Dict[str, float]:
+        """Update policy and value function using data in self.memory."""
         if not self.training:
-            return
-            
-        # Extract log_prob and value from info
-        log_prob = info.get('log_prob', None)
-        value = info.get('value', None)
-        action_probs = info.get('action_probs', None)
-        
-        # Add experience to memory
-        self.memory.add(state, action, reward, next_state, done, log_prob, value, action_probs)
-        
-        # Update episode counter if episode ended
-        if done:
-            self.episodes_completed += 1
-    
-    def update(self, experiences: List) -> Dict[str, float]:
-        """Update policy and value function.
-        
-        Args:
-            experiences: List of experience tuples (state, action, reward, next_state, done, log_prob, value)
-            
-        Returns:
-            Dict with update statistics
-        """
-        if not self.training:
+            logger.warning("Update called while agent is not in training mode. Skipping.")
             return {'actor_loss': 0.0, 'critic_loss': 0.0, 'entropy': 0.0}
             
-        # Process experiences
-        for exp in experiences:
-            state, action, reward, next_state, done, log_prob, value = exp
-            
-            # Store experience
-            info = {'log_prob': log_prob, 'value': value}
-            self.store_experience(state, action, reward, next_state, done, info)
-            
-        # Check if enough experiences are stored
-        if self.memory.size() < self.updater.batch_size:
-            logger.warning(f"Not enough experiences for update: {self.memory.size()} < {self.updater.batch_size}")
+        # Check if enough experiences are stored in memory
+        updater_batch_size = getattr(self.updater, 'batch_size', 64) # Default if not found
+        if self.memory.size() < updater_batch_size:
+            logger.warning(f"Not enough experiences for update: {self.memory.size()} < {updater_batch_size}")
             return {'actor_loss': 0.0, 'critic_loss': 0.0, 'entropy': 0.0}
             
-        # Compute returns and advantages
+        # Compute returns and advantages using memory data
+        logger.critical("Computing returns and advantages...")
         self.memory.compute_returns(self.gamma, self.gae_lambda)
+        logger.critical("Returns and advantages computed.")
         
-        # If using mixed precision, update with gradient scaling
-        if self.use_amp:
-            # Update with mixed precision
-            with torch.cuda.amp.autocast():
-                # Run standard update through updater but with mixed precision
-                update_stats = self._update_with_amp()
-        else:
-            # Standard update
-            update_stats = self.updater.update(self.memory)
+        logger.critical("Calling PPOUpdater.update...")
+        update_stats = self.updater.update(self.memory, scaler=self.scaler if self.use_amp else None)
+        logger.critical("PPOUpdater.update completed.")
             
         # Clear memory after update
+        logger.critical("Clearing agent memory after update.")
         self.memory.clear()
         
         return update_stats
     
-    def _update_with_amp(self) -> Dict[str, float]:
-        """Perform update with automatic mixed precision.
-        
-        Returns:
-            Dict with update statistics
-        """
-        # Initialize stats
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_entropy = 0.0
-        num_updates = 0
-        
-        # Custom update loop similar to updater.update but with AMP
-        for epoch in range(self.updater.ppo_epochs):
-            # Get batch iterator
-            batch_iter = self.memory.get_batch_iterator(self.updater.batch_size, shuffle=True)
-            
-            # Process each batch
-            for batch in batch_iter:
-                # Extract batch data
-                states, actions, old_log_probs, returns, advantages, old_values = batch
-                
-                # Forward pass with autocast
-                with torch.cuda.amp.autocast():
-                    # Get action distributions and values
-                    action_dists, values = self.network(states)
-                    
-                    # Calculate new log probs
-                    new_log_probs = action_dists.log_prob(actions)
-                    
-                    # Calculate policy loss (clipped PPO objective)
-                    ratio = torch.exp(new_log_probs - old_log_probs)
-                    surr1 = ratio * advantages
-                    surr2 = torch.clamp(ratio, 1.0 - self.updater.clip_param, 1.0 + self.updater.clip_param) * advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # Calculate value loss (clipped)
-                    value_pred_clipped = old_values + torch.clamp(values - old_values, -self.updater.clip_param, self.updater.clip_param)
-                    value_loss_unclipped = (values - returns) ** 2
-                    value_loss_clipped = (value_pred_clipped - returns) ** 2
-                    value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
-                    
-                    # Calculate entropy bonus
-                    entropy = action_dists.entropy().mean()
-                    
-                    # Calculate total loss
-                    loss = policy_loss + self.updater.value_coef * value_loss - self.updater.entropy_coef * entropy
-                
-                # Zero gradients
-                self.updater.optimizer.zero_grad()
-                
-                # Backward pass with scaler
-                self.scaler.scale(loss).backward()
-                
-                # Clip gradients using scaler
-                self.scaler.unscale_(self.updater.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.updater.max_grad_norm)
-                
-                # Step optimizer with scaler
-                self.scaler.step(self.updater.optimizer)
-                
-                # Update scaler
-                self.scaler.update()
-                
-                # Update stats
-                total_policy_loss += policy_loss.item()
-                total_value_loss += value_loss.item()
-                total_entropy += entropy.item()
-                num_updates += 1
-        
-        # Calculate average stats
-        if num_updates > 0:
-            avg_policy_loss = total_policy_loss / num_updates
-            avg_value_loss = total_value_loss / num_updates
-            avg_entropy = total_entropy / num_updates
-        else:
-            avg_policy_loss = 0.0
-            avg_value_loss = 0.0
-            avg_entropy = 0.0
-        
-        return {
-            'actor_loss': avg_policy_loss,
-            'critic_loss': avg_value_loss,
-            'entropy': avg_entropy
-        }
-            
     def set_training(self, training: bool) -> None:
         """Set agent to training or evaluation mode.
         
@@ -446,23 +320,12 @@ class PPOAgent:
         # Create directory if it doesn't exist
         os.makedirs(path, exist_ok=True)
         
-        # Create state dict
-        state_dict = {
-            'network': self.network.state_dict(),
-            'policy': self.policy.state_dict(),
-            'value_function': self.value_function.state_dict(),
-            'updater': self.updater.state_dict(),
-            'gamma': self.gamma,
-            'gae_lambda': self.gae_lambda,
-            'state_dim': self.state_dim,
-            'action_dim': self.action_dim,
-            'steps_taken': self.steps_taken,
-            'episodes_completed': self.episodes_completed
-        }
+        # Create state dict using the dedicated method
+        agent_state_dict = self.state_dict()
         
         # Save state dict
         model_path = os.path.join(path, 'agent.pth')
-        torch.save(state_dict, model_path)
+        torch.save(agent_state_dict, model_path)
         
         logger.info(f"Saved agent state to {model_path}")
         
@@ -502,55 +365,54 @@ class PPOAgent:
             logger.warning(f"Action dimensions don't match: {state_dict['action_dim']} vs {self.action_dim}")
             return
         
-        # Load network state
+        # Load network, policy, value_function, updater states
         if 'network' in state_dict:
-            try:
-                self.network.load_state_dict(state_dict['network'])
-            except Exception as e:
-                logger.error(f"Error loading network state: {e}")
-        
-        # Load component states
+            self.network.load_state_dict(state_dict['network'])
         if 'policy' in state_dict:
             self.policy.load_state_dict(state_dict['policy'])
-        
         if 'value_function' in state_dict:
             self.value_function.load_state_dict(state_dict['value_function'])
-        
         if 'updater' in state_dict:
-            self.updater.load_state_dict(state_dict['updater'])
-        
-        # Load optimizer separately if exists
-        optimizer_path = os.path.join(path, 'optimizer.pth')
-        if os.path.exists(optimizer_path):
-            try:
-                optimizer_dict = torch.load(optimizer_path, map_location=self.device)
-                if 'optimizer' in optimizer_dict:
-                    self.updater.optimizer.load_state_dict(optimizer_dict['optimizer'])
-            except Exception as e:
-                logger.error(f"Error loading optimizer state: {e}")
-        
-        # Load other parameters
+            # Make sure updater has a load_state_dict method
+            if hasattr(self.updater, 'load_state_dict') and callable(self.updater.load_state_dict):
+                self.updater.load_state_dict(state_dict['updater'])
+            else:
+                logger.warning("Updater does not support loading state dict, skipping.")
+                
+        # Restore training parameters
         self.gamma = state_dict.get('gamma', self.gamma)
         self.gae_lambda = state_dict.get('gae_lambda', self.gae_lambda)
         self.steps_taken = state_dict.get('steps_taken', 0)
         self.episodes_completed = state_dict.get('episodes_completed', 0)
         
-        # Update value function parameters
-        self.value_function.set_params(gamma=self.gamma, gae_lambda=self.gae_lambda)
+        logger.info(f"Loaded agent state from {model_path}")
         
-        # Load episode statistics if exists
+        # Load optimizer state
+        optimizer_path = os.path.join(path, 'optimizer.pth')
+        if os.path.exists(optimizer_path):
+            try:
+                optim_state = torch.load(optimizer_path, map_location=self.device)
+                if 'optimizer' in optim_state:
+                    self.updater.optimizer.load_state_dict(optim_state['optimizer'])
+                    logger.info(f"Loaded optimizer state from {optimizer_path}")
+                else:
+                    logger.warning(f"Optimizer state not found in {optimizer_path}")
+            except Exception as e:
+                logger.error(f"Error loading optimizer state from {optimizer_path}: {e}")
+        else:
+            logger.warning(f"Optimizer state file not found at {optimizer_path}")
+            
+        # Load stats (optional, mainly for info)
         stats_path = os.path.join(path, 'stats.pth')
         if os.path.exists(stats_path):
             try:
-                stats_dict = torch.load(stats_path, map_location=self.device)
-                if 'episode_rewards' in stats_dict:
-                    self.memory.episode_rewards = deque(stats_dict['episode_rewards'], maxlen=100)
-                if 'episode_lengths' in stats_dict:
-                    self.memory.episode_lengths = deque(stats_dict['episode_lengths'], maxlen=100)
+                stats = torch.load(stats_path, map_location=self.device)
+                # You might want to store/use these stats if needed, e.g.:
+                # self.loaded_episode_rewards = stats.get('episode_rewards', [])
+                # self.loaded_episode_lengths = stats.get('episode_lengths', [])
+                logger.info(f"Loaded stats from {stats_path}")
             except Exception as e:
-                logger.error(f"Error loading statistics: {e}")
-        
-        logger.info(f"Loaded agent state from {path}")
+                logger.error(f"Error loading stats from {stats_path}: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get agent statistics.

@@ -163,36 +163,6 @@ class ObservationManager:
         
         return processed_frame
     
-    def get_frame_stack(self, stack_size: int = 4) -> torch.Tensor:
-        """Get a stack of frames for temporal processing.
-        
-        Args:
-            stack_size: Number of frames to stack
-            
-        Returns:
-            torch.Tensor: Stacked frames [stack_size, C, H, W]
-        """
-        # Ensure we have enough frames
-        if len(self.frame_history) < stack_size:
-            # Fill with copies of the latest frame if not enough history
-            if len(self.frame_history) > 0:
-                latest_frame = self.frame_history[-1]
-                while len(self.frame_history) < stack_size:
-                    self.frame_history.appendleft(latest_frame)
-            else:
-                # Get observation if no frames available
-                observation = self.get_observation()
-                while len(self.frame_history) < stack_size:
-                    self.frame_history.appendleft(observation)
-        
-        # Get most recent frames
-        frames = list(self.frame_history)[-stack_size:]
-        
-        # Stack frames along new dimension
-        stacked = torch.stack(frames)
-        
-        return stacked
-    
     def get_current_frame(self) -> Optional[torch.Tensor]:
         """Get the most recent frame.
         

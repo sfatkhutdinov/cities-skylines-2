@@ -45,5 +45,5 @@ requests>=2.32.0
 PyYAML>=6.0.0
 pandas>=2.2.0
 pathlib>=1.0.1  # for path manipulation
-deque-dict>=0.1.0  # for ordered dictionary with deque functionality
-pickle5>=0.0.12  # for serialization 
+# Removed unused deque-dict requirement
+# Removed pickle5 requirement (unnecessary for Python 3.8+) 

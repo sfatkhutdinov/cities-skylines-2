@@ -81,9 +81,6 @@ class MemoryAugmentedAgent(PPOAgent):
         # Initialize base PPO agent with the appropriate parameters
         super().__init__(state_dim, action_dim, config, **kwargs)
         
-        # Store the policy network
-        self.policy = policy_network
-        
         self.memory_use_prob = memory_use_prob
         self.memory_enabled = True
         self.memory_stats = {
@@ -105,7 +102,7 @@ class MemoryAugmentedAgent(PPOAgent):
             deterministic: Whether to select the action deterministically
             
         Returns:
-            dict: Containing action, log_prob, value, and other info
+            int: Selected action
         """
         logger.critical(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
         
@@ -119,7 +116,7 @@ class MemoryAugmentedAgent(PPOAgent):
                 use_memory = self.memory_enabled and np.random.random() < self.memory_use_prob
                 
                 # Forward pass through policy network with memory
-                action_probs, value, next_hidden = self.policy(
+                action_probs, value, next_hidden = self.network(
                     state, 
                     self.hidden_state, 
                     use_memory=use_memory
@@ -151,7 +148,7 @@ class MemoryAugmentedAgent(PPOAgent):
                 
                 # Extract state embedding for potential memory storage
                 try:
-                    state_embedding = self.policy.extract_state_embedding(state, self.hidden_state)
+                    state_embedding = self.network.extract_state_embedding(state, self.hidden_state)
                     # Store info for experience processing
                     self.last_state_embedding = state_embedding
                 except Exception as e:
@@ -159,42 +156,28 @@ class MemoryAugmentedAgent(PPOAgent):
                     state_embedding = None
                     self.last_state_embedding = None
                 
-                # Create info dictionary
-                info = {
-                    'action_probs': action_probs,
-                    'action_distribution': action_distribution,
-                    'log_prob': log_prob,
-                    'value': value,
-                    'used_memory': use_memory,
-                    'state_embedding': state_embedding
-                }
+                # Store info for PPO update and experience processing
+                self.last_state = state # Store the input state
+                self.last_action = action_item # Store the chosen action item
+                self.last_value = value
+                self.last_log_prob = log_prob
+                # Store other info from this agent
+                self.last_action_probs = action_probs
+                self.last_state_embedding = state_embedding
+                self.last_used_memory = use_memory
                 
-                # Return action information
-                logger.critical(f"Returning action: {action.cpu().numpy().item()}, with value: {value}")
-                return {
-                    'action': action,
-                    'log_prob': log_prob,
-                    'value': value,
-                    'action_probs': action_probs,
-                    'state_embedding': state_embedding,
-                    'used_memory': use_memory
-                }
+                # Return only the action item, matching PPOAgent
+                logger.critical(f"Returning action item: {action_item}")
+                return action_item
                 
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
             import traceback
             logger.error(traceback.format_exc())
             
-            # Return a random action as fallback
+            # Return a random action item as fallback
             random_action = torch.randint(0, self.action_dim, (1,), device=self.device)
-            return {
-                'action': random_action,
-                'log_prob': torch.tensor(0.0, device=self.device),
-                'value': torch.tensor(0.0, device=self.device),
-                'action_probs': torch.ones(1, self.action_dim, device=self.device) / self.action_dim,
-                'state_embedding': None,
-                'used_memory': False
-            }
+            return random_action.item()
     
     def process_experience(self, state, action, reward, next_state, done, info=None):
         """Process experience to potentially store in episodic memory.
@@ -221,14 +204,14 @@ class MemoryAugmentedAgent(PPOAgent):
                     state_tensor = torch.tensor(state, device=self.device).float()
                     
                 try:
-                    state_embedding = self.policy.extract_state_embedding(state_tensor, self.hidden_state)
+                    state_embedding = self.network.extract_state_embedding(state_tensor, self.hidden_state)
                 except Exception as e:
                     logger.error(f"Error extracting state embedding in process_experience: {e}")
                     state_embedding = None
             
             # Check if we should store this experience
             if state_embedding is not None:
-                should_store, importance = self.policy.should_store_memory(state_embedding, reward, done)
+                should_store, importance = self.network.should_store_memory(state_embedding, reward, done)
                 
                 if should_store:
                     # Prepare memory data
@@ -242,7 +225,7 @@ class MemoryAugmentedAgent(PPOAgent):
                     }
                     
                     # Store in memory
-                    success = self.policy.store_memory(state_embedding, memory_data, importance)
+                    success = self.network.store_memory(state_embedding, memory_data, importance)
                     
                     if success:
                         self.memory_stats["writes"] += 1
@@ -277,7 +260,7 @@ class MemoryAugmentedAgent(PPOAgent):
             Dict of memory statistics
         """
         # Get stats from the memory controller
-        controller_stats = self.policy.get_memory_stats()
+        controller_stats = self.network.get_memory_stats()
         
         # Combine with agent stats
         return {**self.memory_stats, **controller_stats}
@@ -321,7 +304,7 @@ class MemoryAugmentedAgent(PPOAgent):
                 embedding, data = best_experience
                 
                 # Store in memory with medium importance
-                self.policy.store_memory(embedding, data, importance=0.7)
+                self.network.store_memory(embedding, data, importance=0.7)
                 self.memory_stats["writes"] += 1
                 logger.info("Stored best experience from buffer at episode end")
             

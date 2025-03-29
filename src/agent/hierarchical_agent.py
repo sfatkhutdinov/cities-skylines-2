@@ -160,8 +160,8 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         self.last_error_info = None
         self.last_predicted_next_state = None
         
-        # Initialize optimizer for the policy network
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=0.0003)
+        # Initialize experience buffer (if needed for specific logic)
+        self.experience_buffer = deque(maxlen=1000) # Example size, adjust as needed
         
         logger.critical(f"Initialized hierarchical agent with components: "
                        f"Visual={use_visual_network}, World={use_world_model}, "
@@ -180,11 +180,14 @@ class HierarchicalAgent(MemoryAugmentedAgent):
         if not isinstance(observation, torch.Tensor):
             observation = torch.tensor(observation, dtype=torch.float32, device=self.device)
         
-        # Handle frame stacking - if we have 12 channels (4 stacked frames of 3 channels each)
-        # Use only the most recent frame for visual processing
-        if self.use_visual_network and len(observation.shape) > 1 and observation.shape[0] == 12:
+        # Handle frame stacking - use config value
+        frame_stack = getattr(self.policy.config, 'frame_stack', 1) if hasattr(self.policy, 'config') else 1
+        expected_channels = frame_stack * 3 # Assuming 3 channels per frame (RGB)
+        
+        if self.use_visual_network and len(observation.shape) > 1 and observation.shape[0] == expected_channels and frame_stack > 1:
             # Extract the last frame (last 3 channels) from the stacked frames
-            last_frame = observation[9:12]  # Get channels 9, 10, 11 (last frame in stack)
+            last_frame_start_channel = (frame_stack - 1) * 3
+            last_frame = observation[last_frame_start_channel:] 
             
             with torch.no_grad():
                 visual_features, _ = self.visual_network(last_frame)
@@ -208,7 +211,7 @@ class HierarchicalAgent(MemoryAugmentedAgent):
             deterministic: Whether to select the action deterministically
             
         Returns:
-            tuple: (action, log_prob, value) for compatibility with the trainer
+            int: Selected action item
         """
         logger.debug(f"Selecting action for state with shape {state.shape if hasattr(state, 'shape') else 'unknown'}")
         
@@ -327,18 +330,24 @@ class HierarchicalAgent(MemoryAugmentedAgent):
             self.last_predicted_next_state = predicted_next_state
             self.last_uncertainty = uncertainty
             
-            logger.debug(f"Returning action: {action.cpu().numpy().item()}")
-            # Return the triple expected by the trainer
-            return action.cpu().item(), log_prob.cpu().item(), value.cpu().item()
+            # Store PPO required values
+            self.last_log_prob = log_prob
+            self.last_value = value
+            self.last_state = processed_state # Store processed state for PPO memory
+            self.last_action = action_item # Store integer action for PPO memory
+            
+            # Return only the action item, consistent with base PPOAgent
+            logger.debug(f"HierarchicalAgent returning action item: {action_item}")
+            return action_item
                 
         except Exception as e:
             logger.error(f"Error selecting action: {e}")
             import traceback
             logger.error(traceback.format_exc())
             
-            # Return a random action as fallback - using the format expected by the trainer
+            # Return a random action item as fallback
             random_action = torch.randint(0, self.action_dim, (1,), device=self.device).item()
-            return random_action, 0.0, 0.0
+            return random_action
     
     def process_experience(self, state, action, reward, next_state, done, info=None):
         """Process experience to potentially store in episodic memory.

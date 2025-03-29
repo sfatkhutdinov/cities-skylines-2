@@ -5,9 +5,27 @@ This script handles the command line interface and training process.
 """
 
 import os
+import sys
+if sys.platform == 'win32' and sys.version_info >= (3, 8):
+    # Explicitly add Python's DLL directory to the search path
+    # This attempts to fix DLL load errors for packages like pywin32 on newer Python
+    python_dll_path = os.path.join(sys.base_prefix, 'DLLs')
+    if os.path.isdir(python_dll_path):
+        try:
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(python_dll_path)
+        except (FileNotFoundError, OSError):
+            pass
+    # Also try adding the main Python installation directory
+    if os.path.isdir(sys.base_prefix):
+         try:
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(sys.base_prefix)
+         except (FileNotFoundError, OSError):
+            pass
+
 import time
 import logging
-import sys
 import signal
 import argparse
 import traceback
@@ -317,9 +335,6 @@ def main():
         if not hasattr(args, 'disable_hierarchical'):
             args.disable_hierarchical = False
         
-        # Setup configuration
-        config = setup_config(args)
-        
         # Setup hardware configuration
         hardware_config = setup_hardware_config(args)
         
@@ -358,116 +373,52 @@ def main():
         # Setup the agent
         agent = setup_agent(args, hardware_config, _environment.observation_space, _environment.action_space)
         
-        # Create config dict for trainer
-        trainer_config = {
-            'num_episodes': args.num_episodes,
-            'max_steps': args.max_steps,
-            'checkpoint_dir': args.checkpoint_dir,
-            'tensorboard_dir': 'logs',  # Add explicit tensorboard_dir parameter
-            'checkpoint_freq': args.checkpoint_interval if hasattr(args, 'checkpoint_interval') else 10,
-            'learning_rate': args.learning_rate if hasattr(args, 'learning_rate') else 0.0003,
-            'early_stop_reward': args.early_stop_reward if hasattr(args, 'early_stop_reward') else None,
-            'use_wandb': False,  # Disable wandb for now
-            'mixed_precision': args.mixed_precision if hasattr(args, 'mixed_precision') else True,  # Enable by default
-        }
+        # Gather trainer-specific parameters
+        num_episodes = args.num_episodes
+        max_steps = args.max_steps
+        checkpoint_dir = args.checkpoint_dir
+        tensorboard_dir = 'logs' # Keep explicit tensorboard_dir
+        checkpoint_freq = getattr(args, 'checkpoint_interval', 5)
+        early_stop_reward = getattr(args, 'early_stop_reward', None)
+        use_wandb = False # Keep explicit wandb setting
         
-        # Update hardware config with trainer config values
-        hardware_config.num_episodes = trainer_config['num_episodes']
-        hardware_config.max_steps = trainer_config['max_steps']
-        hardware_config.learning_rate = trainer_config['learning_rate']
-        hardware_config.early_stop_reward = trainer_config['early_stop_reward']
-        hardware_config.mixed_precision = trainer_config.get('mixed_precision', True)  # Enable by default
-        
-        # Add optimizer related attributes 
-        hardware_config.optimizer = 'adam'  # Default optimizer
-        hardware_config.weight_decay = 0.0  # Default weight decay
-        hardware_config.clip_param = 0.2    # PPO clip parameter
-        
-        # Add additional required attributes
-        hardware_config.max_checkpoints = 5  # Maximum number of checkpoints to keep
-        hardware_config.value_loss_coef = 0.5  # Value loss coefficient
-        hardware_config.entropy_coef = 0.01  # Entropy coefficient
-        hardware_config.max_grad_norm = 0.5  # Max gradient norm
-        hardware_config.visualizer_update_interval = 10  # Visualizer update interval
-        hardware_config.monitor_hardware = False  # Hardware monitoring
-        hardware_config.min_fps = 10  # Minimum FPS
-        hardware_config.max_memory_usage = 0.9  # Maximum memory usage (90%)
-        hardware_config.safeguard_cooldown = 60  # Safeguard cooldown
-        
-        # Add memory configuration
-        if not hasattr(hardware_config, 'memory'):
-            hardware_config.memory = {
-                'enabled': not args.disable_memory,
-                'memory_size': args.memory_size,
-                'key_size': 128,
-                'value_size': 256,
-                'retrieval_threshold': 0.5,
-                'warmup_episodes': 10,
-                'use_curriculum': True,
-                'curriculum_phases': {
-                    'observation': 10,
-                    'retrieval': 30,
-                    'integration': 50,
-                    'refinement': 100
-                },
-                'memory_use_probability': 0.8
-            }
-        
-        # Add hierarchical configuration if not present - always add it with default values
-        use_hierarchical = not (hasattr(args, 'disable_hierarchical') and args.disable_hierarchical)
-        if not hasattr(hardware_config, 'hierarchical') and use_hierarchical:
-            hardware_config.hierarchical = {
-                'enabled': True,
-                'feature_dim': 512,
-                'latent_dim': 256,
-                'prediction_horizon': 5,
-                'adaptive_memory_use': True,
-                'adaptive_memory_threshold': 0.7,
-                'training_schedules': {
-                    'visual_network': 10,      # Train visual network every 10 steps
-                    'world_model': 5,          # Train world model every 5 steps
-                    'error_detection': 20      # Train error detection every 20 steps
-                },
-                'batch_sizes': {
-                    'visual_network': 32,
-                    'world_model': 64,
-                    'error_detection': 32
-                },
-                'progressive_training': True,
-                'progressive_phases': {
-                    'visual_network': 50,      # Start training visual network after 50 episodes
-                    'world_model': 100,        # Start training world model after 100 episodes
-                    'error_detection': 150     # Start training error detection after 150 episodes
-                }
-            }
+        # Add trainer-specific parameters to the hardware_config object
+        # The Trainer classes expect these to be attributes of the config object passed
+        hardware_config.num_episodes = num_episodes
+        hardware_config.max_steps = max_steps
+        hardware_config.checkpoint_freq = checkpoint_freq
+        hardware_config.early_stop_reward = early_stop_reward
+        hardware_config.use_wandb = use_wandb
+        # Note: hardware_config already has learning_rate and mixed_precision (use_fp16)
         
         # Create appropriate trainer based on agent type
+        # Pass the unified hardware_config object and specific dirs
         if isinstance(agent, HierarchicalAgent):
             logger.info("Creating hierarchical trainer")
             _trainer = HierarchicalTrainer(
                 agent=agent,
                 env=_environment,
-                config=hardware_config,
-                checkpoint_dir=trainer_config['checkpoint_dir'],
-                tensorboard_dir=trainer_config['tensorboard_dir']
+                config=hardware_config, # Pass the unified config
+                checkpoint_dir=checkpoint_dir,
+                tensorboard_dir=tensorboard_dir
             )
         elif isinstance(agent, MemoryAugmentedAgent):
             logger.info("Creating memory-augmented trainer")
             _trainer = MemoryTrainer(
                 agent=agent,
                 env=_environment,
-                config=hardware_config,
-                checkpoint_dir=trainer_config['checkpoint_dir'],
-                tensorboard_dir=trainer_config['tensorboard_dir']
+                config=hardware_config, # Pass the unified config
+                checkpoint_dir=checkpoint_dir,
+                tensorboard_dir=tensorboard_dir
             )
         else:
             logger.info("Creating standard trainer")
             _trainer = Trainer(
                 agent=agent,
                 env=_environment,
-                config=hardware_config,
-                checkpoint_dir=trainer_config['checkpoint_dir'],
-                tensorboard_dir=trainer_config['tensorboard_dir']
+                config=hardware_config, # Pass the unified config
+                checkpoint_dir=checkpoint_dir,
+                tensorboard_dir=tensorboard_dir
             )
         
         # Resume from checkpoint if specified
